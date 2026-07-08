@@ -443,12 +443,17 @@ os._exit(0 if received else 2)
 
             last_price = self.last_price or self._latest_price()
             size_usdt = self._minimal_test_size_usdt(last_price, balance)
+            test_action, direction_detail = self._select_test_order_action()
+            self._add("Test Order Direction", OK if "matches" in direction_detail else WARN, direction_detail)
             signal = Signal(
                 symbol=self.symbol,
-                action=Action.OPEN_LONG,
+                action=test_action,
                 source="self_check",
                 confidence=0.99,
-                reason="Минимальная TESTNET-сделка для проверки Execution и Journal",
+                reason=(
+                    "Минимальная TESTNET-сделка для проверки Execution и Journal. "
+                    + direction_detail
+                ),
                 stop_loss_pct=1.0,
                 take_profit_pct=1.0,
             )
@@ -512,6 +517,23 @@ os._exit(0 if received else 2)
             self._add("Execution", OK, "minimal Testnet order opened and closed")
         except Exception as exc:
             self._add("Test Order", FAIL, f"{type(exc).__name__}: {exc}", True)
+
+    def _select_test_order_action(self) -> Tuple[Action, str]:
+        """
+        Test order должен быть понятен в отчёте:
+        - если Decision Engine дал реальное направление LONG/SHORT, тестовый
+          ордер повторяет его направление;
+        - если Decision Engine дал HOLD, тестовый ордер остаётся технической
+          минимальной проверкой Execution и явно помечается как независимый.
+        """
+        if self.decision_report and self.decision_report.final_signal.action in (Action.OPEN_LONG, Action.OPEN_SHORT):
+            action = self.decision_report.final_signal.action
+            side = "Buy" if action == Action.OPEN_LONG else "Sell"
+            return action, f"matches Decision Engine preview: {action.value} -> {side}"
+        return (
+            Action.OPEN_LONG,
+            "independent synthetic test order: Decision Engine preview is HOLD, using open_long -> Buy only to test Testnet execution",
+        )
 
     def _minimal_test_size_usdt(self, last_price: float, balance: float) -> float:
         info = self.rest.get_instruments_info(self.symbol)[0]
