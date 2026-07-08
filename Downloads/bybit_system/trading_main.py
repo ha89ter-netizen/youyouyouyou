@@ -8,7 +8,6 @@
    (минимум ~30-40 штук на символ для расчёта EMA, 202+ для trend filter).
 2. Нужны переменные окружения:
    BYBIT_API_KEY / BYBIT_API_SECRET — ключи с testnet.bybit.com
-   OPENAI_API_KEY — для AI-модуля
    BYBIT_TESTNET=true — обязательно на старте
 
 Запуск:

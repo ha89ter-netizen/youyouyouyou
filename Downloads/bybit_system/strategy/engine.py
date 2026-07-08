@@ -26,8 +26,13 @@ from storage.models import Candle, FundingRate, OpenInterest, Liquidation, Trade
 from storage.journal import TradeJournal
 from strategy.signal import Signal, Action
 from strategy.rule_based import TechnicalRuleCommittee
+from strategy.experts import ExpertSignalCollector
 from strategy.indicators import compute_all_indicators, trend_direction
-from strategy.ai_strategy import OpenAIMarketAnalyst
+from market_context import MarketContextEngine
+from meta_strategy import MetaStrategyManager
+from decision_engine import DecisionEngine
+from portfolio_risk import PortfolioRiskEngine
+from ai_market_analyst import AIMarketAnalyst
 from risk.risk_manager import RiskManager
 from execution.execution_engine import ExecutionEngine
 
@@ -39,7 +44,12 @@ class StrategyEngine:
         self.cfg = cfg
         self.db = db
         self.rule_strategy = TechnicalRuleCommittee()
-        self.ai_strategy = OpenAIMarketAnalyst(cfg)
+        self.experts = ExpertSignalCollector()
+        self.market_context_engine = MarketContextEngine()
+        self.meta_strategy = MetaStrategyManager()
+        self.decision_engine = DecisionEngine()
+        self.portfolio_risk = PortfolioRiskEngine()
+        self.ai_market_analyst = AIMarketAnalyst()
         self.risk_manager = RiskManager(cfg)
         self.execution = ExecutionEngine(cfg)
         self.journal = TradeJournal(db)
@@ -193,17 +203,24 @@ class StrategyEngine:
         )
         market_snapshot["trend_filter"] = trend
 
-        rule_signal = self.rule_strategy.generate_signal(symbol, candles_df, funding_rate or 0.0)
-        ai_signal = self.ai_strategy.generate_signal(symbol, market_snapshot)
-
-        final_signal = self._reconcile(rule_signal, ai_signal, symbol)
-        final_signal = self._apply_trend_filter(final_signal, trend, symbol)
+        market_context = self.market_context_engine.analyze(symbol, candles_df, market_snapshot)
+        meta_decision = self.meta_strategy.evaluate(market_context)
+        expert_signals = self.experts.collect(symbol, candles_df, funding_rate or 0.0, market_snapshot)
+        ai_analysis = self.ai_market_analyst.analyze(symbol, market_snapshot, market_context)
+        decision_report = self.decision_engine.decide(
+            symbol=symbol,
+            context=market_context,
+            meta=meta_decision,
+            expert_signals=expert_signals,
+            ai_analysis=ai_analysis.conclusion,
+        )
+        final_signal = self._apply_trend_filter(decision_report.final_signal, trend, symbol)
 
         logger.info(
-            "%s: rule=%s ai=%s trend=%s -> итог=%s (%s)",
+            "%s: context=[%s] experts=%s trend=%s -> итог=%s (%s)",
             symbol,
-            rule_signal.action if rule_signal else "нет данных",
-            ai_signal.action if ai_signal else "нет данных",
+            market_context.summary(),
+            ", ".join(f"{s.source}:{s.action.value}:{s.confidence:.2f}" for s in expert_signals),
             trend or "недостаточно данных",
             final_signal.action, final_signal.reason,
         )
@@ -220,11 +237,17 @@ class StrategyEngine:
         if final_signal.action == Action.HOLD:
             return
 
+        portfolio_check = self.portfolio_risk.evaluate(final_signal, positions)
+        if not portfolio_check.approved:
+            logger.info("%s: сигнал отклонён Portfolio Risk Engine: %s", symbol, portfolio_check.reason)
+            return
+
         last_price = float(candles_df["close"].iloc[-1])
         check = self.risk_manager.evaluate(
             final_signal, positions, balance,
             atr_pct_of_price=indicators.get("atr_pct_of_price") if indicators else None,
             spread_pct=orderbook.get("spread_pct") if orderbook else None,
+            position_size_multiplier=meta_decision.position_size_multiplier,
         )
 
         if not check.approved:
@@ -245,7 +268,7 @@ class StrategyEngine:
         if resp.get("retCode") == 0:
             self.journal.log_entry(
                 symbol=symbol, action=final_signal.action, source=final_signal.source,
-                reason=final_signal.reason, entry_price=last_price,
+                reason=decision_report.journal_reason(), entry_price=last_price,
                 size_usdt=check.approved_size_usdt, leverage=check.approved_leverage,
                 stop_loss_pct=final_signal.stop_loss_pct or self.cfg.default_stop_loss_pct,
                 take_profit_pct=final_signal.take_profit_pct,

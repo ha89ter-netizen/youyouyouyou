@@ -50,6 +50,7 @@ class RiskManager:
         account_balance_usdt: float,
         atr_pct_of_price: Optional[float] = None,
         spread_pct: Optional[float] = None,
+        position_size_multiplier: float = 1.0,
     ) -> RiskCheckResult:
         """
         open_positions: список текущих открытых позиций (из get_positions())
@@ -135,6 +136,9 @@ class RiskManager:
         approved_size = min(sizing_size, requested_size) if requested_size else sizing_size
         # Жёсткий потолок из конфига — не даёт risk-sizing'у улететь при большом балансе
         approved_size = min(approved_size, self.cfg.max_position_usdt)
+        # Meta Strategy Manager может только УМЕНЬШАТЬ размер в сложном контексте
+        # (high volatility / low liquidity). Увеличивать риск этим множителем нельзя.
+        approved_size *= max(0.1, min(position_size_multiplier, 1.0))
         # Никогда не рискуем больше, чем позволяет баланс
         approved_size = min(approved_size, account_balance_usdt * 0.9)
 
