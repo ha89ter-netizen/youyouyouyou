@@ -71,7 +71,7 @@ class TradeDecisionReport:
 
 
 class DecisionEngine:
-    MIN_OPEN_CONFIDENCE = 0.58
+    MIN_OPEN_CONFIDENCE = 0.45
     MIN_MARGIN = 0.12
 
     def decide(
@@ -105,7 +105,7 @@ class DecisionEngine:
                 f"Недостаточный перевес над противоположным сценарием "
                 f"({best_open_score:.2f} vs {opposite_score:.2f})"
             )
-        elif hold_score > best_open_score and best_open_score < 0.75:
+        elif hold_score > best_open_score and best_open_score < 0.50:
             winning_action = Action.HOLD
             rejected[best_open.value] = f"HOLD-сценарий сильнее ({hold_score:.2f} vs {best_open_score:.2f})"
         else:

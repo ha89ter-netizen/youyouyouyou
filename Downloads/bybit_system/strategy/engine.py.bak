@@ -265,28 +265,18 @@ class StrategyEngine:
             stop_loss_pct=final_signal.stop_loss_pct or self.cfg.default_stop_loss_pct,
             take_profit_pct=final_signal.take_profit_pct,
             source=final_signal.source,
-	)
-        if resp.get("retCode") == 0:
-            order_link_id = (
-                resp.get("result", {}).get("orderLinkId")
-                or resp.get("retExtInfo", {}).get("orderLinkId")
-                or ""
-            )
+        )
 
+        if resp.get("retCode") == 0:
             self.journal.log_entry(
-                symbol=symbol,
-                action=final_signal.action,
-                source=final_signal.source,
-                reason=decision_report.journal_reason(),
-                entry_price=last_price,
-                size_usdt=check.approved_size_usdt,
-                leverage=check.approved_leverage,
+                symbol=symbol, action=final_signal.action, source=final_signal.source,
+                reason=decision_report.journal_reason(), entry_price=last_price,
+                size_usdt=check.approved_size_usdt, leverage=check.approved_leverage,
                 stop_loss_pct=final_signal.stop_loss_pct or self.cfg.default_stop_loss_pct,
                 take_profit_pct=final_signal.take_profit_pct,
-                order_link_id=order_link_id,
+                order_link_id=resp.get("result", {}).get("orderLinkId", ""),
             )
             return True
-
         return False
 
     @staticmethod
@@ -295,7 +285,6 @@ class StrategyEngine:
             if p.get("symbol") == symbol and float(p.get("size", 0)) > 0:
                 return p
         return None
-    
     def _manage_exit(self, symbol: str, position: dict, final_signal: Signal, trend: Optional[str]) -> bool:
         """
         Exit Manager: закрывает позицию только при явном разворотном сигнале.

@@ -40,34 +40,57 @@ class ExpertSignalCollector:
     def _ema_expert(symbol: str, candles_df: pd.DataFrame) -> Optional[Signal]:
         if len(candles_df) < 28:
             return None
+
         closes = candles_df["close"].astype(float)
+        price = float(closes.iloc[-1])
+
         ema_fast = closes.ewm(span=12, adjust=False).mean()
         ema_slow = closes.ewm(span=26, adjust=False).mean()
-        diff = ema_fast.iloc[-1] - ema_slow.iloc[-1]
-        prev_diff = ema_fast.iloc[-2] - ema_slow.iloc[-2]
 
-        if prev_diff <= 0 < diff:
+        fast = float(ema_fast.iloc[-1])
+        slow = float(ema_slow.iloc[-1])
+
+        gap_pct = abs(fast - slow) / price * 100
+
+        if gap_pct < 0.03:
+            return Signal(
+                symbol=symbol,
+                action=Action.HOLD,
+                source="expert:ema",
+                confidence=0.50,
+                reason=f"EMA12/26 слишком близко: gap={gap_pct:.3f}%",
+            )
+
+        if fast > slow:
             return Signal(
                 symbol=symbol,
                 action=Action.OPEN_LONG,
                 source="expert:ema",
-                confidence=0.68,
-                reason="EMA12 пересекла EMA26 вверх",
+                confidence=0.62,
+                reason=f"EMA12 выше EMA26, тренд LONG, gap={gap_pct:.3f}%",
                 stop_loss_pct=1.5,
                 take_profit_pct=3.0,
             )
-        if prev_diff >= 0 > diff:
+
+        if fast < slow:
             return Signal(
                 symbol=symbol,
                 action=Action.OPEN_SHORT,
                 source="expert:ema",
-                confidence=0.68,
-                reason="EMA12 пересекла EMA26 вниз",
+                confidence=0.62,
+                reason=f"EMA12 ниже EMA26, тренд SHORT, gap={gap_pct:.3f}%",
                 stop_loss_pct=1.5,
                 take_profit_pct=3.0,
             )
-        return Signal(symbol=symbol, action=Action.HOLD, source="expert:ema", reason="EMA не дала пересечения")
 
+        return Signal(
+            symbol=symbol,
+            action=Action.HOLD,
+            source="expert:ema",
+            confidence=0.50,
+            reason="EMA12/26 нейтральны",
+        )
+    
     @staticmethod
     def _rsi_expert(symbol: str, candles_df: pd.DataFrame) -> Optional[Signal]:
         if len(candles_df) < 16:

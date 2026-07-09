@@ -429,6 +429,8 @@ os._exit(0 if received else 2)
     # ------------------------------------------------------------------
 
     def _run_test_order(self):
+        position_to_close = None
+        close_attempted = False
         try:
             if self.db is None:
                 self.db = Database(self.cfg)
@@ -478,10 +480,11 @@ os._exit(0 if received else 2)
             if position is None:
                 self._add("Position Open", FAIL, "position not visible after order", True)
                 return
+            position_to_close = position
             self._add("Order Filled", OK, f"avgPrice={position.get('avgPrice')} size={position.get('size')}")
             self._add("Position Open", OK, f"side={position.get('side')} size={position.get('size')}")
 
-            journal.log_entry(
+            journal_saved = journal.log_entry(
                 symbol=self.symbol,
                 action=signal.action,
                 source=signal.source,
@@ -493,8 +496,9 @@ os._exit(0 if received else 2)
                 take_profit_pct=signal.take_profit_pct,
                 order_link_id=order_link_id,
             )
-            self._add("Journal Saved", OK, "entry saved")
+            self._add("Journal Saved", OK if journal_saved else FAIL, "entry saved" if journal_saved else "entry save failed", critical=not journal_saved)
 
+            close_attempted = True
             close_resp = self.execution.close_position(
                 self.symbol,
                 side_to_close=position.get("side"),
@@ -517,6 +521,20 @@ os._exit(0 if received else 2)
             self._add("Execution", OK, "minimal Testnet order opened and closed")
         except Exception as exc:
             self._add("Test Order", FAIL, f"{type(exc).__name__}: {exc}", True)
+            if position_to_close is not None and not close_attempted:
+                self._emergency_close_test_position(position_to_close)
+
+    def _emergency_close_test_position(self, position: dict):
+        try:
+            self.execution.close_position(
+                self.symbol,
+                side_to_close=position.get("side"),
+                qty=float(position.get("size") or 0),
+                source="self_check_emergency",
+            )
+            self._add("Emergency Test Close", WARN, "test position close order sent after self-check error")
+        except Exception as close_exc:
+            self._add("Emergency Test Close", FAIL, f"{type(close_exc).__name__}: {close_exc}", True)
 
     def _select_test_order_action(self) -> Tuple[Action, str]:
         """

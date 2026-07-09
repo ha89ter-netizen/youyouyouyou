@@ -9,6 +9,7 @@ place_order/set_leverage на Bybit. Strategy Engine и Risk Manager сами
 """
 
 import logging
+import os
 import time
 import uuid
 from typing import Optional, Dict, Any
@@ -28,10 +29,10 @@ class ExecutionEngine:
                 "Execution Engine требует BYBIT_API_KEY и BYBIT_API_SECRET "
                 "(даже для testnet — создайте ключи на testnet.bybit.com)"
             )
-        if not cfg.testnet:
-            logger.warning(
-                "!!! ExecutionEngine запущен НЕ на testnet — ордера будут "
-                "реальными и с реальными деньгами !!!"
+        if not cfg.testnet and os.getenv("ALLOW_PRODUCTION_ORDERS", "").lower() != "true":
+            raise RuntimeError(
+                "ExecutionEngine refuses to start outside Bybit Testnet. "
+                "Set ALLOW_PRODUCTION_ORDERS=true only after a manual production readiness review."
             )
         self.cfg = cfg
         self.session = HTTP(
@@ -113,6 +114,8 @@ class ExecutionEngine:
         Реальное количество монет = size_usdt / last_price, округлённое
         вниз до шага лота инструмента (qtyStep).
         """
+        if action not in (Action.OPEN_LONG, Action.OPEN_SHORT):
+            raise ValueError(f"open_position accepts only OPEN_LONG/OPEN_SHORT, got {action}")
         side = "Buy" if action == Action.OPEN_LONG else "Sell"
         qty = self._round_qty(symbol, size_usdt / last_price)
 

@@ -23,7 +23,7 @@ class TradeJournal:
         entry_price: float, size_usdt: float, leverage: int,
         stop_loss_pct: Optional[float], take_profit_pct: Optional[float],
         order_link_id: str,
-    ):
+    ) -> bool:
         session = self.db.get_session()
         try:
             entry = TradeLog(
@@ -36,9 +36,11 @@ class TradeJournal:
             session.add(entry)
             session.commit()
             logger.info("Журнал: записан вход %s %s (order_link_id=%s)", symbol, action, order_link_id)
+            return True
         except Exception:
             logger.exception("Не удалось записать вход в журнал сделок")
             session.rollback()
+            return False
         finally:
             session.close()
 

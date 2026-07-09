@@ -15,6 +15,7 @@
 """
 
 import logging
+import os
 
 from config.settings import BybitConfig
 from storage.db import Database
@@ -30,11 +31,10 @@ logger = logging.getLogger("trading_main")
 def main():
     cfg = BybitConfig()
 
-    if not cfg.testnet:
+    if os.getenv("BYBIT_TESTNET", "").lower() != "true" or not cfg.testnet:
         logger.error(
-            "BYBIT_TESTNET не равен true. Из соображений безопасности "
-            "отказываюсь запускаться на реальном счёте без явного "
-            "осознанного шага — измените этот скрипт, если вы точно уверены."
+            "BYBIT_TESTNET должен быть явно установлен в true. "
+            "Торговый цикл не стартует без явного подтверждения Testnet-режима."
         )
         return
 
