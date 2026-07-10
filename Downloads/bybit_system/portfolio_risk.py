@@ -6,8 +6,9 @@ Portfolio Risk Engine.
 """
 
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
+from config.settings import BybitConfig
 from strategy.signal import Action, Signal
 
 
@@ -19,12 +20,22 @@ class PortfolioRiskResult:
 
 class PortfolioRiskEngine:
     DEFAULT_CORRELATION_GROUPS: Tuple[Tuple[str, ...], ...] = (
-        ("BTCUSDT", "ETHUSDT", "SOLUSDT"),
-        ("BNBUSDT", "ETHUSDT"),
+        ("BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"),
+        ("ETHUSDT", "AVAXUSDT", "SUIUSDT", "APTUSDT"),
+        ("XRPUSDT", "ADAUSDT", "DOTUSDT", "LINKUSDT", "ATOMUSDT"),
+        ("DOGEUSDT", "1000PEPEUSDT"),
     )
 
-    def __init__(self, max_same_direction_per_group: int = 2):
-        self.max_same_direction_per_group = max_same_direction_per_group
+    def __init__(
+        self,
+        cfg: Optional[BybitConfig] = None,
+        max_same_direction_per_group: Optional[int] = None,
+    ):
+        self.max_same_direction_per_group = (
+            max_same_direction_per_group
+            if max_same_direction_per_group is not None
+            else (cfg.max_same_direction_per_group if cfg is not None else 2)
+        )
         self.symbol_to_group: Dict[str, Tuple[str, ...]] = {}
         for group in self.DEFAULT_CORRELATION_GROUPS:
             for symbol in group:
@@ -40,6 +51,7 @@ class PortfolioRiskEngine:
 
         desired_side = "Buy" if signal.action == Action.OPEN_LONG else "Sell"
         same_direction = 0
+        opposite_direction = 0
         for position in open_positions:
             if position.get("symbol") not in group:
                 continue
@@ -47,6 +59,8 @@ class PortfolioRiskEngine:
                 continue
             if position.get("side") == desired_side:
                 same_direction += 1
+            else:
+                opposite_direction += 1
 
         if same_direction >= self.max_same_direction_per_group:
             return PortfolioRiskResult(
@@ -56,4 +70,10 @@ class PortfolioRiskEngine:
                     f"позиций той же стороны в группе {', '.join(group)}"
                 ),
             )
-        return PortfolioRiskResult(True, "Портфельный риск допустим")
+        return PortfolioRiskResult(
+            True,
+            (
+                f"Портфельный риск допустим: same_direction={same_direction}, "
+                f"opposite_direction={opposite_direction}, group={', '.join(group)}"
+            ),
+        )

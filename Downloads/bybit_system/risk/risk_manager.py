@@ -38,6 +38,9 @@ class RiskManager:
         self._daily_reset_date = datetime.now(timezone.utc).date()
         self._circuit_breaker_tripped = False
         self._circuit_breaker_reason = ""
+        self._daily_trade_count = 0
+        self._symbol_trade_counts: dict[str, int] = {}
+        self._last_entry_ts_by_symbol: dict[str, float] = {}
 
     # ------------------------------------------------------------------
     # Публичный API
@@ -50,6 +53,7 @@ class RiskManager:
         account_balance_usdt: float,
         atr_pct_of_price: Optional[float] = None,
         spread_pct: Optional[float] = None,
+        funding_rate: Optional[float] = None,
         position_size_multiplier: float = 1.0,
     ) -> RiskCheckResult:
         """
@@ -73,6 +77,43 @@ class RiskManager:
         if signal.action == Action.CLOSE:
             # Закрытие позиций всегда разрешаем — снижение риска не опасно
             return RiskCheckResult(approved=True, reason="Закрытие позиции разрешено без ограничений")
+
+        if signal.confidence < self.cfg.min_open_confidence:
+            return RiskCheckResult(
+                approved=False,
+                reason=(
+                    f"Confidence итогового сигнала {signal.confidence:.2f} ниже "
+                    f"порога {self.cfg.min_open_confidence:.2f}"
+                ),
+            )
+
+        if self._daily_trade_count >= self.cfg.max_daily_trades:
+            return RiskCheckResult(
+                approved=False,
+                reason=f"Достигнут дневной лимит сделок ({self._daily_trade_count}/{self.cfg.max_daily_trades})",
+            )
+
+        symbol_count = self._symbol_trade_counts.get(signal.symbol, 0)
+        if symbol_count >= self.cfg.max_trades_per_symbol:
+            return RiskCheckResult(
+                approved=False,
+                reason=(
+                    f"Достигнут дневной лимит сделок по {signal.symbol} "
+                    f"({symbol_count}/{self.cfg.max_trades_per_symbol})"
+                ),
+            )
+
+        last_entry_ts = self._last_entry_ts_by_symbol.get(signal.symbol)
+        if last_entry_ts is not None:
+            elapsed_minutes = (datetime.now(timezone.utc).timestamp() - last_entry_ts) / 60
+            if elapsed_minutes < self.cfg.cooldown_minutes:
+                return RiskCheckResult(
+                    approved=False,
+                    reason=(
+                        f"Cooldown по {signal.symbol}: прошло {elapsed_minutes:.1f}m "
+                        f"из {self.cfg.cooldown_minutes}m"
+                    ),
+                )
 
         # --- Проверка 1: дневной лимит убытка (в % от баланса на начало дня) ---
         daily_loss_limit_usdt = self._daily_loss_limit_usdt()
@@ -99,7 +140,26 @@ class RiskManager:
                        f"(низкая ликвидность, риск плохого исполнения)",
             )
 
-        # --- Проверка 4: количество открытых позиций ---
+        # --- Проверка 4: funding не должен делать удержание позиции заведомо дорогим ---
+        if funding_rate is not None:
+            if signal.action == Action.OPEN_LONG and funding_rate > self.cfg.max_long_funding_rate:
+                return RiskCheckResult(
+                    approved=False,
+                    reason=(
+                        f"Funding слишком дорогой для LONG: {funding_rate:.5f} "
+                        f"> {self.cfg.max_long_funding_rate:.5f}"
+                    ),
+                )
+            if signal.action == Action.OPEN_SHORT and funding_rate < -self.cfg.max_short_funding_rate_abs:
+                return RiskCheckResult(
+                    approved=False,
+                    reason=(
+                        f"Funding слишком дорогой для SHORT: {funding_rate:.5f} "
+                        f"< -{self.cfg.max_short_funding_rate_abs:.5f}"
+                    ),
+                )
+
+        # --- Проверка 5: количество открытых позиций ---
         open_count = len([p for p in open_positions if float(p.get("size", 0)) > 0])
         if open_count >= self.cfg.max_open_positions:
             return RiskCheckResult(
@@ -107,7 +167,7 @@ class RiskManager:
                 reason=f"Достигнут лимит открытых позиций ({open_count}/{self.cfg.max_open_positions})",
             )
 
-        # --- Проверка 5: не открываем вторую позицию по тому же символу ---
+        # --- Проверка 6: не открываем вторую позицию по тому же символу ---
         for p in open_positions:
             if p.get("symbol") == signal.symbol and float(p.get("size", 0)) > 0:
                 return RiskCheckResult(
@@ -115,7 +175,7 @@ class RiskManager:
                     reason=f"По {signal.symbol} уже есть открытая позиция",
                 )
 
-        # --- Проверка 6: обязательный стоп-лосс (нужен и для сайзинга, и для ордера) ---
+        # --- Проверка 7: обязательный стоп-лосс (нужен и для сайзинга, и для ордера) ---
         stop_loss_pct = signal.stop_loss_pct or self.cfg.default_stop_loss_pct
         if signal.stop_loss_pct is None:
             logger.warning(
@@ -123,7 +183,7 @@ class RiskManager:
                 signal.source, signal.symbol, self.cfg.default_stop_loss_pct,
             )
 
-        # --- Проверка 7: размер позиции — risk-based sizing ---
+        # --- Проверка 8: размер позиции — risk-based sizing ---
         # Формула: сколько USDT готовы потерять на сделке (risk_amount), делим на
         # дистанцию до стоп-лосса в долях -> получаем номинальный размер позиции,
         # при котором срабатывание SL даст убыток ровно risk_amount, а не больше.
@@ -145,7 +205,7 @@ class RiskManager:
         if approved_size <= 0:
             return RiskCheckResult(approved=False, reason="Недостаточно баланса для открытия позиции")
 
-        # --- Проверка 8: плечо ---
+        # --- Проверка 9: плечо ---
         requested_leverage = signal.suggested_leverage or 1
         approved_leverage = min(requested_leverage, self.cfg.max_leverage)
 
@@ -179,6 +239,17 @@ class RiskManager:
         self._daily_pnl_usdt += pnl_usdt
         logger.info("Дневной PnL обновлён: %.2f USDT (изменение %.2f)", self._daily_pnl_usdt, pnl_usdt)
 
+    def record_open_trade(self, symbol: str):
+        """Вызывать после успешного создания ордера, чтобы работали лимиты частоты торговли."""
+        self._daily_trade_count += 1
+        self._symbol_trade_counts[symbol] = self._symbol_trade_counts.get(symbol, 0) + 1
+        self._last_entry_ts_by_symbol[symbol] = datetime.now(timezone.utc).timestamp()
+        logger.info(
+            "Счётчики сделок обновлены: daily=%d/%d, %s=%d/%d",
+            self._daily_trade_count, self.cfg.max_daily_trades,
+            symbol, self._symbol_trade_counts[symbol], self.cfg.max_trades_per_symbol,
+        )
+
     def manual_reset_circuit_breaker(self):
         """
         Сознательно ручной метод — Risk Manager НЕ снимает circuit breaker сам.
@@ -210,6 +281,9 @@ class RiskManager:
                 current_balance,
             )
             self._daily_pnl_usdt = 0.0
+            self._daily_trade_count = 0
+            self._symbol_trade_counts.clear()
+            self._last_entry_ts_by_symbol.clear()
             self._daily_start_balance = current_balance
             self._daily_reset_date = today
             self._circuit_breaker_tripped = False

@@ -10,6 +10,7 @@ place_order/set_leverage на Bybit. Strategy Engine и Risk Manager сами
 
 import logging
 import os
+import re
 import time
 import uuid
 from typing import Optional, Dict, Any
@@ -121,7 +122,8 @@ class ExecutionEngine:
 
         self.set_leverage(symbol, leverage)
 
-        order_link_id = f"{source[:10]}-{uuid.uuid4().hex[:16]}"
+        safe_source = re.sub(r"[^A-Za-z0-9_-]", "_", source)[:10] or "unknown"
+        order_link_id = f"{safe_source}-{uuid.uuid4().hex[:16]}"
 
         params: Dict[str, Any] = {
             "category": self.cfg.category,
@@ -141,20 +143,25 @@ class ExecutionEngine:
 
         logger.info("Отправляю ордер: %s", params)
         resp = self.session.place_order(**params)
-        logger.info("Ответ биржи: retCode=%s orderId=%s",
-                     resp.get("retCode"), resp.get("result", {}).get("orderId"))
+        resp["local_order_link_id"] = order_link_id
+        logger.info("Ответ биржи: retCode=%s retMsg=%s orderId=%s orderLinkId=%s",
+                     resp.get("retCode"), resp.get("retMsg"),
+                     resp.get("result", {}).get("orderId"), order_link_id)
         return resp
 
     def close_position(self, symbol: str, side_to_close: str, qty: float, source: str = "unknown") -> Dict[str, Any]:
         """side_to_close — сторона ТЕКУЩЕЙ позиции ('Buy'/'Sell'); закрываем встречным ордером."""
         close_side = "Sell" if side_to_close == "Buy" else "Buy"
-        order_link_id = f"{source[:10]}-close-{uuid.uuid4().hex[:12]}"
+        safe_source = re.sub(r"[^A-Za-z0-9_-]", "_", source)[:10] or "unknown"
+        order_link_id = f"{safe_source}-close-{uuid.uuid4().hex[:12]}"
         resp = self.session.place_order(
             category=self.cfg.category, symbol=symbol, side=close_side,
             orderType="Market", qty=str(qty), reduceOnly=True,
             orderLinkId=order_link_id,
         )
-        logger.info("Закрытие позиции %s: retCode=%s", symbol, resp.get("retCode"))
+        resp["local_order_link_id"] = order_link_id
+        logger.info("Закрытие позиции %s: retCode=%s retMsg=%s orderLinkId=%s",
+                    symbol, resp.get("retCode"), resp.get("retMsg"), order_link_id)
         return resp
 
     def set_trailing_stop(self, symbol: str, last_price: float, distance_pct: float):

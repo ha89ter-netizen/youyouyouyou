@@ -49,6 +49,8 @@ class ExpertSignalCollector:
 
         fast = float(ema_fast.iloc[-1])
         slow = float(ema_slow.iloc[-1])
+        fast_prev = float(ema_fast.iloc[-2])
+        fast_slope_pct = (fast / fast_prev - 1) * 100 if fast_prev else 0.0
 
         gap_pct = abs(fast - slow) / price * 100
 
@@ -61,24 +63,26 @@ class ExpertSignalCollector:
                 reason=f"EMA12/26 слишком близко: gap={gap_pct:.3f}%",
             )
 
-        if fast > slow:
+        if fast > slow and fast_slope_pct >= -0.03:
+            confidence = min(0.58 + gap_pct * 2.0 + max(fast_slope_pct, 0) * 2.0, 0.74)
             return Signal(
                 symbol=symbol,
                 action=Action.OPEN_LONG,
                 source="expert:ema",
-                confidence=0.62,
-                reason=f"EMA12 выше EMA26, тренд LONG, gap={gap_pct:.3f}%",
+                confidence=round(confidence, 3),
+                reason=f"EMA12 выше EMA26, LONG-состояние, gap={gap_pct:.3f}%, slope={fast_slope_pct:.3f}%",
                 stop_loss_pct=1.5,
                 take_profit_pct=3.0,
             )
 
-        if fast < slow:
+        if fast < slow and fast_slope_pct <= 0.03:
+            confidence = min(0.58 + gap_pct * 2.0 + max(-fast_slope_pct, 0) * 2.0, 0.74)
             return Signal(
                 symbol=symbol,
                 action=Action.OPEN_SHORT,
                 source="expert:ema",
-                confidence=0.62,
-                reason=f"EMA12 ниже EMA26, тренд SHORT, gap={gap_pct:.3f}%",
+                confidence=round(confidence, 3),
+                reason=f"EMA12 ниже EMA26, SHORT-состояние, gap={gap_pct:.3f}%, slope={fast_slope_pct:.3f}%",
                 stop_loss_pct=1.5,
                 take_profit_pct=3.0,
             )
@@ -99,23 +103,25 @@ class ExpertSignalCollector:
         values = rsi(closes)
         prev_value = float(values.iloc[-2])
         current = float(values.iloc[-1])
-        if prev_value < 30 <= current:
+        recent_min = float(values.tail(6).min())
+        recent_max = float(values.tail(6).max())
+        if prev_value < 30 <= current or (recent_min <= 35 and 30 <= current <= 42 and current > prev_value):
             return Signal(
                 symbol=symbol,
                 action=Action.OPEN_LONG,
                 source="expert:rsi",
-                confidence=0.64,
-                reason=f"RSI вышел из перепроданности ({prev_value:.1f}->{current:.1f})",
+                confidence=0.64 if prev_value < 30 <= current else 0.58,
+                reason=f"RSI восстановление после перепроданности (min6={recent_min:.1f}, {prev_value:.1f}->{current:.1f})",
                 stop_loss_pct=1.3,
                 take_profit_pct=2.4,
             )
-        if prev_value > 70 >= current:
+        if prev_value > 70 >= current or (recent_max >= 65 and 58 <= current <= 70 and current < prev_value):
             return Signal(
                 symbol=symbol,
                 action=Action.OPEN_SHORT,
                 source="expert:rsi",
-                confidence=0.64,
-                reason=f"RSI вышел из перекупленности ({prev_value:.1f}->{current:.1f})",
+                confidence=0.64 if prev_value > 70 >= current else 0.58,
+                reason=f"RSI охлаждение после перекупленности (max6={recent_max:.1f}, {prev_value:.1f}->{current:.1f})",
                 stop_loss_pct=1.3,
                 take_profit_pct=2.4,
             )
@@ -163,7 +169,12 @@ class ExpertSignalCollector:
     @staticmethod
     def _momentum_expert(symbol: str, snapshot: dict) -> Signal:
         change_20 = float(snapshot.get("price_change_pct_last_20_candles") or 0.0)
-        trade_flow = snapshot.get("trade_flow_last_minutes") or {}
+        trade_flow = snapshot.get("trade_flow_last_minutes")
+        if not trade_flow:
+            return Signal(
+                symbol=symbol, action=Action.HOLD, source="expert:momentum",
+                reason="Нет свежего trade flow: momentum отключён до восстановления data pipeline",
+            )
         imbalance = float(trade_flow.get("imbalance") or 0.0)
         if change_20 >= 1.2 and imbalance >= 0.15:
             return Signal(
@@ -190,6 +201,11 @@ class ExpertSignalCollector:
     @staticmethod
     def _orderbook_expert(symbol: str, snapshot: dict) -> Signal:
         orderbook = snapshot.get("orderbook") or {}
+        if not orderbook:
+            return Signal(
+                symbol=symbol, action=Action.HOLD, source="expert:orderbook",
+                reason="Нет свежего orderbook snapshot",
+            )
         imbalance = float(orderbook.get("bid_ask_imbalance") or 0.0)
         spread_pct = orderbook.get("spread_pct")
         if spread_pct is not None and spread_pct > 0.15:
@@ -220,24 +236,24 @@ class ExpertSignalCollector:
     def _funding_expert(symbol: str, funding_rate: float, snapshot: dict) -> Signal:
         funding_trend = snapshot.get("funding_trend") or {}
         trend = funding_trend.get("trend")
-        if funding_rate > 0.0005 and trend == "растёт":
+        if (funding_rate > 0.0005 and trend in ("растёт", "стабилен")) or funding_rate > 0.0008:
             return Signal(
                 symbol=symbol,
                 action=Action.OPEN_SHORT,
                 source="expert:funding",
-                confidence=0.61,
-                reason=f"Funding высокий и растёт ({funding_rate:.5f}), лонги переполнены",
+                confidence=0.63 if trend == "растёт" else 0.58,
+                reason=f"Funding высокий ({funding_rate:.5f}, trend={trend or 'unknown'}), лонги переполнены",
                 stop_loss_pct=1.4,
-                take_profit_pct=2.4,
+                take_profit_pct=2.8,
             )
-        if funding_rate < -0.0005 and trend == "падает":
+        if (funding_rate < -0.0005 and trend in ("падает", "стабилен")) or funding_rate < -0.0008:
             return Signal(
                 symbol=symbol,
                 action=Action.OPEN_LONG,
                 source="expert:funding",
-                confidence=0.61,
-                reason=f"Funding отрицательный и падает ({funding_rate:.5f}), шорты переполнены",
+                confidence=0.63 if trend == "падает" else 0.58,
+                reason=f"Funding отрицательный ({funding_rate:.5f}, trend={trend or 'unknown'}), шорты переполнены",
                 stop_loss_pct=1.4,
-                take_profit_pct=2.4,
+                take_profit_pct=2.8,
             )
         return Signal(symbol=symbol, action=Action.HOLD, source="expert:funding", reason="Funding без экстремального перекоса")

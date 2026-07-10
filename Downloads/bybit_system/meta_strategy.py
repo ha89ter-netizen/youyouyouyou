@@ -26,10 +26,7 @@ class MetaStrategyDecision:
     notes: List[str] = field(default_factory=list)
 
     def is_allowed(self, source: str) -> bool:
-        if source in self.allowed_sources:
-            return True
-        prefix = source.split(":", 1)[0] + ":"
-        return any(source.startswith(allowed) or allowed.startswith(prefix) for allowed in self.allowed_sources)
+        return source in self.allowed_sources
 
 
 class MetaStrategyManager:

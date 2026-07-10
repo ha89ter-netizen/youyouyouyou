@@ -16,6 +16,7 @@ import logging
 
 from config.settings import BybitConfig
 from storage.db import Database
+from storage.migrations import run_safe_migrations
 from storage.models import Base, HYPERTABLE_CONFIG
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -34,6 +35,7 @@ def init_database(cfg: BybitConfig = None):
     # 1. Обычные таблицы
     logger.info("Создаю таблицы...")
     Base.metadata.create_all(db.engine)
+    run_safe_migrations(db.engine)
 
     # 2. Расширение TimescaleDB + 3. hypertables — через raw SQL,
     #    SQLAlchemy ORM этого не умеет.

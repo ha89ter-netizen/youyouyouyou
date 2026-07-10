@@ -11,11 +11,13 @@
 
 from sqlalchemy import (
     Column, BigInteger, Numeric, String, Boolean, Integer, DateTime,
-    PrimaryKeyConstraint, func
+    ForeignKey, JSON, PrimaryKeyConstraint, UniqueConstraint, func
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import declarative_base
 
 Base = declarative_base()
+JSONB_COMPAT = JSON().with_variant(JSONB, "postgresql")
 
 
 class TradeLog(Base):
@@ -31,7 +33,17 @@ class TradeLog(Base):
     action = Column(String(10), nullable=False)  # open_long / open_short
     source = Column(String(50), nullable=False)  # rule:committee | ai:openai | rule+ai
     reason = Column(String(1000), nullable=False)
+    entry_reason = Column(String(2000), nullable=True)
     order_link_id = Column(String(100), nullable=False, unique=True)
+
+    market_context = Column(String(2000), nullable=True)
+    regime = Column(String(30), nullable=True)
+    trend = Column(String(30), nullable=True)
+    decision_confidence = Column(Numeric, nullable=True)
+    expected_rr = Column(Numeric, nullable=True)
+    confirmation_count = Column(Integer, nullable=True)
+    confirmation_families = Column(String(500), nullable=True)
+    entry_snapshot = Column(JSONB_COMPAT, nullable=True)
 
     entry_price = Column(Numeric, nullable=False)
     size_usdt = Column(Numeric, nullable=False)
@@ -41,10 +53,38 @@ class TradeLog(Base):
 
     exit_price = Column(Numeric, nullable=True)
     pnl_usdt = Column(Numeric, nullable=True)
+    pnl_pct = Column(Numeric, nullable=True)
+    mfe_pct = Column(Numeric, nullable=True)
+    mae_pct = Column(Numeric, nullable=True)
+    exit_reason = Column(String(100), nullable=True)
+    exit_type = Column(String(30), nullable=True)
+    exit_snapshot = Column(JSONB_COMPAT, nullable=True)
+    holding_seconds = Column(Integer, nullable=True)
     status = Column(String(10), nullable=False, default="open")  # open | closed
 
     opened_at = Column(DateTime(timezone=True), server_default=func.now())
     closed_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class TradeExpertVote(Base):
+    """Нормализованные голоса экспертов по каждой сделке для будущей аналитики."""
+    __tablename__ = "trade_expert_votes"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    trade_log_id = Column(Integer, ForeignKey("trade_log.id"), nullable=True)
+    order_link_id = Column(String(100), nullable=False)
+    symbol = Column(String(20), nullable=False)
+    source = Column(String(80), nullable=False)
+    family = Column(String(50), nullable=True)
+    action = Column(String(20), nullable=False)
+    confidence = Column(Numeric, nullable=True)
+    reason = Column(String(2000), nullable=True)
+    weight = Column(Numeric, nullable=True)
+    contributed_to_final_decision = Column(Boolean, nullable=False, default=False)
+
+    __table_args__ = (
+        UniqueConstraint("order_link_id", "source", name="uq_trade_expert_vote_order_source"),
+    )
 
 
 class Candle(Base):

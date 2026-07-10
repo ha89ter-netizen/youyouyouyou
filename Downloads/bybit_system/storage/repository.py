@@ -179,6 +179,36 @@ class MarketDataStore:
         finally:
             session.close()
 
+    def save_funding_history(self, symbol: str, rows_from_api: List[Dict[str, Any]]):
+        session = self.db.get_session()
+        try:
+            rows = []
+            for item in rows_from_api:
+                ts = item.get("fundingRateTimestamp") or item.get("funding_ts") or item.get("timestamp")
+                rate = item.get("fundingRate") or item.get("funding_rate")
+                if ts is None or rate is None:
+                    continue
+                rows.append({"symbol": symbol, "funding_ts": int(ts), "funding_rate": rate})
+            _upsert(session, FundingRate, rows)
+            logger.info("Сохранено %d исторических funding records для %s", len(rows), symbol)
+        finally:
+            session.close()
+
+    def save_open_interest_history(self, symbol: str, rows_from_api: List[Dict[str, Any]]):
+        session = self.db.get_session()
+        try:
+            rows = []
+            for item in rows_from_api:
+                ts = item.get("timestamp") or item.get("ts")
+                oi = item.get("openInterest") or item.get("open_interest")
+                if ts is None or oi is None:
+                    continue
+                rows.append({"symbol": symbol, "ts": int(ts), "open_interest": oi})
+            _upsert(session, OpenInterest, rows)
+            logger.info("Сохранено %d исторических OI records для %s", len(rows), symbol)
+        finally:
+            session.close()
+
     def stop(self):
         """Сбросить все буферы перед остановкой приложения."""
         for writer in [self.candles, self.trades, self.funding,

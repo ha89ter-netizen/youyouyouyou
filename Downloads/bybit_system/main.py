@@ -13,14 +13,12 @@ import time
 
 from config.settings import BybitConfig
 from data.rest_client import BybitRestClient
+from logging_config import configure_app_logging
 from data.ws_client import BybitPublicStream
 from storage.db import Database
 from storage.repository import MarketDataStore
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
+configure_app_logging("main", "main.log")
 logger = logging.getLogger("main")
 
 
@@ -44,8 +42,14 @@ def main():
     # недостающие свечи не накопятся через WebSocket.
     rest = BybitRestClient(cfg)
     for symbol in cfg.symbols:
-        klines = rest.get_klines(symbol, interval="15", limit=210)
-        store.save_historical_klines(symbol, "15", klines)
+        klines = rest.get_klines(symbol, interval=cfg.primary_interval, limit=210)
+        store.save_historical_klines(symbol, cfg.primary_interval, klines)
+
+        funding_history = rest.get_funding_rate_history(symbol, limit=200)
+        store.save_funding_history(symbol, funding_history)
+
+        oi_history = rest.get_open_interest(symbol, interval_time="15min", limit=200)
+        store.save_open_interest_history(symbol, oi_history)
 
         tickers = rest.get_tickers(symbol)
         if tickers:
@@ -60,7 +64,7 @@ def main():
     for symbol in cfg.symbols:
         stream.subscribe_orderbook(symbol, depth=50, on_message=store.on_orderbook_ws)
         stream.subscribe_trades(symbol, on_message=store.on_trade_ws)
-        stream.subscribe_kline(symbol, interval="15", on_message=store.on_kline_ws)
+        stream.subscribe_kline(symbol, interval=cfg.primary_interval, on_message=store.on_kline_ws)
         stream.subscribe_liquidations(symbol, on_message=store.on_liquidation_ws)
         stream.subscribe_ticker(symbol, on_message=store.on_ticker_ws)
 

@@ -11,6 +11,33 @@ from dataclasses import dataclass, field
 from typing import List
 
 
+def _symbols_from_env() -> List[str]:
+    raw = os.getenv("SYMBOLS")
+    if raw:
+        return [s.strip().upper() for s in raw.split(",") if s.strip()]
+    return [
+        "ETHUSDT",
+        "SOLUSDT",
+        "BNBUSDT",
+        "XRPUSDT",
+        "DOGEUSDT",
+        "ADAUSDT",
+        "TRXUSDT",
+        "LINKUSDT",
+        "AVAXUSDT",
+        "SUIUSDT",
+        "TONUSDT",
+        "HBARUSDT",
+        "DOTUSDT",
+        "LTCUSDT",
+        "BCHUSDT",
+        "UNIUSDT",
+        "ATOMUSDT",
+        "APTUSDT",
+        "1000PEPEUSDT",
+    ]
+
+
 @dataclass
 class BybitConfig:
     # ==========================================================
@@ -43,27 +70,7 @@ class BybitConfig:
     # ТОРГУЕМЫЕ ИНСТРУМЕНТЫ
     # ==========================================================
 
-    symbols: List[str] = field(default_factory=lambda: [
-        "ETHUSDT",
-        "SOLUSDT",
-        "BNBUSDT",
-        "XRPUSDT",
-        "DOGEUSDT",
-        "ADAUSDT",
-        "TRXUSDT",
-        "LINKUSDT",
-        "AVAXUSDT",
-        "SUIUSDT",
-        "TONUSDT",
-        "HBARUSDT",
-        "DOTUSDT",
-        "LTCUSDT",
-        "BCHUSDT",
-        "UNIUSDT",
-        "ATOMUSDT",
-        "APTUSDT",
-        "1000PEPEUSDT",
-    ])
+    symbols: List[str] = field(default_factory=_symbols_from_env)
 
     # ==========================================================
     # БАЗА ДАННЫХ
@@ -98,11 +105,27 @@ class BybitConfig:
     )
 
     min_open_confidence: float = float(
-        os.getenv("MIN_OPEN_CONFIDENCE", "0.50")
+        os.getenv("MIN_OPEN_CONFIDENCE", "0.45")
     )
 
     min_rr: float = float(
         os.getenv("MIN_RR", "2.0")
+    )
+
+    min_decision_margin: float = float(
+        os.getenv("MIN_DECISION_MARGIN", "0.08")
+    )
+
+    min_confirming_families: int = int(
+        os.getenv("MIN_CONFIRMING_FAMILIES", "2")
+    )
+
+    max_new_positions_per_cycle: int = int(
+        os.getenv("MAX_NEW_POSITIONS_PER_CYCLE", "2")
+    )
+
+    min_seconds_between_entries: int = int(
+        os.getenv("MIN_SECONDS_BETWEEN_ENTRIES", "20")
     )
 
     # ==========================================================
@@ -126,7 +149,7 @@ class BybitConfig:
     )
 
     max_open_positions: int = int(
-        os.getenv("MAX_OPEN_POSITIONS", "2")
+        os.getenv("MAX_OPEN_POSITIONS", "5")
     )
 
     max_daily_trades: int = int(
@@ -158,11 +181,19 @@ class BybitConfig:
     # ==========================================================
 
     max_volatility_atr_pct: float = float(
-        os.getenv("MAX_VOLATILITY_ATR_PCT", "3.0")
+        os.getenv("MAX_VOLATILITY_ATR_PCT", "5.0")
     )
 
     max_spread_pct: float = float(
-        os.getenv("MAX_SPREAD_PCT", "0.6")
+        os.getenv("MAX_SPREAD_PCT", "0.8")
+    )
+
+    max_long_funding_rate: float = float(
+        os.getenv("MAX_LONG_FUNDING_RATE", "0.001")
+    )
+
+    max_short_funding_rate_abs: float = float(
+        os.getenv("MAX_SHORT_FUNDING_RATE_ABS", "0.001")
     )
 
     # ==========================================================
@@ -171,6 +202,42 @@ class BybitConfig:
 
     trend_filter_enabled: bool = (
         os.getenv("TREND_FILTER_ENABLED", "true").lower() == "true"
+    )
+
+    trend_filter_reversal_confidence: float = float(
+        os.getenv("TREND_FILTER_REVERSAL_CONFIDENCE", "0.68")
+    )
+
+    # ==========================================================
+    # СВЕЖЕСТЬ ДАННЫХ
+    # ==========================================================
+
+    max_candle_age_minutes: int = int(
+        os.getenv("MAX_CANDLE_AGE_MINUTES", "45")
+    )
+
+    max_orderbook_age_seconds: int = int(
+        os.getenv("MAX_ORDERBOOK_AGE_SECONDS", "90")
+    )
+
+    max_funding_age_minutes: int = int(
+        os.getenv("MAX_FUNDING_AGE_MINUTES", "90")
+    )
+
+    max_open_interest_age_minutes: int = int(
+        os.getenv("MAX_OPEN_INTEREST_AGE_MINUTES", "90")
+    )
+
+    max_trade_flow_age_seconds: int = int(
+        os.getenv("MAX_TRADE_FLOW_AGE_SECONDS", "120")
+    )
+
+    # ==========================================================
+    # PORTFOLIO RISK
+    # ==========================================================
+
+    max_same_direction_per_group: int = int(
+        os.getenv("MAX_SAME_DIRECTION_PER_GROUP", "2")
     )
 
     # ==========================================================

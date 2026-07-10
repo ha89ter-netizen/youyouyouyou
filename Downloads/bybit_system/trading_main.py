@@ -18,13 +18,12 @@ import logging
 import os
 
 from config.settings import BybitConfig
+from logging_config import configure_app_logging
+from storage.migrations import run_safe_migrations
 from storage.db import Database
 from strategy.engine import StrategyEngine
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
+configure_app_logging("trading", "trading.log")
 logger = logging.getLogger("trading_main")
 
 
@@ -50,6 +49,7 @@ def main():
     if not db.check_connection():
         logger.error("БД недоступна. Запустите docker compose up -d и python -m storage.init_db")
         return
+    run_safe_migrations(db.engine)
 
     engine = StrategyEngine(cfg, db)
     try:

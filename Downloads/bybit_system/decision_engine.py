@@ -36,6 +36,8 @@ class TradeDecisionReport:
     risk_score: float = 0.0
     expected_rr: Optional[float] = None
     confidence: float = 0.0
+    confirmation_count: int = 0
+    confirmation_families: List[str] = field(default_factory=list)
     meta_notes: List[str] = field(default_factory=list)
     ai_analysis: Optional[str] = None
 
@@ -43,6 +45,10 @@ class TradeDecisionReport:
         active_votes = [
             f"{v.source}={v.action.value}({v.confidence:.2f})"
             for v in self.votes if not v.ignored
+        ]
+        hold_reasons = [
+            f"{v.source}: {v.reason}" for v in self.votes
+            if not v.ignored and v.action == Action.HOLD and v.reason
         ]
         ignored_votes = [
             f"{v.source}: {v.ignored_reason}" for v in self.votes if v.ignored
@@ -52,12 +58,19 @@ class TradeDecisionReport:
             "Голоса: " + (", ".join(active_votes) if active_votes else "нет активных голосов"),
             f"Итог: {self.winning_action.value}, confidence={self.confidence:.2f}, "
             f"risk_score={self.risk_score:.2f}, expected_rr={self.expected_rr}",
+            "Подтверждения: "
+            + (
+                f"{self.confirmation_count} независимых семейств ({', '.join(self.confirmation_families)})"
+                if self.confirmation_families else "нет"
+            ),
         ]
         if self.rejected_actions:
             chunks.append(
                 "Отклонено: "
                 + "; ".join(f"{action}: {reason}" for action, reason in self.rejected_actions.items())
             )
+        if hold_reasons:
+            chunks.append("Причины HOLD экспертов: " + "; ".join(hold_reasons[:4]))
         if ignored_votes:
             chunks.append("Проигнорированы: " + "; ".join(ignored_votes))
         if self.meta_notes:
@@ -71,8 +84,21 @@ class TradeDecisionReport:
 
 
 class DecisionEngine:
-    MIN_OPEN_CONFIDENCE = 0.45
-    MIN_MARGIN = 0.12
+    def __init__(
+        self,
+        min_open_confidence: float = 0.45,
+        min_margin: float = 0.08,
+        min_rr: float = 2.0,
+        default_stop_loss_pct: float = 1.5,
+        default_take_profit_rr: float = 2.0,
+        min_confirming_families: int = 2,
+    ):
+        self.min_open_confidence = min_open_confidence
+        self.min_margin = min_margin
+        self.min_rr = min_rr
+        self.default_stop_loss_pct = default_stop_loss_pct
+        self.default_take_profit_rr = default_take_profit_rr
+        self.min_confirming_families = min_confirming_families
 
     def decide(
         self,
@@ -94,18 +120,35 @@ class DecisionEngine:
         opposite_score = min(long_score, short_score)
 
         rejected: Dict[str, str] = {}
-        if best_open_score < self.MIN_OPEN_CONFIDENCE:
+        base_signal = self._select_base_signal(expert_signals, best_open)
+        open_votes = [
+            v for v in votes if not v.ignored and v.action == best_open
+        ]
+        confirmation_families = self._confirmation_families(open_votes)
+        expected_rr = self._expected_rr(open_votes, base_signal)
+
+        if best_open_score < self.min_open_confidence:
             winning_action = Action.HOLD
             rejected[best_open.value] = (
-                f"Суммарная уверенность {best_open_score:.2f} ниже порога {self.MIN_OPEN_CONFIDENCE:.2f}"
+                f"Суммарная уверенность {best_open_score:.2f} ниже порога {self.min_open_confidence:.2f}"
             )
-        elif best_open_score - opposite_score < self.MIN_MARGIN and opposite_score > 0:
+        elif len(confirmation_families) < self.min_confirming_families:
+            winning_action = Action.HOLD
+            rejected[best_open.value] = (
+                f"Недостаточно независимых подтверждений: "
+                f"{len(confirmation_families)}/{self.min_confirming_families} "
+                f"({', '.join(confirmation_families) if confirmation_families else 'нет активных семейств'})"
+            )
+        elif best_open_score - opposite_score < self.min_margin and opposite_score > 0:
             winning_action = Action.HOLD
             rejected[best_open.value] = (
                 f"Недостаточный перевес над противоположным сценарием "
                 f"({best_open_score:.2f} vs {opposite_score:.2f})"
             )
-        elif hold_score > best_open_score and best_open_score < 0.50:
+        elif expected_rr is not None and expected_rr < self.min_rr:
+            winning_action = Action.HOLD
+            rejected[best_open.value] = f"RR {expected_rr:.2f} ниже минимального {self.min_rr:.2f}"
+        elif hold_score > best_open_score and best_open_score < self.min_open_confidence + 0.03:
             winning_action = Action.HOLD
             rejected[best_open.value] = f"HOLD-сценарий сильнее ({hold_score:.2f} vs {best_open_score:.2f})"
         else:
@@ -122,7 +165,11 @@ class DecisionEngine:
         ]
         base_signal = self._select_base_signal(expert_signals, winning_action)
         confidence = self._final_confidence(scores, winning_action, context)
-        expected_rr = self._expected_rr(winning_votes, base_signal)
+        if winning_action != Action.HOLD:
+            expected_rr = self._expected_rr(winning_votes, base_signal)
+            confirmation_families = self._confirmation_families(winning_votes)
+        else:
+            confirmation_families = []
 
         if winning_action == Action.HOLD:
             final_signal = Signal(
@@ -134,6 +181,11 @@ class DecisionEngine:
             )
         else:
             decision_source = self._decision_source(winning_votes)
+            stop_loss_pct = (base_signal.stop_loss_pct if base_signal else None) or self.default_stop_loss_pct
+            take_profit_pct = (
+                (base_signal.take_profit_pct if base_signal else None)
+                or stop_loss_pct * self.default_take_profit_rr
+            )
             final_signal = Signal(
                 symbol=symbol,
                 action=winning_action,
@@ -142,8 +194,8 @@ class DecisionEngine:
                 reason=self._decision_reason(winning_action, winning_votes, context),
                 suggested_size_usdt=base_signal.suggested_size_usdt if base_signal else None,
                 suggested_leverage=base_signal.suggested_leverage if base_signal else None,
-                stop_loss_pct=(base_signal.stop_loss_pct if base_signal else None) or 1.5,
-                take_profit_pct=(base_signal.take_profit_pct if base_signal else None) or 3.0,
+                stop_loss_pct=stop_loss_pct,
+                take_profit_pct=take_profit_pct,
             )
 
         report = TradeDecisionReport(
@@ -156,6 +208,8 @@ class DecisionEngine:
             risk_score=context.risk_score,
             expected_rr=expected_rr,
             confidence=confidence,
+            confirmation_count=len(confirmation_families),
+            confirmation_families=confirmation_families,
             meta_notes=meta.notes,
             ai_analysis=ai_analysis,
         )
@@ -167,6 +221,11 @@ class DecisionEngine:
         votes: List[ExpertVote] = []
         for signal in signals:
             ignored = not meta.is_allowed(signal.source)
+            permission = meta.permissions.get(signal.source)
+            ignored_reason = (
+                permission.reason if permission is not None
+                else "Meta Strategy Manager не разрешил этому эксперту голосовать"
+            )
             votes.append(ExpertVote(
                 source=signal.source,
                 action=signal.action,
@@ -174,7 +233,7 @@ class DecisionEngine:
                 reason=signal.reason,
                 expected_rr=DecisionEngine._rr_from_signal(signal),
                 ignored=ignored,
-                ignored_reason="Meta Strategy Manager не разрешил этому эксперту голосовать" if ignored else "",
+                ignored_reason=ignored_reason if ignored else "",
             ))
         return votes
 
@@ -185,6 +244,10 @@ class DecisionEngine:
             if vote.ignored:
                 continue
             weight = vote.confidence
+            if vote.action == Action.HOLD:
+                # HOLD-голос эксперта — это диагностическая осторожность, а не
+                # самостоятельное veto против всех OPEN-сценариев.
+                weight *= 0.45
             if vote.action == Action.OPEN_LONG and context.trend == "UP":
                 weight *= 1.12
             elif vote.action == Action.OPEN_SHORT and context.trend == "DOWN":
@@ -207,9 +270,33 @@ class DecisionEngine:
             # экспертов дают небольшой бонус, но один уверенный эксперт не
             # исчезает просто потому, что остальные честно сказали HOLD.
             average = sum(weights) / len(weights)
-            support_bonus = min(len(weights) - 1, 3) * 0.05
-            scores[action] = round(min(average + support_bonus, 0.98), 4)
+            support_bonus = min(len(weights) - 1, 3) * (0.025 if action == Action.HOLD else 0.05)
+            cap = 0.45 if action == Action.HOLD else 0.98
+            scores[action] = round(min(average + support_bonus, cap), 4)
         return scores
+
+    @staticmethod
+    def _source_family(source: str) -> str:
+        name = source.split(":", 1)[-1]
+        mapping = {
+            "ema": "trend",
+            "vwap": "price_location",
+            "momentum": "trade_flow",
+            "orderbook": "microstructure",
+            "funding": "positioning",
+            "rsi": "mean_reversion",
+            "committee": "multi_indicator",
+        }
+        return mapping.get(name, name)
+
+    @classmethod
+    def _confirmation_families(cls, votes: List[ExpertVote]) -> List[str]:
+        families: List[str] = []
+        for vote in sorted(votes, key=lambda v: v.confidence, reverse=True):
+            family = cls._source_family(vote.source)
+            if family not in families:
+                families.append(family)
+        return families
 
     @staticmethod
     def _select_base_signal(signals: List[Signal], action: Action) -> Optional[Signal]:
@@ -245,8 +332,9 @@ class DecisionEngine:
     @staticmethod
     def _decision_reason(action: Action, votes: List[ExpertVote], context: MarketContext) -> str:
         supporters = ", ".join(v.source for v in votes) or "нет явных сторонников"
+        families = ", ".join(DecisionEngine._confirmation_families(votes)) or "нет"
         direction = "LONG" if action == Action.OPEN_LONG else "SHORT"
-        return f"{direction} победил: {supporters}. Контекст: {context.summary()}"
+        return f"{direction} победил: {supporters}. Независимые подтверждения: {families}. Контекст: {context.summary()}"
 
     @staticmethod
     def _decision_source(votes: List[ExpertVote]) -> str:

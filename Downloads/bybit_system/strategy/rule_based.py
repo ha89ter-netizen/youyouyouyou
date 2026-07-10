@@ -119,7 +119,7 @@ class TechnicalRuleCommittee:
         votes: List[str] = []  # каждый элемент "long" или "short"
         reasons: List[str] = []
 
-        # --- Голос 1: EMA cross ---
+        # --- Голос 1: EMA state ---
         ema_fast = closes.ewm(span=self.ema_fast, adjust=False).mean()
         ema_slow = closes.ewm(span=self.ema_slow, adjust=False).mean()
         prev_diff = ema_fast.iloc[-2] - ema_slow.iloc[-2]
@@ -130,18 +130,32 @@ class TechnicalRuleCommittee:
         elif prev_diff >= 0 and curr_diff < 0:
             votes.append("short")
             reasons.append(f"EMA{self.ema_fast}/{self.ema_slow} пересечение вниз")
+        elif ema_fast.iloc[-1] > ema_slow.iloc[-1] and ema_fast.iloc[-1] >= ema_fast.iloc[-3]:
+            votes.append("long")
+            reasons.append(f"EMA{self.ema_fast} выше EMA{self.ema_slow}, трендовое LONG-состояние")
+        elif ema_fast.iloc[-1] < ema_slow.iloc[-1] and ema_fast.iloc[-1] <= ema_fast.iloc[-3]:
+            votes.append("short")
+            reasons.append(f"EMA{self.ema_fast} ниже EMA{self.ema_slow}, трендовое SHORT-состояние")
 
         # --- Голос 2: RSI выход из экстремума (коррекционный сигнал) ---
         rsi_series = rsi(closes, self.rsi_period)
         rsi_prev, rsi_curr = rsi_series.iloc[-2], rsi_series.iloc[-1]
+        rsi_recent_min = rsi_series.tail(6).min()
+        rsi_recent_max = rsi_series.tail(6).max()
         if rsi_prev < self.rsi_oversold <= rsi_curr:
             votes.append("long")
             reasons.append(f"RSI вышел из перепроданности ({rsi_prev:.1f}->{rsi_curr:.1f})")
         elif rsi_prev > self.rsi_overbought >= rsi_curr:
             votes.append("short")
             reasons.append(f"RSI вышел из перекупленности ({rsi_prev:.1f}->{rsi_curr:.1f})")
+        elif rsi_recent_min <= 35 and 30 <= rsi_curr <= 42 and rsi_curr > rsi_prev:
+            votes.append("long")
+            reasons.append(f"RSI восстанавливается после перепроданности ({rsi_prev:.1f}->{rsi_curr:.1f})")
+        elif rsi_recent_max >= 65 and 58 <= rsi_curr <= 70 and rsi_curr < rsi_prev:
+            votes.append("short")
+            reasons.append(f"RSI остывает после перекупленности ({rsi_prev:.1f}->{rsi_curr:.1f})")
 
-        # --- Голос 3: MACD histogram пересекает 0 ---
+        # --- Голос 3: MACD histogram state ---
         _, _, hist = macd(closes)
         hist_prev, hist_curr = hist.iloc[-2], hist.iloc[-1]
         if hist_prev <= 0 < hist_curr:
@@ -150,6 +164,12 @@ class TechnicalRuleCommittee:
         elif hist_prev >= 0 > hist_curr:
             votes.append("short")
             reasons.append("MACD histogram пересёк 0 вниз")
+        elif hist_curr > 0 and hist_curr >= hist_prev:
+            votes.append("long")
+            reasons.append("MACD histogram положительный и не ослабевает")
+        elif hist_curr < 0 and hist_curr <= hist_prev:
+            votes.append("short")
+            reasons.append("MACD histogram отрицательный и не ослабевает")
 
         # --- Голос 4: Bollinger — цена у края полосы ---
         if len(candles_df) >= 20:
