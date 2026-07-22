@@ -26,7 +26,9 @@ from config.settings import BybitConfig
 from storage.db import Database
 from storage.models import Candle, FundingRate, OpenInterest, Liquidation, Trade, OrderbookSnapshot
 from storage.journal import TradeJournal
+from storage.risk_state import RiskStateStore
 from strategy.signal import Signal, Action
+from timeutils import from_epoch_ms, utc_today, utcnow
 from strategy.rule_based import TechnicalRuleCommittee
 from strategy.experts import ExpertSignalCollector
 from strategy.indicators import compute_all_indicators, trend_direction
@@ -35,10 +37,48 @@ from meta_strategy import MetaStrategyManager
 from decision_engine import DecisionEngine
 from portfolio_risk import PortfolioRiskEngine
 from ai_market_analyst import AIMarketAnalyst
-from risk.risk_manager import RiskManager
-from execution.execution_engine import ExecutionEngine
+from risk.risk_manager import RiskManager, orphan_cause
+from execution.execution_engine import ExecutionEngine, FillStatus, OrderConfirmation
 
 logger = logging.getLogger(__name__)
+
+
+def _unknown_confirmation(detail: str) -> OrderConfirmation:
+    return OrderConfirmation(status=FillStatus.UNKNOWN, detail=detail)
+
+
+def _orphan_breaker_reason(order_link_id: str, symbol: str) -> str:
+    """
+    Единый текст причины breaker для orphaned-сделки.
+
+    Одна функция намеренно: причина взводится из двух мест (обнаружение в цикле
+    и восстановление из журнала при старте), а trip_circuit_breaker считает
+    повтор no-op только при совпадении и ключа, И текста. Разъехавшиеся строки
+    молча превратили бы идемпотентный вызов в переписывание причины.
+    """
+    return (
+        f"orphaned-сделка {order_link_id} по {symbol}: результат неизвестен, "
+        f"дневной лимит убытка нельзя считать достоверным"
+    )
+
+# Сколько циклов подряд пытаемся найти закрытие для сделки, которую журнал
+# считает открытой, а живой позиции нет. После этого — orphaned + circuit breaker.
+_ORPHAN_MAX_ATTEMPTS = 3
+
+# Допуск на проскальзывание при сверке цены входа с closed PnL. Нужен потому,
+# что цена входа в журнале может быть оценкой (если биржа не подтвердила
+# фактическую цену исполнения). Когда фактическая цена известна, совпадение
+# получается практически точным и допуск не задействуется.
+_PRICE_TOLERANCE_PCT = 0.5
+
+# Окно, за которое Bybit ещё отдаёт closed PnL. Orphaned-сделку старше него
+# автоматически восстановить невозможно.
+_CLOSED_PNL_WINDOW_SECONDS = 7 * 24 * 60 * 60
+
+# Сколько ждём подтверждения fill, прежде чем считать состояние неизвестным.
+# Ордер, зависший в pending дольше этого срока без живой позиции, эскалируется
+# в блокировку символа: продолжать вслепую опаснее, чем остановиться.
+_PENDING_MAX_AGE_SECONDS = 300
 
 
 @dataclass
@@ -75,12 +115,70 @@ class StrategyEngine:
         )
         self.portfolio_risk = PortfolioRiskEngine(cfg)
         self.ai_market_analyst = AIMarketAnalyst()
-        self.risk_manager = RiskManager(cfg)
+        # Состояние Risk Manager персистится: дневной лимит убытка, cooldown и
+        # circuit breaker обязаны пережить перезапуск процесса.
+        self.risk_manager = RiskManager(cfg, state_store=RiskStateStore(db))
         self.execution = ExecutionEngine(cfg)
         self.journal = TradeJournal(db)
         self._trailing_activated: set = set()  # order_link_id, для которых уже включили trailing
         self._last_entry_ts: Optional[float] = None
         self._pending_exit_reasons: dict[str, str] = {}
+        # order_link_id -> сколько циклов подряд не можем найти закрытие
+        self._orphan_attempts: dict[str, int] = {}
+        self._reconcile_daily_pnl_with_journal()
+
+    def _reconcile_daily_pnl_with_journal(self):
+        """
+        Сверяет восстановленное состояние Risk Manager с журналом при старте.
+
+        risk_state мог не дописаться (падение между закрытием сделки и записью
+        состояния), поэтому журнал закрытых сделок — независимый источник правды.
+        При расхождении Risk Manager берёт более консервативное значение.
+        """
+        try:
+            journal_pnl, closed_count = self.journal.sum_closed_pnl_for_utc_day(utc_today())
+        except Exception:
+            logger.exception(
+                "Не удалось свериться с журналом по дневному PnL при старте. "
+                "Risk Manager продолжает с сохранённым состоянием."
+            )
+            return
+        self.risk_manager.restore_daily_pnl_from_journal(journal_pnl, closed_count)
+
+        self._restore_breaker_from_orphaned_trades()
+
+    def _restore_breaker_from_orphaned_trades(self):
+        """
+        Взводит circuit breaker по orphaned-сделкам, найденным в журнале.
+
+        risk_state — кэш, а журнал — источник правды. Если строку состояния
+        потеряли (свежая БД, ручная чистка), но в trade_log есть сделки с
+        неизвестным результатом, торговать нельзя: без этого бот стартовал бы
+        со снятым breaker и считал дневной лимит по неполным данным.
+
+        Идемпотентно: причина именована по order_link_id, повторный взвод той же
+        причины с тем же текстом — no-op.
+        """
+        try:
+            orphaned = self.journal.get_orphaned_trades()
+        except Exception:
+            logger.exception("Не удалось проверить журнал на orphaned-сделки при старте")
+            return
+        if not orphaned:
+            return
+
+        logger.critical(
+            "В журнале %d сделок в статусе orphaned — их финансовый результат неизвестен. "
+            "Circuit breaker взведён. Автоматический поиск закрытия продолжится в торговом цикле; "
+            "состояние смотрите через `python risk_admin.py status`.",
+            len(orphaned),
+        )
+        for trade in orphaned:
+            self.risk_manager.trip_circuit_breaker(
+                _orphan_breaker_reason(trade["order_link_id"], trade["symbol"]),
+                sticky=True,
+                cause=orphan_cause(trade["order_link_id"]),
+            )
 
     def run_forever(self):
         logger.info("Strategy Engine запущен, интервал решений: %d сек", self.cfg.decision_interval_sec)
@@ -97,6 +195,7 @@ class StrategyEngine:
         logger.info("Баланс: %.2f USDT, открытых позиций: %d", balance, len(positions))
 
         self.risk_manager.ensure_daily_reset(balance)
+        self._resolve_pending_entries(positions)
         self._manage_trailing_stops(positions)
         self._sync_closed_trades(positions)
 
@@ -113,6 +212,47 @@ class StrategyEngine:
                 logger.exception("Ошибка обработки символа %s", symbol)
 
         self._execute_ranked_candidates(candidates, balance, positions)
+
+    def _resolve_pending_entries(self, positions: list):
+        """
+        Разбирает ордера, принятые биржей, но не подтверждённые как исполненные.
+
+        Такое состояние переживает перезапуск (оно в risk_state), поэтому его
+        нужно чем-то закрывать, иначе символ останется заблокирован навсегда:
+        - есть живая позиция -> судьба ясна, снимаем pending;
+        - позиции нет и ждём дольше лимита -> экспозиция неизвестна, блокируем
+          символ до ручного разбора вместо того, чтобы молча забыть.
+        """
+        pending_symbols = self.risk_manager.pending_entry_symbols()
+        if not pending_symbols:
+            return
+
+        live_symbols = {
+            p.get("symbol") for p in positions
+            if float(p.get("size", 0) or 0) > 0
+        }
+        for symbol in pending_symbols:
+            if symbol in live_symbols:
+                logger.info(
+                    "%s: неподтверждённый ордер разрешён — позиция видна на бирже, снимаю pending",
+                    symbol,
+                )
+                self.risk_manager.clear_entry_pending(symbol)
+                continue
+
+            age = self.risk_manager.pending_entry_age_seconds(symbol)
+            if age is not None and age > _PENDING_MAX_AGE_SECONDS:
+                self.risk_manager.clear_entry_pending(symbol)
+                self.risk_manager.block_symbol(
+                    symbol,
+                    f"ордер принят биржей {age:.0f}s назад, но ни исполнение, ни позиция "
+                    f"так и не подтвердились",
+                )
+                logger.critical(
+                    "%s: неподтверждённый ордер завис на %.0fs без живой позиции. "
+                    "Символ заблокирован до ручной сверки с биржей.",
+                    symbol, age,
+                )
 
     def _manage_trailing_stops(self, positions: list):
         """
@@ -136,6 +276,16 @@ class StrategyEngine:
 
                 already_trailing = float(p.get("trailingStop", 0) or 0) > 0
                 if pnl_pct >= self.cfg.trailing_activation_pct and not already_trailing:
+                    if not self.cfg.trading_enabled:
+                        # Решение логируем, действие не выполняем. Guard в
+                        # ExecutionEngine всё равно заблокировал бы вызов —
+                        # здесь ранний выход только ради читаемого лога.
+                        logger.info(
+                            "%s: SAFE MODE: trailing stop НЕ выставлен (TRADING_ENABLED=false), "
+                            "прибыль %.2f%% >= порога %.2f%%",
+                            symbol, pnl_pct, self.cfg.trailing_activation_pct,
+                        )
+                        continue
                     self.execution.set_trailing_stop(symbol, mark_price, self.cfg.trailing_distance_pct)
                     logger.info(
                         "%s: активирован trailing stop, прибыль %.2f%% >= порога %.2f%%",
@@ -157,7 +307,6 @@ class StrategyEngine:
         Risk Manager не даёт открыть вторую позицию по тому же символу, пока
         текущая не закрыта — на символ в любой момент максимум одна открытая сделка.
         """
-        PRICE_TOLERANCE_PCT = 0.5  # допуск на проскальзывание при сверке цены входа
         live_symbols = {
             p.get("symbol")
             for p in (positions or [])
@@ -165,62 +314,247 @@ class StrategyEngine:
         }
 
         for symbol in self.cfg.symbols:
-            open_trades = self.journal.get_open_trades(symbol)
-            if not open_trades:
+            # И "open", и "orphaned": orphaned обязан пересверяться, иначе его
+            # результат навсегда выпадет из дневного PnL. Раньше сюда попадали
+            # только "open", и orphaned становился вечным тупиком.
+            trades = self.journal.get_unresolved_trades(symbol)
+            if not trades:
                 continue
-            try:
-                closed = self.execution.get_closed_pnl(symbol, limit=50)
-            except Exception:
-                logger.exception("Не удалось получить closed PnL для %s", symbol)
+            trades = [t for t in trades if self._is_worth_reconciling(t)]
+            if not trades:
                 continue
 
-            for trade in open_trades:
-                match = self._find_matching_closed_pnl(trade, closed, PRICE_TOLERANCE_PCT)
+            try:
+                # Ищем от момента открытия САМОЙ СТАРОЙ неразобранной сделки и с
+                # пагинацией. Прежний get_closed_pnl(limit=50) отдавал только
+                # последние записи: если после нашей сделки прошло больше
+                # закрытий или бот стоял долго, нужное закрытие не попадало в
+                # окно, и сделка навсегда оставалась "открытой" в журнале.
+                oldest_ms = min(
+                    (t["opened_at_ms"] for t in trades if t.get("opened_at_ms") is not None),
+                    default=None,
+                )
+                closed = self.execution.get_closed_pnl_since(symbol, start_time_ms=oldest_ms)
+            except Exception:
+                # Ошибка API != "закрытий нет". Пропускаем символ целиком, не
+                # трогая счётчики orphan: иначе сетевой сбой пометил бы живые
+                # сделки orphaned.
+                logger.exception("Не удалось получить closed PnL для %s — символ пропущен в этом цикле", symbol)
+                continue
+
+            has_live_position = symbol in live_symbols
+            for trade in trades:
+                match = self._find_matching_closed_pnl(trade, closed)
                 if match is None:
-                    if positions is not None and symbol not in live_symbols:
-                        logger.warning(
-                            "%s: журнал считает сделку %s открытой, но live-позиции нет; "
-                            "closed_pnl не найден по цене %.4f. Нужна ручная сверка или расширение окна closed_pnl.",
-                            symbol, trade["order_link_id"], trade["entry_price"],
-                        )
-                    continue
-                exit_price = float(match.get("avgExitPrice", 0) or 0)
-                pnl_usdt = float(match.get("closedPnl", 0) or 0)
-                pending_exit_reasons = getattr(self, "_pending_exit_reasons", {})
-                exit_reason = pending_exit_reasons.pop(symbol, None) or self._infer_exit_reason(match)
-                exit_snapshot = self._build_exit_snapshot(symbol, match)
-                if self.journal.log_exit(
-                    trade["order_link_id"],
-                    exit_price,
-                    pnl_usdt,
-                    exit_reason=exit_reason,
-                    exit_snapshot=exit_snapshot,
-                ):
-                    self.risk_manager.record_closed_pnl(pnl_usdt)
-                    holding_seconds = self._holding_seconds(trade.get("opened_at_ms"))
-                    pnl_pct = self._position_pnl_pct(trade, exit_price)
-                    logger.info(
-                        "TRADE_CLOSE symbol=%s direction=%s entry=%.6f exit=%.6f pnl_usdt=%.4f "
-                        "pnl_pct=%.3f holding_seconds=%s exit_reason=%s orderLinkId=%s",
-                        symbol,
-                        trade.get("action"),
-                        trade["entry_price"],
-                        exit_price,
-                        pnl_usdt,
-                        pnl_pct,
-                        holding_seconds,
-                        exit_reason,
-                        trade["order_link_id"],
+                    self._handle_unmatched_trade(
+                        symbol, trade, len(closed), positions, has_live_position,
                     )
+                    continue
+                self._apply_closed_pnl(symbol, trade, match)
+
+    def _apply_closed_pnl(self, symbol: str, trade: dict, match: dict):
+        """
+        Записывает найденный результат сделки. Единственная точка, где дневной
+        PnL пополняется реализованным результатом.
+
+        Идемпотентность обеспечивает журнал: record_closed_pnl вызывается ТОЛЬКО
+        если log_exit сообщил recorded=True, то есть если именно этот вызов
+        перевёл сделку в "closed". Повторная реконсиляция уже закрытой сделки
+        вернёт recorded=False и ничего не прибавит.
+        """
+        order_link_id = trade["order_link_id"]
+        self._orphan_attempts.pop(order_link_id, None)
+
+        exit_price = float(match.get("avgExitPrice", 0) or 0)
+        pnl_usdt = float(match.get("closedPnl", 0) or 0)
+        closed_at = self._closed_at_from_match(match)
+        exit_reason = self._pending_exit_reasons.pop(symbol, None) or self._infer_exit_reason(match)
+        exit_snapshot = self._build_exit_snapshot(symbol, match)
+
+        result = self.journal.log_exit(
+            order_link_id,
+            exit_price,
+            pnl_usdt,
+            exit_reason=exit_reason,
+            exit_snapshot=exit_snapshot,
+            closed_at=closed_at,
+        )
+        if not result.recorded:
+            if result.already_closed:
+                logger.debug(
+                    "%s: сделка %s уже закрыта — PnL повторно не учитывается",
+                    symbol, order_link_id,
+                )
+            return
+
+        effective_closed_at = result.closed_at or utcnow()
+        if effective_closed_at.date() == utc_today():
+            self.risk_manager.record_closed_pnl(pnl_usdt)
+        else:
+            # Сделка закрылась в прошлые сутки (например, восстановленный orphan).
+            # Прибавлять её к сегодняшнему дневному лимиту было бы неверно:
+            # лимит считает убыток за текущий торговый день.
+            logger.warning(
+                "%s: сделка %s закрылась %s (не сегодня) — её PnL=%.4f USDT записан в журнал, "
+                "но в дневной лимит за сегодня не включён",
+                symbol, order_link_id, effective_closed_at.date(), pnl_usdt,
+            )
+
+        if result.recovered_from_orphan:
+            self._on_orphan_recovered(symbol, order_link_id, pnl_usdt, effective_closed_at)
+
+        holding_seconds = self._holding_seconds(trade.get("opened_at_ms"))
+        pnl_pct = self._position_pnl_pct(trade, exit_price)
+        logger.info(
+            "TRADE_CLOSE symbol=%s direction=%s entry=%.6f exit=%.6f pnl_usdt=%.4f "
+            "pnl_pct=%.3f holding_seconds=%s exit_reason=%s recovered=%s orderLinkId=%s",
+            symbol, trade.get("action"), trade["entry_price"], exit_price, pnl_usdt,
+            pnl_pct, holding_seconds, exit_reason, result.recovered_from_orphan, order_link_id,
+        )
+
+    def _on_orphan_recovered(self, symbol: str, order_link_id: str, pnl_usdt: float, closed_at):
+        """
+        Сделка вернулась из orphaned. Снимаем ровно ту причину circuit breaker,
+        которую она породила — остальные (например, дневной лимит убытка)
+        остаются в силе.
+
+        Идемпотентно: resolve_breaker_cause по уже снятой причине вернёт False.
+        """
+        resolved = self.risk_manager.resolve_breaker_cause(orphan_cause(order_link_id))
+        logger.warning(
+            "ORPHAN_RECOVERED symbol=%s orderLinkId=%s pnl_usdt=%.4f closed_at=%s "
+            "breaker_cause_resolved=%s remaining_causes=%s",
+            symbol, order_link_id, pnl_usdt, closed_at.isoformat(),
+            resolved, ", ".join(self.risk_manager.breaker_causes()) or "нет",
+        )
+
+    def _is_worth_reconciling(self, trade: dict) -> bool:
+        """
+        Orphaned-сделку старше окна closed PnL (7 суток) биржа уже не отдаст —
+        сверять её бессмысленно, и незачем каждый цикл расширять окно запроса
+        до её времени открытия. Такая сделка остаётся orphaned навсегда и
+        разбирается только человеком.
+        """
+        if trade.get("status") != "orphaned":
+            return True
+        opened_at_ms = trade.get("opened_at_ms")
+        if opened_at_ms is None:
+            return False
+        age_seconds = (time.time() * 1000 - opened_at_ms) / 1000
+        if age_seconds > _CLOSED_PNL_WINDOW_SECONDS:
+            logger.debug(
+                "%s: orphaned-сделка %s старше окна closed PnL — автоматическая сверка невозможна",
+                trade.get("symbol"), trade.get("order_link_id"),
+            )
+            return False
+        return True
 
     @staticmethod
-    def _find_matching_closed_pnl(trade: dict, closed_pnl_list: list, tolerance_pct: float) -> Optional[dict]:
+    def _closed_at_from_match(match: dict):
+        """Реальное время закрытия с биржи, а не 'сейчас'."""
+        for key in ("updatedTime", "createdTime"):
+            closed_at = from_epoch_ms(match.get(key))
+            if closed_at is not None:
+                return closed_at
+        return None
+
+    def _handle_unmatched_trade(
+        self,
+        symbol: str,
+        trade: dict,
+        scanned: int,
+        positions: Optional[list],
+        has_live_position: bool,
+    ):
         """
-        Ищет запись closed_pnl, которая соответствует нашей открытой сделке:
-        - та же цена входа (avgEntryPrice) с допуском на проскальзывание
-        - createdTime записи ПОЗЖЕ, чем наш opened_at (закрытие не может быть раньше открытия)
-        Если совпадений несколько — берём ближайшую по времени к нашему opened_at.
+        Закрытие для неразобранной сделки не найдено. Что делать — зависит от
+        того, есть ли живая позиция.
         """
+        order_link_id = trade["order_link_id"]
+
+        if has_live_position:
+            # Позиция жива: сделка совершенно нормальна, закрытия и не должно быть.
+            # Счётчик безуспешных попыток сбрасываем — иначе редкие моменты, когда
+            # биржа не показала позицию, накапливались бы за часы и в итоге
+            # пометили бы orphaned полностью здоровую сделку.
+            self._orphan_attempts.pop(order_link_id, None)
+            return
+
+        if positions is None:
+            # Снимка позиций нет — судить не о чем.
+            return
+
+        if trade.get("status") == "orphaned":
+            # Уже orphaned и breaker уже взведён: просто продолжаем тихо искать.
+            # Повторно взводить причину не нужно — она и так активна.
+            logger.info(
+                "%s: orphaned-сделка %s пока не восстановлена (просмотрено %d записей closed PnL). "
+                "Поиск продолжится в следующих циклах.",
+                symbol, order_link_id, scanned,
+            )
+            return
+
+        attempts = self._orphan_attempts.get(order_link_id, 0) + 1
+        self._orphan_attempts[order_link_id] = attempts
+
+        logger.warning(
+            "%s: журнал считает сделку %s открытой, но live-позиции нет; "
+            "closed_pnl не найден по цене %.4f среди %d записей (попытка %d/%d). "
+            "Нужна ручная сверка или расширение окна closed_pnl.",
+            symbol, order_link_id, trade["entry_price"], scanned, attempts, _ORPHAN_MAX_ATTEMPTS,
+        )
+
+        if attempts < _ORPHAN_MAX_ATTEMPTS:
+            return
+
+        reason = (
+            f"закрытие не найдено за {attempts} попыток: позиции нет, "
+            f"closed_pnl по цене входа {trade['entry_price']} отсутствует"
+        )
+        if not self.journal.mark_orphaned(order_link_id, reason):
+            return
+        self._orphan_attempts.pop(order_link_id, None)
+        logger.critical(
+            "%s: сделка %s признана ORPHANED — финансовый результат неизвестен, "
+            "дневной PnL считается по неполным данным. Торговля останавливается. "
+            "Поиск закрытия продолжится автоматически; при находке статус снимется сам.",
+            symbol, order_link_id,
+        )
+        self.risk_manager.trip_circuit_breaker(
+            _orphan_breaker_reason(order_link_id, symbol),
+            # Неизвестный результат не рассасывается от наступления полуночи.
+            # Причина именована: когда сделка восстановится, снимется ровно она,
+            # не задев остальные причины.
+            sticky=True,
+            cause=orphan_cause(order_link_id),
+        )
+
+    @classmethod
+    def _find_matching_closed_pnl(
+        cls,
+        trade: dict,
+        closed_pnl_list: list,
+        tolerance_pct: float = _PRICE_TOLERANCE_PCT,
+    ) -> Optional[dict]:
+        """
+        Ищет запись closed_pnl, соответствующую нашей неразобранной сделке.
+
+        Критерии, от жёсткого к мягкому:
+        1. направление: сторона закрывающего ордера должна быть ПРОТИВОПОЛОЖНА
+           направлению нашей позиции (long закрывается Sell). Отсекает ложный
+           матч длинной и короткой сделки, открытых по одной цене;
+        2. время: закрытие не может быть раньше открытия;
+        3. цена входа: avgEntryPrice с допуском на проскальзывание.
+
+        Из подходящих берём запись с БЛИЖАЙШЕЙ ценой входа, а при равной цене —
+        самую раннюю по времени. Раньше отбор шёл только по времени, из-за чего
+        при нескольких близких по цене закрытиях мог выиграть не тот кандидат.
+        """
+        entry_price = trade.get("entry_price")
+        if not entry_price:
+            return None
+        expected_close_side = cls._expected_close_side(trade.get("action"))
+
         candidates = []
         for c in closed_pnl_list:
             avg_entry = c.get("avgEntryPrice")
@@ -233,18 +567,30 @@ class StrategyEngine:
             except (TypeError, ValueError):
                 continue
 
+            side = c.get("side")
+            if expected_close_side and side and side != expected_close_side:
+                continue  # закрытие позиции другого направления
+
             if trade["opened_at_ms"] is not None and created_time_ms < trade["opened_at_ms"]:
                 continue  # закрытие раньше открытия -- не может относиться к этой сделке
 
-            price_diff_pct = abs(avg_entry - trade["entry_price"]) / trade["entry_price"] * 100
+            price_diff_pct = abs(avg_entry - entry_price) / entry_price * 100
             if price_diff_pct <= tolerance_pct:
-                candidates.append((created_time_ms, c))
+                candidates.append((price_diff_pct, created_time_ms, c))
 
         if not candidates:
             return None
-        # Берём самое РАННЕЕ закрытие после открытия -- это и есть закрытие именно этой сделки
-        candidates.sort(key=lambda x: x[0])
-        return candidates[0][1]
+        candidates.sort(key=lambda x: (round(x[0], 6), x[1]))
+        return candidates[0][2]
+
+    @staticmethod
+    def _expected_close_side(action: Optional[str]) -> Optional[str]:
+        """Сторона ордера, которым закрывается наша позиция."""
+        if action in (Action.OPEN_LONG.value, "open_long"):
+            return "Sell"
+        if action in (Action.OPEN_SHORT.value, "open_short"):
+            return "Buy"
+        return None
 
     # ------------------------------------------------------------------
 
@@ -309,6 +655,11 @@ class StrategyEngine:
             return self._manage_exit(symbol, existing_position, final_signal, trend)
 
         if final_signal.action == Action.HOLD:
+            return False
+
+        block_reason = self._entry_block_reason(symbol, positions)
+        if block_reason:
+            logger.info("%s: новый вход заблокирован: %s", symbol, block_reason)
             return False
 
         portfolio_check = self.portfolio_risk.evaluate(final_signal, positions)
@@ -393,8 +744,12 @@ class StrategyEngine:
                 )
                 continue
 
-            if self._find_open_position(candidate.symbol, positions) is not None:
-                logger.info("%s: кандидат пропущен: позиция уже открыта после обновления портфеля", candidate.symbol)
+            # Повторная проверка перед самым ордером: между сбором кандидатов и
+            # этим моментом мог открыться вход по тому же символу (в том числе
+            # предыдущим кандидатом этого же цикла).
+            block_reason = self._entry_block_reason(candidate.symbol, positions)
+            if block_reason:
+                logger.info("%s: кандидат пропущен: %s", candidate.symbol, block_reason)
                 continue
 
             portfolio_check = self.portfolio_risk.evaluate(candidate.final_signal, positions)
@@ -473,9 +828,54 @@ class StrategyEngine:
                 or resp.get("retExtInfo", {}).get("orderLinkId")
                 or ""
             )
+
+            # Биржа приняла запрос — с этой секунды возможна реальная экспозиция.
+            # Счётчики и cooldown фиксируем ПЕРВЫМ делом, до журнала и до
+            # подтверждения fill: любая последующая ошибка (БД, сеть, падение
+            # процесса) не должна давать право на повторный вход по символу.
+            self.risk_manager.record_open_trade(symbol)
+            self.risk_manager.mark_entry_pending(symbol)
+
             if not order_link_id:
-                logger.critical("%s: биржа приняла ордер, но order_link_id потерян: %s", symbol, resp)
+                # Ордер живёт на бирже, но идентифицировать его мы не можем:
+                # ни подтвердить, ни сопоставить с закрытием.
+                self.risk_manager.block_symbol(
+                    symbol, "биржа приняла ордер, но order_link_id потерян"
+                )
+                logger.critical(
+                    "%s: биржа приняла ордер, но order_link_id потерян — символ заблокирован, "
+                    "требуется ручная сверка позиции с биржей: %s",
+                    symbol, resp,
+                )
                 return True
+
+            confirmation = self._confirm_entry_fill(symbol, order_link_id)
+
+            # Реальные цифры исполнения важнее наших предположений.
+            # last_price — это закрытие свечи из БД, а не цена сделки; именно
+            # из-за этого расхождения сверка с closed PnL вынуждена работать с
+            # допуском ±0.5%. Если биржа сказала фактическую цену и объём —
+            # пишем в журнал их, и тогда avgEntryPrice совпадает почти точно.
+            entry_price = confirmation.avg_price or last_price
+            filled_size_usdt = check.approved_size_usdt
+            if confirmation.filled_qty > 0 and confirmation.avg_price:
+                filled_size_usdt = confirmation.filled_qty * confirmation.avg_price
+                if abs(filled_size_usdt - check.approved_size_usdt) > 0.01:
+                    logger.info(
+                        "%s: фактический размер позиции %.4f USDT отличается от одобренного "
+                        "%.4f USDT (округление лота или частичное исполнение) — в журнал идёт фактический",
+                        symbol, filled_size_usdt, check.approved_size_usdt,
+                    )
+
+            if confirmation.status == FillStatus.REJECTED:
+                # Экспозиции нет. Cooldown и счётчик оставляем взведёнными
+                # намеренно: отклонённый ордер — сигнал, что по символу что-то
+                # не так, и долбиться в него в том же цикле не нужно.
+                logger.warning(
+                    "%s: ордер %s отклонён биржей после принятия (%s) — позиции нет",
+                    symbol, order_link_id, confirmation.detail,
+                )
+                return False
 
             sl_pct = final_signal.stop_loss_pct or self.cfg.default_stop_loss_pct
             tp_pct = final_signal.take_profit_pct
@@ -484,9 +884,9 @@ class StrategyEngine:
                 "sl_pct=%s sl_price=%s tp_pct=%s tp_price=%s orderLinkId=%s supporters=%s reason=%s",
                 symbol,
                 final_signal.action.value,
-                check.approved_size_usdt,
+                filled_size_usdt,
                 check.approved_leverage,
-                last_price,
+                entry_price,
                 sl_pct,
                 self._price_from_pct(last_price, final_signal.action, sl_pct, is_stop=True),
                 tp_pct,
@@ -501,8 +901,8 @@ class StrategyEngine:
                 action=final_signal.action,
                 source=final_signal.source,
                 reason=decision_report.journal_reason(),
-                entry_price=last_price,
-                size_usdt=check.approved_size_usdt,
+                entry_price=entry_price,
+                size_usdt=filled_size_usdt,
                 leverage=check.approved_leverage,
                 stop_loss_pct=final_signal.stop_loss_pct or self.cfg.default_stop_loss_pct,
                 take_profit_pct=final_signal.take_profit_pct,
@@ -519,12 +919,17 @@ class StrategyEngine:
                 expert_votes=candidate.expert_vote_rows,
             )
             if not journal_saved:
+                # Счётчик и cooldown уже зафиксированы выше, поэтому повторного
+                # входа по символу не будет. Но сделку теперь нечем сверять с
+                # закрытием, поэтому символ блокируется до ручного разбора.
+                self.risk_manager.block_symbol(
+                    symbol, "ордер исполнен, но вход не записан в журнал — сверка с закрытием невозможна"
+                )
                 logger.critical(
-                    "%s: ордер создан, но вход не записан в trade_log; позиция требует ручной сверки. order_link_id=%s",
+                    "%s: ордер создан, но вход не записан в trade_log; позиция требует ручной сверки. "
+                    "Символ заблокирован для новых входов. order_link_id=%s",
                     symbol, order_link_id,
                 )
-            else:
-                self.risk_manager.record_open_trade(symbol)
             return True
 
         logger.warning(
@@ -533,12 +938,94 @@ class StrategyEngine:
         )
         return False
 
+    def _confirm_entry_fill(self, symbol: str, order_link_id: str):
+        """
+        Выясняет судьбу принятого ордера и приводит состояние Risk Manager
+        в соответствие. Возвращает OrderConfirmation.
+
+        Ключевое правило: UNKNOWN — это НЕ "ордера нет". Мы не знаем, есть ли
+        экспозиция, поэтому символ блокируется до ручного разбора, и пишется
+        CRITICAL. Сам факт входа при этом считается состоявшимся.
+        """
+        try:
+            confirmation = self.execution.confirm_order(symbol, order_link_id)
+        except Exception:
+            logger.exception("%s: подтверждение ордера %s упало с ошибкой", symbol, order_link_id)
+            self.risk_manager.block_symbol(
+                symbol, f"подтверждение ордера {order_link_id} завершилось ошибкой"
+            )
+            logger.critical(
+                "%s: состояние ордера %s неизвестно из-за ошибки подтверждения — "
+                "символ заблокирован, требуется ручная сверка с биржей",
+                symbol, order_link_id,
+            )
+            return _unknown_confirmation("исключение при подтверждении")
+
+        if confirmation.status == FillStatus.UNKNOWN:
+            self.risk_manager.block_symbol(
+                symbol, f"состояние ордера {order_link_id} не подтверждено: {confirmation.detail}"
+            )
+            logger.critical(
+                "%s: ордер %s принят биржей, но исполнение НЕ подтверждено (%s). "
+                "Возможна незарегистрированная позиция. Символ заблокирован для новых входов, "
+                "требуется ручная сверка с биржей.",
+                symbol, order_link_id, confirmation.detail,
+            )
+            # pending намеренно НЕ снимаем: неизвестность не должна выглядеть
+            # как разрешённая ситуация.
+            return confirmation
+
+        # Судьба ордера выяснена — снимаем признак "ждём подтверждения".
+        self.risk_manager.clear_entry_pending(symbol)
+
+        if confirmation.status == FillStatus.PARTIALLY_FILLED:
+            logger.warning(
+                "%s: ордер %s исполнен частично (qty=%.8f) — позиция меньше одобренной Risk Manager",
+                symbol, order_link_id, confirmation.filled_qty,
+            )
+        return confirmation
+
     @staticmethod
     def _find_open_position(symbol: str, positions: list) -> Optional[dict]:
         for p in positions:
             if p.get("symbol") == symbol and float(p.get("size", 0)) > 0:
                 return p
         return None
+
+    def _entry_block_reason(self, symbol: str, positions: list) -> Optional[str]:
+        """
+        Единый гейт повторного входа. Опрашивает ВСЕ источники, которые могут
+        знать, что символ занят, и блокирует вход, если хотя бы один так считает:
+
+        1. живая позиция на бирже;
+        2. открытая сделка в журнале (переживает перезапуск, в отличие от памяти);
+        3. неподтверждённый ордер, cooldown, лимит сделок по символу, ручная
+           блокировка — всё это знает Risk Manager.
+
+        Раньше проверялся только источник (1) — снимок позиций, снятый один раз
+        в начале цикла. Любое запаздывание биржи, сбой журнала или перезапуск
+        процесса открывали окно для второй позиции по тому же символу.
+        """
+        if self._find_open_position(symbol, positions) is not None:
+            return f"по {symbol} уже есть живая позиция на бирже"
+
+        try:
+            open_trades = self.journal.get_open_trades(symbol)
+        except Exception:
+            # Журнал недоступен -> мы не знаем, есть ли незакрытая сделка.
+            # Отказ от входа здесь безопаснее, чем вход вслепую.
+            logger.exception(
+                "%s: не удалось проверить журнал на открытые сделки — вход заблокирован из осторожности",
+                symbol,
+            )
+            return f"журнал недоступен, состояние {symbol} неизвестно"
+        if open_trades:
+            return (
+                f"журнал считает сделку по {symbol} открытой "
+                f"(order_link_id={open_trades[0].get('order_link_id')})"
+            )
+
+        return self.risk_manager.symbol_block_reason(symbol)
     
     def _manage_exit(self, symbol: str, position: dict, final_signal: Signal, trend: Optional[str]) -> bool:
         """
@@ -563,15 +1050,40 @@ class StrategyEngine:
         if close_reason is None:
             return False
 
+        if not self.cfg.trading_enabled:
+            # Решение зафиксировано в логе, но настоящий reduceOnly-ордер в
+            # safe mode не отправляется. Guard в ExecutionEngine — вторая линия
+            # защиты; здесь ранний выход, чтобы не взводить pending_exit_reason
+            # для закрытия, которого не было.
+            logger.info(
+                "%s: SAFE MODE: позиция (%s) НЕ закрыта (TRADING_ENABLED=false) — %s",
+                symbol, position_direction, close_reason,
+            )
+            return False
+
         logger.info("%s: закрываю позицию (%s) -- %s", symbol, position_direction, close_reason)
 
         try:
-            self.execution.close_position(symbol, side, size, source="exit_manager")
-            self._pending_exit_reasons[symbol] = "exit manager"
-            return True
+            resp = self.execution.close_position(symbol, side, size, source="exit_manager")
         except Exception:
             logger.exception("Не удалось закрыть позицию %s через Exit Manager", symbol)
             return False
+
+        if resp.get("retCode") != 0:
+            # Биржа НЕ приняла запрос на закрытие: позиция всё ещё живая.
+            # Раньше это игнорировалось, и _pending_exit_reasons всё равно
+            # взводился в "exit manager" — при следующем реальном закрытии
+            # (по SL/TP, никак не связанном с этой попыткой) причина в журнале
+            # оказалась бы неверной.
+            logger.warning(
+                "%s: закрытие позиции через Exit Manager отклонено биржей retCode=%s retMsg=%s — "
+                "позиция остаётся открытой",
+                symbol, resp.get("retCode"), resp.get("retMsg"),
+            )
+            return False
+
+        self._pending_exit_reasons[symbol] = "exit manager"
+        return True
 
     def _apply_trend_filter(self, signal: Signal, trend: Optional[str], context, symbol: str) -> Signal:
         """

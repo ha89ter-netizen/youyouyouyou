@@ -3,6 +3,7 @@ import statistics
 from typing import Any, Callable, Iterable, Optional
 
 from analytics.reliability import ReliabilityThresholds, reliability_status
+from timeutils import trade_time_sort_key
 
 
 EPS = 1e-12
@@ -96,7 +97,10 @@ def result_metrics(
     )
     expectancy = net / total if total else None
     expectancy_pct = mean(pct_values)
-    ordered = sorted(rows, key=lambda r: r.get("closed_at") or r.get("opened_at") or "")
+    # Ключ — float, а не datetime: строки могут смешивать naive (старые записи из
+    # SQLite) и aware (новые), а прежний фолбэк на "" добавлял третий несравнимый
+    # тип. Любая такая смесь роняла весь отчёт на TypeError.
+    ordered = sorted(rows, key=trade_time_sort_key)
     ordered_pnls = [safe_float(r.get(pnl_key)) or 0.0 for r in ordered]
     sequence = [1 if p > EPS else -1 if p < -EPS else 0 for p in ordered_pnls]
     dd = max_drawdown(ordered_pnls)

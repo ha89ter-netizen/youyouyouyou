@@ -13,12 +13,13 @@ sys.path.insert(0, str(ROOT))
 
 from config.settings import BybitConfig
 from decision_engine import DecisionEngine
-from execution.execution_engine import ExecutionEngine
+from execution.execution_engine import ExecutionEngine, FillStatus, OrderConfirmation
 from market_context import MarketContext, MarketContextEngine
 from meta_strategy import MetaStrategyDecision, MetaStrategyManager
 from portfolio_risk import PortfolioRiskEngine
 from risk.risk_manager import RiskManager
-from storage.journal import TradeJournal
+from storage.journal import ExitResult, TradeJournal
+from timeutils import utcnow
 from storage.models import Base, TradeLog
 from strategy.engine import StrategyEngine
 from strategy.signal import Action, Signal
@@ -41,6 +42,9 @@ class FakeExecution:
         self.closed_pnl = {}
         self.trailing = []
         self.closed_orders = []
+        # Чем confirm_order отвечает по умолчанию; тесты переопределяют.
+        self.confirmation = OrderConfirmation(status=FillStatus.FILLED, filled_qty=1.0)
+        self.confirm_calls = []
 
     def get_account_balance_usdt(self):
         return 1000.0
@@ -76,15 +80,25 @@ class FakeExecution:
     def get_closed_pnl(self, symbol, limit=50):
         return self.closed_pnl.get(symbol, [])
 
+    def get_closed_pnl_since(self, symbol, start_time_ms=None, max_pages=5):
+        return self.closed_pnl.get(symbol, [])
+
+    def confirm_order(self, symbol, order_link_id, attempts=3, delay_seconds=0.6):
+        self.confirm_calls.append((symbol, order_link_id))
+        return self.confirmation
+
 
 class FakeJournal:
     def __init__(self):
         self.entries = []
         self.open = []
         self.exits = []
+        self.orphaned = []
+        self.closed = []
+        self.log_entry_ok = True
 
     def log_entry(self, **kwargs):
-        if not kwargs["order_link_id"]:
+        if not kwargs["order_link_id"] or not self.log_entry_ok:
             return False
         self.entries.append(kwargs)
         self.open.append({
@@ -93,19 +107,51 @@ class FakeJournal:
             "action": kwargs["action"].value,
             "entry_price": kwargs["entry_price"],
             "opened_at_ms": int(time.time() * 1000) - 1000,
+            "status": "open",
         })
         return True
 
     def get_open_trades(self, symbol=None):
         return [t for t in self.open if symbol is None or t["symbol"] == symbol]
 
-    def log_exit(self, order_link_id, exit_price, pnl_usdt, exit_reason="manual/unknown", **kwargs):
+    def log_exit(self, order_link_id, exit_price, pnl_usdt, exit_reason="manual/unknown",
+                 closed_at=None, **kwargs):
         for trade in list(self.open):
             if trade["order_link_id"] == order_link_id:
+                recovered = trade.get("status") == "orphaned"
                 self.open.remove(trade)
+                self.closed.append(trade["order_link_id"])
                 self.exits.append((order_link_id, exit_price, pnl_usdt, exit_reason))
+                return ExitResult(
+                    recorded=True, recovered_from_orphan=recovered,
+                    closed_at=closed_at or utcnow(), symbol=trade["symbol"],
+                )
+        if order_link_id in self.closed:
+            return ExitResult(recorded=False, already_closed=True, reason="уже закрыта")
+        return ExitResult(recorded=False, reason="не найдена")
+
+    def get_unresolved_trades(self, symbol=None):
+        return [t for t in self.open if symbol is None or t["symbol"] == symbol]
+
+    def get_orphaned_trades(self, symbol=None):
+        return [
+            t for t in self.open
+            if t.get("status") == "orphaned" and (symbol is None or t["symbol"] == symbol)
+        ]
+
+    def mark_orphaned(self, order_link_id, reason):
+        for trade in self.open:
+            if trade["order_link_id"] == order_link_id and trade.get("status", "open") == "open":
+                trade["status"] = "orphaned"
+                self.orphaned.append((order_link_id, reason))
                 return True
         return False
+
+    def count_orphaned(self):
+        return len([t for t in self.open if t.get("status") == "orphaned"])
+
+    def sum_closed_pnl_for_utc_day(self, day=None):
+        return 0.0, 0
 
 
 class FixedTrendExperts:
@@ -246,6 +292,10 @@ class IntegrationPipelineTest(unittest.TestCase):
 
         execution = object.__new__(ExecutionEngine)
         execution.cfg = BybitConfig(api_key="x", api_secret="y")
+        # Явно, а не из окружения: тест проверяет путь реальной отправки ордера,
+        # и safe-mode guard должен быть пройден. Сеть не задействована —
+        # session подменён на FakeSession.
+        execution.cfg.trading_enabled = True
         execution.session = FakeSession()
         execution._lot_size_cache = {}
 
@@ -295,6 +345,7 @@ class IntegrationPipelineTest(unittest.TestCase):
             "action": Action.OPEN_LONG.value,
             "entry_price": 100.0,
             "opened_at_ms": int(time.time() * 1000) - 1000,
+            "status": "open",
         })
         engine.execution.closed_pnl["ETHUSDT"] = []
 
@@ -359,6 +410,11 @@ class IntegrationPipelineTest(unittest.TestCase):
         candles = self._trend_candles(now)
         cfg = BybitConfig(api_key="x", api_secret="y")
         cfg.symbols = ["ETHUSDT"]
+        # Явно, а не из окружения: BybitConfig вычисляет значения из env на этапе
+        # импорта, поэтому с TRADING_ENABLED=false в шелле эти тесты молча
+        # переставали проверять путь исполнения. Реальные ордера здесь невозможны —
+        # execution подменён на FakeExecution, до сети дело не доходит.
+        cfg.trading_enabled = True
         cfg.trend_filter_enabled = True
         cfg.min_open_confidence = 0.45
         cfg.max_open_positions = 5
@@ -393,6 +449,8 @@ class IntegrationPipelineTest(unittest.TestCase):
         engine.journal = FakeJournal()
         engine._trailing_activated = set()
         engine._pending_exit_reasons = {}
+        engine._orphan_attempts = {}
+        engine._last_entry_ts = None
 
         engine._load_recent_candles = lambda symbol, limit=210: candles.tail(limit).copy()
         engine._load_latest_funding = lambda symbol: {"rate": 0.0, "ts": now}

@@ -9,6 +9,7 @@ from analytics.attribution import (
 from analytics.metrics import group_by, result_metrics, safe_float
 from analytics.reliability import ReliabilityThresholds, reliability_status
 from analytics.repository import AnalyticsFilters, AnalyticsRepository
+from timeutils import ensure_aware_utc
 
 
 class AnalyticsEngine:
@@ -201,9 +202,9 @@ def _by_days(trades: list[dict], days: int) -> list[dict]:
 
 
 def _as_aware_utc(value):
-    if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc)
+    """Тонкая обёртка над общим хелпером — оставлена, чтобы не трогать
+    вызывающий код в этом модуле."""
+    return ensure_aware_utc(value)
 
 
 def _group_records(records: list[dict], key_fn) -> dict:

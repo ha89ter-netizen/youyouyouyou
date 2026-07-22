@@ -13,7 +13,9 @@ import os
 import re
 import time
 import uuid
-from typing import Optional, Dict, Any
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Optional, Dict, Any, List
 
 from pybit.unified_trading import HTTP
 
@@ -21,6 +23,65 @@ from config.settings import BybitConfig
 from strategy.signal import Action
 
 logger = logging.getLogger(__name__)
+
+# Bybit отдаёт closed PnL постранично; окно запроса ограничено 7 сутками.
+_CLOSED_PNL_MAX_WINDOW_MS = 7 * 24 * 60 * 60 * 1000
+_HISTORY_PAGE_SIZE = 100
+
+# Синтетический retCode отказа безопасного режима. Заведомо вне диапазона
+# реальных кодов Bybit, чтобы в логах отказ guard'а нельзя было спутать
+# с ответом биржи.
+SAFE_MODE_RET_CODE = 999001
+
+
+class FillStatus(str, Enum):
+    """
+    Фактическое состояние ордера. retCode == 0 означает лишь ACCEPTED —
+    "биржа приняла запрос", а не "позиция открыта".
+    """
+    REJECTED = "rejected"            # биржа отвергла/отменила без исполнения
+    ACCEPTED = "accepted"            # принят, но исполнение не подтверждено
+    FILLED = "filled"                # исполнен полностью
+    PARTIALLY_FILLED = "partially_filled"
+    UNKNOWN = "unknown"              # выяснить не удалось — считать опасным
+
+
+# Статусы Bybit v5 -> наши. Всё, чего здесь нет, трактуется как UNKNOWN.
+_BYBIT_ORDER_STATUS: Dict[str, FillStatus] = {
+    "Created": FillStatus.ACCEPTED,
+    "New": FillStatus.ACCEPTED,
+    "Untriggered": FillStatus.ACCEPTED,
+    "Triggered": FillStatus.ACCEPTED,
+    "PartiallyFilled": FillStatus.PARTIALLY_FILLED,
+    "Filled": FillStatus.FILLED,
+    "Rejected": FillStatus.REJECTED,
+    "Cancelled": FillStatus.REJECTED,
+    "Deactivated": FillStatus.REJECTED,
+    # Частично исполнен и затем отменён: экспозиция есть, добирать не будут.
+    "PartiallyFilledCanceled": FillStatus.PARTIALLY_FILLED,
+}
+
+# Состояния, после которых опрашивать биржу дальше бессмысленно.
+_TERMINAL_STATUSES = (FillStatus.FILLED, FillStatus.REJECTED)
+
+
+@dataclass
+class OrderConfirmation:
+    status: FillStatus
+    filled_qty: float = 0.0
+    avg_price: Optional[float] = None
+    detail: str = ""
+    raw: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def has_exposure(self) -> bool:
+        """Есть ли реальная позиция на бирже в результате этого ордера."""
+        return self.status in (FillStatus.FILLED, FillStatus.PARTIALLY_FILLED)
+
+    @property
+    def is_conclusive(self) -> bool:
+        """Знаем ли мы достоверно, чем закончился ордер."""
+        return self.status != FillStatus.UNKNOWN
 
 
 class ExecutionEngine:
@@ -55,7 +116,39 @@ class ExecutionEngine:
         resp = self.session.get_positions(category=self.cfg.category, settleCoin="USDT")
         return resp["result"]["list"]
 
+    def _safe_mode_block(self, operation: str, symbol: str = "") -> Optional[Dict[str, Any]]:
+        """
+        ЕДИНСТВЕННЫЙ централизованный guard безопасного режима.
+
+        Правило: TRADING_ENABLED=false запрещает любой запрос, меняющий
+        состояние на Bybit (ордера, стопы, плечо). Чтение (баланс, позиции,
+        история ордеров, closed PnL) не ограничивается никогда.
+
+        Каждый мутирующий метод этого класса обязан вызвать guard ПЕРВОЙ
+        строкой — до расчётов и до любых обращений к session. Новые мутирующие
+        методы добавлять только с этим вызовом. Отдельные проверки
+        trading_enabled в других слоях допустимы лишь как ранний выход для
+        логов — защитой является только эта точка.
+
+        Возвращает None (разрешено) или синтетический отказ в формате ответа
+        Bybit, чтобы вызывающий код обработал его как обычный отклонённый запрос.
+        """
+        if self.cfg.trading_enabled:
+            return None
+        logger.warning(
+            "SAFE MODE: %s%s заблокирован — TRADING_ENABLED=false, состояние биржи не меняем",
+            operation, f" {symbol}" if symbol else "",
+        )
+        return {
+            "retCode": SAFE_MODE_RET_CODE,
+            "retMsg": f"safe mode (TRADING_ENABLED=false): {operation} blocked",
+            "result": {},
+            "safe_mode_blocked": True,
+        }
+
     def set_leverage(self, symbol: str, leverage: int):
+        if self._safe_mode_block("set_leverage", symbol) is not None:
+            return
         try:
             self.session.set_leverage(
                 category=self.cfg.category, symbol=symbol,
@@ -115,6 +208,9 @@ class ExecutionEngine:
         Реальное количество монет = size_usdt / last_price, округлённое
         вниз до шага лота инструмента (qtyStep).
         """
+        blocked = self._safe_mode_block("open_position", symbol)
+        if blocked is not None:
+            return blocked
         if action not in (Action.OPEN_LONG, Action.OPEN_SHORT):
             raise ValueError(f"open_position accepts only OPEN_LONG/OPEN_SHORT, got {action}")
         side = "Buy" if action == Action.OPEN_LONG else "Sell"
@@ -151,6 +247,9 @@ class ExecutionEngine:
 
     def close_position(self, symbol: str, side_to_close: str, qty: float, source: str = "unknown") -> Dict[str, Any]:
         """side_to_close — сторона ТЕКУЩЕЙ позиции ('Buy'/'Sell'); закрываем встречным ордером."""
+        blocked = self._safe_mode_block("close_position", symbol)
+        if blocked is not None:
+            return blocked
         close_side = "Sell" if side_to_close == "Buy" else "Buy"
         safe_source = re.sub(r"[^A-Za-z0-9_-]", "_", source)[:10] or "unknown"
         order_link_id = f"{safe_source}-close-{uuid.uuid4().hex[:12]}"
@@ -169,6 +268,9 @@ class ExecutionEngine:
         Bybit принимает trailing stop как АБСОЛЮТНОЕ расстояние в цене, не в процентах —
         поэтому переводим процент в цену прямо перед вызовом.
         """
+        blocked = self._safe_mode_block("set_trailing_stop", symbol)
+        if blocked is not None:
+            return blocked
         distance_price = round(last_price * distance_pct / 100, 4)
         resp = self.session.set_trading_stop(
             category=self.cfg.category, symbol=symbol,
@@ -184,6 +286,312 @@ class ExecutionEngine:
         """Последние закрытые сделки с реализованным PnL — источник для журнала и Risk Manager."""
         resp = self.session.get_closed_pnl(category=self.cfg.category, symbol=symbol, limit=limit)
         return resp["result"]["list"]
+
+    def get_closed_pnl_since(
+        self,
+        symbol: str,
+        start_time_ms: Optional[int] = None,
+        max_pages: int = 5,
+    ) -> list:
+        """
+        Closed PnL с постраничным обходом, начиная от start_time_ms (обычно —
+        время открытия сделки).
+
+        Зачем: get_closed_pnl(limit=50) отдаёт только последние записи. Если по
+        символу после нашей сделки прошло больше закрытий, или бот стоял долго,
+        нужное закрытие в это окно не попадает — и сделка навсегда остаётся
+        "открытой" в журнале, а её убыток не доходит до дневного лимита.
+
+        Окно ограничено 7 сутками (лимит Bybit): более старый start_time_ms
+        подрезается, и это честно логируется.
+
+        ОШИБКИ НЕ ГЛУШАТСЯ. Пустой список означает ровно "закрытий нет", и
+        вызывающий код принимает по нему решение об orphaned-сделке. Если бы
+        сетевой сбой возвращался как [], временная недоступность API выглядела
+        бы как отсутствие закрытия и за несколько циклов пометила бы живую
+        сделку orphaned с остановкой торговли. Поэтому любая ошибка страницы
+        пробрасывается наверх — цикл просто пропустит символ и повторит позже.
+        """
+        params = self._history_window_params(symbol, start_time_ms, "closed PnL")
+        return self._paginate(self.session.get_closed_pnl, params, max_pages, symbol, "closed PnL")
+
+    def _history_window_params(
+        self, symbol: str, start_time_ms: Optional[int], label: str
+    ) -> Dict[str, Any]:
+        """
+        Общие параметры запроса истории. Окно Bybit ограничено 7 сутками:
+        более старый start_time_ms подрезается, и это честно логируется.
+        """
+        params: Dict[str, Any] = {
+            "category": self.cfg.category,
+            "symbol": symbol,
+            "limit": _HISTORY_PAGE_SIZE,
+        }
+        if start_time_ms is None:
+            return params
+        now_ms = int(time.time() * 1000)
+        oldest_allowed = now_ms - _CLOSED_PNL_MAX_WINDOW_MS
+        if start_time_ms < oldest_allowed:
+            logger.warning(
+                "%s: запрошенный %s от %d старше 7 суток — окно подрезано до %d. "
+                "Записи старше этого порога биржа уже не отдаёт.",
+                symbol, label, start_time_ms, oldest_allowed,
+            )
+            start_time_ms = oldest_allowed
+        params["startTime"] = start_time_ms
+        params["endTime"] = now_ms
+        return params
+
+    def _paginate(
+        self,
+        fetch,
+        params: Dict[str, Any],
+        max_pages: int,
+        symbol: str,
+        label: str,
+    ) -> List[dict]:
+        """
+        Постраничный обход истории Bybit по nextPageCursor.
+
+        ОШИБКИ НЕ ГЛУШАТСЯ. Пустой список означает ровно "записей нет", и
+        вызывающий код принимает по нему решения (вплоть до orphaned). Если бы
+        сетевой сбой возвращался как [], временная недоступность API выглядела
+        бы как отсутствие данных и пометила бы живую сделку orphaned с
+        остановкой торговли. Поэтому любая ошибка страницы пробрасывается
+        наверх — вызывающий пропустит символ и повторит позже.
+        """
+        params = dict(params)
+        rows: List[dict] = []
+        cursor = None
+        for page in range(max_pages):
+            if cursor:
+                params["cursor"] = cursor
+            try:
+                resp = fetch(**params)
+            except Exception:
+                logger.warning(
+                    "%s: ошибка запроса %s на странице %d из %d (получено %d записей) — "
+                    "пробрасываю ошибку, решение по данным не принимается",
+                    symbol, label, page + 1, max_pages, len(rows),
+                )
+                raise
+            result = resp.get("result") or {}
+            page_rows = result.get("list") or []
+            rows.extend(page_rows)
+            cursor = result.get("nextPageCursor")
+            # Пустой курсор или неполная страница — данные закончились.
+            if not cursor or len(page_rows) < _HISTORY_PAGE_SIZE:
+                break
+        else:
+            logger.warning(
+                "%s: достигнут лимит страниц %s (%d) — возможно, обработаны не все записи",
+                symbol, label, max_pages,
+            )
+        return rows
+
+    def get_order_history(
+        self,
+        symbol: str,
+        order_link_id: Optional[str] = None,
+        start_time_ms: Optional[int] = None,
+        max_pages: int = 5,
+    ) -> List[dict]:
+        """
+        История ордеров. ТОЛЬКО ЧТЕНИЕ.
+
+        Запрос по orderLinkId Bybit обслуживает БЕЗ ограничения окна в 7 суток —
+        поэтому для конкретного нашего ордера временной диапазон не передаётся
+        вовсе. Это единственный способ узнать судьбу входа, которому больше
+        недели: был ли он вообще исполнен.
+        """
+        if order_link_id:
+            params: Dict[str, Any] = {
+                "category": self.cfg.category,
+                "symbol": symbol,
+                "orderLinkId": order_link_id,
+                "limit": _HISTORY_PAGE_SIZE,
+            }
+        else:
+            params = self._history_window_params(symbol, start_time_ms, "order history")
+        return self._paginate(self.session.get_order_history, params, max_pages, symbol, "order history")
+
+    def get_executions(
+        self,
+        symbol: str,
+        order_link_id: Optional[str] = None,
+        start_time_ms: Optional[int] = None,
+        max_pages: int = 5,
+    ) -> List[dict]:
+        """
+        История исполнений (fills). ТОЛЬКО ЧТЕНИЕ.
+
+        Даёт фактическую цену и объём каждого fill — самое точное, что есть
+        для восстановления реального входа, когда цена в журнале была лишь
+        оценкой (закрытие свечи).
+        """
+        params: Dict[str, Any] = self._history_window_params(symbol, start_time_ms, "executions")
+        if order_link_id:
+            params["orderLinkId"] = order_link_id
+        return self._paginate(self.session.get_executions, params, max_pages, symbol, "executions")
+
+    def confirm_order(
+        self,
+        symbol: str,
+        order_link_id: str,
+        attempts: int = 3,
+        delay_seconds: float = 0.6,
+    ) -> OrderConfirmation:
+        """
+        Выясняет, что реально произошло с ордером после retCode == 0.
+
+        Опрос строго ограничен по числу попыток — бесконечного ожидания нет ни в
+        одной ветке. Если после всех попыток ясности нет, возвращается UNKNOWN,
+        и вызывающий код обязан трактовать это консервативно (блокировка
+        символа), а не как "ордер не прошёл".
+        """
+        if not order_link_id:
+            return OrderConfirmation(
+                status=FillStatus.UNKNOWN,
+                detail="order_link_id отсутствует — идентифицировать ордер невозможно",
+            )
+
+        last_seen = OrderConfirmation(
+            status=FillStatus.UNKNOWN,
+            detail="ордер не найден ни в активных, ни в истории",
+        )
+
+        for attempt in range(1, attempts + 1):
+            order = self._find_order(symbol, order_link_id)
+            if order is not None:
+                confirmation = self._confirmation_from_order(order)
+                if confirmation.status in _TERMINAL_STATUSES:
+                    logger.info(
+                        "%s: ордер %s подтверждён как %s (попытка %d/%d, qty=%.8f)",
+                        symbol, order_link_id, confirmation.status.value,
+                        attempt, attempts, confirmation.filled_qty,
+                    )
+                    return confirmation
+                last_seen = confirmation
+
+            if attempt < attempts:
+                time.sleep(delay_seconds)
+
+        # Частичное исполнение — валидный конечный ответ: экспозиция уже есть.
+        if last_seen.status == FillStatus.PARTIALLY_FILLED:
+            logger.warning(
+                "%s: ордер %s остался частично исполненным после %d попыток (qty=%.8f)",
+                symbol, order_link_id, attempts, last_seen.filled_qty,
+            )
+            return last_seen
+
+        # Ордер виден, но всё ещё не исполнен: проверяем позицию — она и есть
+        # источник правды о том, появилась ли экспозиция.
+        position_confirmation = self._confirm_via_position(symbol, order_link_id, last_seen)
+        if position_confirmation is not None:
+            return position_confirmation
+
+        logger.error(
+            "%s: не удалось выяснить судьбу ордера %s за %d попыток (последнее состояние: %s). "
+            "Возвращаю UNKNOWN.",
+            symbol, order_link_id, attempts, last_seen.detail,
+        )
+        return OrderConfirmation(
+            status=FillStatus.UNKNOWN,
+            detail=f"не подтверждено за {attempts} попыток: {last_seen.detail}",
+        )
+
+    def _find_order(self, symbol: str, order_link_id: str) -> Optional[dict]:
+        """
+        Ищет ордер сначала среди активных (realtime), затем в истории.
+        Порядок важен: только что созданный ордер появляется в realtime раньше,
+        чем в истории.
+        """
+        for fetch, source in (
+            (self.session.get_open_orders, "realtime"),
+            (self.session.get_order_history, "history"),
+        ):
+            try:
+                resp = fetch(
+                    category=self.cfg.category,
+                    symbol=symbol,
+                    orderLinkId=order_link_id,
+                )
+            except Exception:
+                logger.warning(
+                    "%s: запрос ордера %s через %s не удался", symbol, order_link_id, source,
+                    exc_info=True,
+                )
+                continue
+            for item in (resp.get("result") or {}).get("list") or []:
+                if item.get("orderLinkId") == order_link_id:
+                    return item
+        return None
+
+    @staticmethod
+    def _confirmation_from_order(order: dict) -> OrderConfirmation:
+        raw_status = str(order.get("orderStatus") or "")
+        status = _BYBIT_ORDER_STATUS.get(raw_status, FillStatus.UNKNOWN)
+        try:
+            filled_qty = float(order.get("cumExecQty") or 0)
+        except (TypeError, ValueError):
+            filled_qty = 0.0
+        try:
+            avg_price = float(order.get("avgPrice") or 0) or None
+        except (TypeError, ValueError):
+            avg_price = None
+
+        # Bybit помечает частично исполненный и отменённый ордер по-разному в
+        # разных версиях API. Если экспозиция есть, "Cancelled" не должен
+        # выглядеть как "ничего не произошло".
+        if status == FillStatus.REJECTED and filled_qty > 0:
+            status = FillStatus.PARTIALLY_FILLED
+
+        return OrderConfirmation(
+            status=status,
+            filled_qty=filled_qty,
+            avg_price=avg_price,
+            detail=f"orderStatus={raw_status or 'нет'}, cumExecQty={filled_qty}",
+            raw=order,
+        )
+
+    def _confirm_via_position(
+        self, symbol: str, order_link_id: str, last_seen: OrderConfirmation
+    ) -> Optional[OrderConfirmation]:
+        """
+        Последний рубеж: живая позиция по символу. Не различает наш ордер и чужой,
+        поэтому используется только когда по ордеру ясности нет.
+        """
+        try:
+            positions = self.get_open_positions()
+        except Exception:
+            logger.exception("%s: не удалось проверить позицию для подтверждения ордера", symbol)
+            return None
+
+        for position in positions:
+            if position.get("symbol") != symbol:
+                continue
+            try:
+                size = float(position.get("size", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if size > 0:
+                logger.warning(
+                    "%s: ордер %s не подтверждён напрямую (%s), но по символу есть живая "
+                    "позиция size=%s — считаю исполненным",
+                    symbol, order_link_id, last_seen.detail, size,
+                )
+                try:
+                    avg_price = float(position.get("avgPrice") or 0) or None
+                except (TypeError, ValueError):
+                    avg_price = None
+                return OrderConfirmation(
+                    status=FillStatus.FILLED,
+                    filled_qty=size,
+                    avg_price=avg_price,
+                    detail="подтверждено по живой позиции, а не по статусу ордера",
+                    raw=position,
+                )
+        return None
 
     @staticmethod
     def _calc_price_offset(price: float, pct: float, side: str, is_stop_loss: bool) -> float:

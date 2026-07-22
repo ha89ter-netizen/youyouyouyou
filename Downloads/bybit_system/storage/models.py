@@ -16,6 +16,8 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import declarative_base
 
+from timeutils import utcnow
+
 Base = declarative_base()
 JSONB_COMPAT = JSON().with_variant(JSONB, "postgresql")
 
@@ -60,10 +62,60 @@ class TradeLog(Base):
     exit_type = Column(String(30), nullable=True)
     exit_snapshot = Column(JSONB_COMPAT, nullable=True)
     holding_seconds = Column(Integer, nullable=True)
-    status = Column(String(10), nullable=False, default="open")  # open | closed
+    # open      — позиция считается живой
+    # closed    — выход подтверждён реальным closed PnL с биржи
+    # orphaned  — журнал считал сделку открытой, но ни живой позиции, ни closed PnL
+    #             найти не удалось: финансовый результат неизвестен (см. circuit breaker)
+    status = Column(String(10), nullable=False, default="open")
 
-    opened_at = Column(DateTime(timezone=True), server_default=func.now())
+    # default=utcnow (а не только server_default) — чтобы время входа было
+    # timezone-aware уже в момент создания объекта и не зависело от того,
+    # в какой зоне живёт сервер БД.
+    opened_at = Column(DateTime(timezone=True), default=utcnow, server_default=func.now())
     closed_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class RiskState(Base):
+    """
+    Персистентное состояние Risk Manager — одна строка (singleton, id=1).
+
+    Существует ровно по одной причине: дневной лимит убытка, cooldown и счётчики
+    сделок обязаны переживать перезапуск процесса. Пока это состояние жило только
+    в памяти, упавший и перезапущенный бот забывал сегодняшние убытки, снимал
+    circuit breaker и мог заново войти в тот же символ.
+
+    Дневные значения сбрасываются ТОЛЬКО при смене UTC-дня (day_utc), никогда —
+    просто из-за рестарта.
+    """
+    __tablename__ = "risk_state"
+
+    id = Column(Integer, primary_key=True, autoincrement=False)  # всегда 1
+    day_utc = Column(String(10), nullable=False)  # "YYYY-MM-DD"
+
+    daily_start_balance = Column(Numeric, nullable=True)
+    daily_pnl_usdt = Column(Numeric, nullable=False, default=0)
+    daily_trade_count = Column(Integer, nullable=False, default=0)
+
+    # {"ETHUSDT": 2} — сколько входов сделано по символу за текущий UTC-день
+    symbol_trade_counts = Column(JSONB_COMPAT, nullable=True)
+    # {"ETHUSDT": 1752480000.0} — unix-секунды последнего входа, для cooldown
+    last_entry_ts_by_symbol = Column(JSONB_COMPAT, nullable=True)
+    # {"ETHUSDT": 1752480000.0} — ордер принят биржей, но fill ещё не подтверждён
+    pending_entries = Column(JSONB_COMPAT, nullable=True)
+    # {"ETHUSDT": "причина"} — символ заблокирован до ручного разбора
+    blocked_symbols = Column(JSONB_COMPAT, nullable=True)
+
+    # Источник правды по circuit breaker: {cause_key: {"reason": str, "sticky": bool}}.
+    # Breaker взведён, пока словарь непуст. Именованные причины нужны, чтобы
+    # снятие одной (восстановленная orphaned-сделка) не снимало остальные.
+    circuit_breaker_causes = Column(JSONB_COMPAT, nullable=True)
+    # Денормализация ниже — только для чтения человеком через psql.
+    # Логика читает circuit_breaker_causes, а не эти три поля.
+    circuit_breaker_tripped = Column(Boolean, nullable=False, default=False)
+    circuit_breaker_reason = Column(String(500), nullable=True)
+    circuit_breaker_sticky = Column(Boolean, nullable=False, default=False)
+
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
 class TradeExpertVote(Base):

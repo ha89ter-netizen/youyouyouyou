@@ -656,13 +656,36 @@ os._exit(0 if received else 2)
 def main():
     parser = argparse.ArgumentParser(description="Bybit Testnet full self-check")
     parser.add_argument("--symbol", default=None, help="Symbol to check. Default: first symbol from config")
-    parser.add_argument("--skip-test-order", action="store_true", help="Do not place the minimal Testnet order")
+    parser.add_argument(
+        "--place-test-order", action="store_true",
+        help="ЯВНО разрешить минимальный Testnet-ордер. Без этого флага ордер "
+             "не отправляется никогда (безопасный режим по умолчанию).",
+    )
+    parser.add_argument(
+        "--skip-test-order", action="store_true",
+        help="Совместимость со старыми скриптами: не отправлять ордер "
+             "(теперь это и так поведение по умолчанию)",
+    )
     parser.add_argument("--ws-timeout", type=int, default=12, help="WebSocket wait timeout in seconds")
     args = parser.parse_args()
 
     cfg = BybitConfig()
     symbol = args.symbol or cfg.symbols[0]
-    checker = TestnetSelfCheck(symbol=symbol, skip_test_order=args.skip_test_order, ws_timeout_sec=args.ws_timeout)
+
+    # Безопасность по умолчанию: ордер отправляется ТОЛЬКО при явном
+    # --place-test-order, и даже тогда TRADING_ENABLED=false его запрещает
+    # (плюс centralized guard в ExecutionEngine — вторая линия защиты).
+    skip_test_order = True
+    if args.place_test_order and not args.skip_test_order:
+        if cfg.trading_enabled:
+            skip_test_order = False
+        else:
+            print(
+                "TRADING_ENABLED=false: тестовый ордер отключён, "
+                "--place-test-order проигнорирован (безопасный режим)."
+            )
+
+    checker = TestnetSelfCheck(symbol=symbol, skip_test_order=skip_test_order, ws_timeout_sec=args.ws_timeout)
     raise SystemExit(checker.run())
 
 

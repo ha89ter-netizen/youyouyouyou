@@ -7,6 +7,8 @@ from decimal import Decimal
 from enum import Enum
 from typing import Any, Iterable, Optional
 
+from timeutils import ensure_aware_utc
+
 logger = logging.getLogger(__name__)
 
 SENSITIVE_ENV_NAMES = (
@@ -100,11 +102,16 @@ def normalize_exit_type(exit_reason: str) -> str:
 
 
 def validate_time_order(opened_at: Optional[datetime], closed_at: Optional[datetime]) -> Optional[int]:
-    if not opened_at or not closed_at:
+    """
+    Длительность удержания в секундах. Оба конца нормализуются к aware UTC:
+    opened_at может прийти из SQLite naive, closed_at пишется кодом как aware,
+    и прямое вычитание падало бы на TypeError.
+    """
+    opened = ensure_aware_utc(opened_at)
+    closed = ensure_aware_utc(closed_at)
+    if opened is None or closed is None:
         return None
-    if opened_at.tzinfo is None:
-        opened_at = opened_at.replace(tzinfo=closed_at.tzinfo)
-    seconds = int((closed_at - opened_at).total_seconds())
+    seconds = int((closed - opened).total_seconds())
     if seconds < 0:
         logger.warning("Trade memory: closed_at is earlier than opened_at")
         return 0

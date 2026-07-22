@@ -1,5 +1,4 @@
 import math
-from datetime import timezone
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -7,6 +6,7 @@ from analytics.attribution import normalize_families
 from analytics.metrics import result_metrics, safe_float
 from analytics.repository import AnalyticsFilters, AnalyticsRepository
 from analytics.reliability import ReliabilityThresholds, reliability_status
+from timeutils import trade_time_sort_key
 
 
 WINDOWS = ("all", 200, 100, 50, 20, 10)
@@ -93,7 +93,7 @@ def stability_profile(
     thresholds: ReliabilityThresholds = ReliabilityThresholds(),
     config: StabilityConfig = StabilityConfig(),
 ) -> dict:
-    ordered = sorted(trades, key=_time_sort_key)
+    ordered = sorted(trades, key=trade_time_sort_key)
     window_metrics = {str(window): _window_metrics(ordered, window, thresholds) for window in WINDOWS}
     score_parts = _score_parts(ordered, window_metrics, config)
     degradation = degradation_flags(window_metrics, config)
@@ -238,13 +238,8 @@ def _group_by(records: list[dict], key_fn: Callable[[dict], Optional[str]]) -> d
     return groups
 
 
-def _time_sort_key(row: dict):
-    value = row.get("closed_at") or row.get("opened_at")
-    if value is None:
-        return 0.0
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=timezone.utc)
-    return value.timestamp()
+# Сортировка по времени сделки живёт в timeutils.trade_time_sort_key: раньше
+# здесь была своя копия этой логики, а в analytics/metrics.py — своя, сломанная.
 
 
 def _preferred_recent_window(windows: dict[str, dict], config: StabilityConfig) -> Optional[dict]:

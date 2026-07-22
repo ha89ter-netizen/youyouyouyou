@@ -3,7 +3,7 @@ from typing import Dict
 
 from sqlalchemy import inspect, text
 
-from storage.models import TradeExpertVote
+from storage.models import RiskState, TradeExpertVote
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +70,43 @@ def ensure_trade_expert_votes_table(engine) -> None:
     TradeExpertVote.__table__.create(bind=engine, checkfirst=True)
 
 
+RISK_STATE_COLUMNS: Dict[str, str] = {
+    "pending_entries": "JSONB",
+    "blocked_symbols": "JSONB",
+    "circuit_breaker_causes": "JSONB",
+    "circuit_breaker_sticky": "BOOLEAN",
+}
+
+
+def ensure_risk_state_table(engine) -> None:
+    """
+    Создаёт таблицу персистентного состояния Risk Manager, если её нет, и
+    дополняет её недостающими колонками, если таблица уже была создана более
+    ранней версией кода. Данных не трогает.
+    """
+    RiskState.__table__.create(bind=engine, checkfirst=True)
+
+    inspector = inspect(engine)
+    if not inspector.has_table("risk_state"):
+        return
+    existing = {column["name"] for column in inspector.get_columns("risk_state")}
+    missing = [(n, t) for n, t in RISK_STATE_COLUMNS.items() if n not in existing]
+    if not missing:
+        return
+
+    dialect = engine.dialect.name
+    with engine.begin() as conn:
+        for name, sql_type in missing:
+            if dialect == "postgresql":
+                statement = f"ALTER TABLE risk_state ADD COLUMN IF NOT EXISTS {name} {sql_type}"
+            elif sql_type == "JSONB":
+                statement = f"ALTER TABLE risk_state ADD COLUMN {name} JSON"
+            else:
+                statement = f"ALTER TABLE risk_state ADD COLUMN {name} {sql_type}"
+            conn.execute(text(statement))
+            logger.info("DB migration: risk_state.%s added", name)
+
+
 def ensure_analytics_indexes(engine) -> None:
     statements = [
         "CREATE INDEX IF NOT EXISTS ix_trade_log_status_closed_at ON trade_log (status, closed_at)",
@@ -79,6 +116,9 @@ def ensure_analytics_indexes(engine) -> None:
         "CREATE INDEX IF NOT EXISTS ix_trade_expert_votes_order_link_id ON trade_expert_votes (order_link_id)",
         "CREATE INDEX IF NOT EXISTS ix_trade_expert_votes_source ON trade_expert_votes (source)",
         "CREATE INDEX IF NOT EXISTS ix_trade_expert_votes_family ON trade_expert_votes (family)",
+        # status+symbol — горячий путь гейта повторного входа и реконсиляции:
+        # на каждый цикл спрашиваем "есть ли открытые сделки по этому символу"
+        "CREATE INDEX IF NOT EXISTS ix_trade_log_status_symbol ON trade_log (status, symbol)",
     ]
     inspector = inspect(engine)
     if not inspector.has_table("trade_log") or not inspector.has_table("trade_expert_votes"):
@@ -91,4 +131,5 @@ def ensure_analytics_indexes(engine) -> None:
 def run_safe_migrations(engine) -> None:
     ensure_trade_log_analytics_columns(engine)
     ensure_trade_expert_votes_table(engine)
+    ensure_risk_state_table(engine)
     ensure_analytics_indexes(engine)
