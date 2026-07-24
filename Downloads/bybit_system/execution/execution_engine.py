@@ -9,11 +9,13 @@ place_order/set_leverage на Bybit. Strategy Engine и Risk Manager сами
 """
 
 import logging
+import math
 import os
 import re
 import time
 import uuid
 from dataclasses import dataclass, field
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from enum import Enum
 from typing import Optional, Dict, Any, List
 
@@ -163,20 +165,87 @@ class ExecutionEngine:
 
     def _get_lot_size(self, symbol: str) -> Dict[str, float]:
         """
-        Кэшируем qtyStep/minOrderQty на процесс — они не меняются на лету.
-        Без этого округление количества "на глаз" (например, всегда до 6
-        знаков) может выдать qty, не кратный шагу лота конкретного инструмента,
-        и биржа отклонит ордер с ошибкой точности.
+        Кэшируем qtyStep/minOrderQty/tickSize на процесс — они не меняются на лету.
+
+        qtyStep нужен, чтобы количество было кратно шагу лота инструмента.
+        tickSize — чтобы цены стоп-лосса и тейк-профита были кратны шагу ЦЕНЫ:
+        Bybit отвергает цену, не попадающую на сетку тика (например, для
+        BNBUSDT tickSize=0.10, и цена 564.7005 невалидна). Раньше цены
+        округлялись жёстко до 4 знаков, что для BTCUSDT/BNBUSDT (tick 0.10),
+        ETHUSDT (0.01) и UNIUSDT (0.001) давало невалидный стоп.
         """
         if symbol not in self._lot_size_cache:
             info = self.session.get_instruments_info(category=self.cfg.category, symbol=symbol)
             item = info["result"]["list"][0]
             lot = item["lotSizeFilter"]
+            price_filter = item.get("priceFilter") or {}
+            try:
+                tick_size = float(price_filter.get("tickSize") or 0)
+            except (TypeError, ValueError):
+                tick_size = 0.0
+            if tick_size <= 0:
+                logger.warning(
+                    "%s: биржа не отдала tickSize — цены SL/TP будут округляться до 4 знаков, "
+                    "что может быть невалидно для этого инструмента",
+                    symbol,
+                )
             self._lot_size_cache[symbol] = {
                 "qtyStep": float(lot["qtyStep"]),
                 "minOrderQty": float(lot["minOrderQty"]),
+                "tickSize": tick_size,
             }
         return self._lot_size_cache[symbol]
+
+    @staticmethod
+    def _snap_to_tick(price: float, tick_size: float, round_down: bool) -> float:
+        """
+        Прижимает цену к сетке тика инструмента.
+
+        round_down выбирается так, чтобы округление всегда играло В ПОЛЬЗУ
+        безопасности: стоп-лосс сдвигается ближе к цене входа (срабатывает
+        чуть раньше), тейк-профит — тоже ближе (фиксируется чуть раньше).
+        Никогда не наоборот: расширять стоп округлением значит молча увеличить
+        риск сделки.
+
+        Считаем в Decimal, а не во float: 0.0027 / 0.000001 во float даёт
+        2700.0000000000005, и ceil() поднял бы цену на лишний тик.
+        """
+        if tick_size <= 0:
+            return round(price, 4)
+        tick = Decimal(str(tick_size))
+        steps = Decimal(str(price)) / tick
+        steps = steps.to_integral_value(rounding=ROUND_FLOOR if round_down else ROUND_CEILING)
+        snapped = steps * tick
+        # normalize() убрал бы хвостовые нули, но вернул бы экспоненту (1E-6),
+        # а Bybit ждёт обычную десятичную запись — поэтому квантуем по тику.
+        return float(snapped.quantize(tick))
+
+    def _price_with_offset(
+        self, symbol: str, price: float, pct: float, side: str, is_stop_loss: bool
+    ) -> float:
+        """Цена SL/TP со смещением в процентах, прижатая к сетке тика инструмента."""
+        # ВАЖНО: считаем смещение в полной точности. _calc_price_offset округляет
+        # до 4 знаков, и для дешёвых монет это разрушало сам стоп: у 1000PEPEUSDT
+        # с ценой входа 0.00271 стоп 1.5% превращался в 0.37%.
+        direction = 1 if side == "Buy" else -1
+        if is_stop_loss:
+            direction *= -1
+        raw = price * (1 + direction * pct / 100)
+        try:
+            tick_size = self._get_lot_size(symbol)["tickSize"]
+        except Exception:
+            logger.warning(
+                "%s: не удалось получить tickSize, округляю цену до 4 знаков", symbol, exc_info=True,
+            )
+            return raw
+
+        # Округляем ВСЕГДА в сторону цены входа — и для стопа, и для тейка.
+        # Где какая цена лежит относительно входа:
+        #   long:  SL ниже (округляем вверх), TP выше (округляем вниз)
+        #   short: SL выше (округляем вниз),  TP ниже (округляем вверх)
+        is_long = side == "Buy"
+        round_down = (not is_long) if is_stop_loss else is_long
+        return self._snap_to_tick(raw, tick_size, round_down=round_down)
 
     def _round_qty(self, symbol: str, raw_qty: float) -> float:
         lot = self._get_lot_size(symbol)
@@ -231,10 +300,10 @@ class ExecutionEngine:
         }
 
         if stop_loss_pct:
-            sl_price = self._calc_price_offset(last_price, stop_loss_pct, side, is_stop_loss=True)
+            sl_price = self._price_with_offset(symbol, last_price, stop_loss_pct, side, is_stop_loss=True)
             params["stopLoss"] = str(sl_price)
         if take_profit_pct:
-            tp_price = self._calc_price_offset(last_price, take_profit_pct, side, is_stop_loss=False)
+            tp_price = self._price_with_offset(symbol, last_price, take_profit_pct, side, is_stop_loss=False)
             params["takeProfit"] = str(tp_price)
 
         logger.info("Отправляю ордер: %s", params)
@@ -271,7 +340,16 @@ class ExecutionEngine:
         blocked = self._safe_mode_block("set_trailing_stop", symbol)
         if blocked is not None:
             return blocked
-        distance_price = round(last_price * distance_pct / 100, 4)
+        # Расстояние trailing stop Bybit тоже принимает по сетке тика.
+        # round(..., 4) здесь давал невалидное значение для BNBUSDT/BTCUSDT (tick 0.10).
+        raw_distance = last_price * distance_pct / 100
+        try:
+            tick_size = self._get_lot_size(symbol)["tickSize"]
+        except Exception:
+            logger.warning("%s: не удалось получить tickSize для trailing stop", symbol, exc_info=True)
+            tick_size = 0.0
+        # Вверх: расстояние меньше тика округлилось бы в 0 и отключило trailing.
+        distance_price = self._snap_to_tick(raw_distance, tick_size, round_down=False)
         resp = self.session.set_trading_stop(
             category=self.cfg.category, symbol=symbol,
             trailingStop=str(distance_price), positionIdx=0,
