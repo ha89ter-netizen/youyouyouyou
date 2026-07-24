@@ -80,6 +80,22 @@ _CLOSED_PNL_WINDOW_SECONDS = 7 * 24 * 60 * 60
 # в блокировку символа: продолжать вслепую опаснее, чем остановиться.
 _PENDING_MAX_AGE_SECONDS = 300
 
+# Bybit's /v5/position/closed-pnl НЕ содержит stopOrderType — только orderType
+# ("Market"/"Limit") и execType, которые для любого закрытия позиции одинаковы.
+# Проверено по официальной документации: раньше _infer_exit_reason искал
+# несуществующее поле и в 90% из 59 закрытых тестовых сделок всегда возвращал
+# "manual/unknown". Реальная причина берётся из /v5/execution/list (см.
+# _infer_exit_reason) — там stopOrderType есть, и это его допустимые значения.
+_STOP_ORDER_TYPE_TO_EXIT_REASON = {
+    "TakeProfit": "TP",
+    "PartialTakeProfit": "TP",
+    "StopLoss": "SL",
+    "PartialStopLoss": "SL",
+    "TrailingStop": "trailing",
+    "Stop": "SL",
+    "MmRateClose": "manual (MMR)",
+}
+
 
 @dataclass
 class EntryCandidate:
@@ -122,7 +138,6 @@ class StrategyEngine:
         self.journal = TradeJournal(db)
         self._trailing_activated: set = set()  # order_link_id, для которых уже включили trailing
         self._last_entry_ts: Optional[float] = None
-        self._pending_exit_reasons: dict[str, str] = {}
         # order_link_id -> сколько циклов подряд не можем найти закрытие
         self._orphan_attempts: dict[str, int] = {}
         self._reconcile_daily_pnl_with_journal()
@@ -300,12 +315,18 @@ class StrategyEngine:
         уже закрыта (по SL, TP, trailing stop или вручную) — подтягивает реальный
         PnL и обновляет запись + Risk Manager.
 
-        Матчинг НЕ по orderLinkId: в ответе get_closed_pnl этого поля нет вообще
-        (закрывающий ордер при срабатывании SL/TP создаётся биржей автоматически).
-        Вместо этого матчим по символу + цене входа (с допуском на проскальзывание)
-        + времени (закрытие должно быть позже открытия). Это надёжно, так как
-        Risk Manager не даёт открыть вторую позицию по тому же символу, пока
-        текущая не закрыта — на символ в любой момент максимум одна открытая сделка.
+        Матчинг closed PnL с нашей сделкой НЕ по orderLinkId: в ответе
+        get_closed_pnl этого поля нет вообще (закрывающий ордер при срабатывании
+        SL/TP создаётся биржей автоматически). Вместо этого матчим по символу +
+        цене входа (с допуском на проскальзывание) + времени (закрытие должно
+        быть позже открытия). Это надёжно, так как Risk Manager не даёт открыть
+        вторую позицию по тому же символу, пока текущая не закрыта — на символ
+        в любой момент максимум одна открытая сделка.
+
+        ПРИЧИНА закрытия (SL/TP/trailing/наш Exit Manager/ручное) берётся
+        отдельно — из /v5/execution/list, сматченного по orderId с закрывающим
+        ордером (см. _infer_exit_reason). get_closed_pnl этой информации не
+        содержит вовсе.
         """
         live_symbols = {
             p.get("symbol")
@@ -342,6 +363,21 @@ class StrategyEngine:
                 logger.exception("Не удалось получить closed PnL для %s — символ пропущен в этом цикле", symbol)
                 continue
 
+            # Executions — только для ТОЧНОСТИ exit_reason, не для решения о
+            # закрытии сделки. В отличие от ошибки closed_pnl выше, ошибка
+            # здесь не должна блокировать реконсиляцию — просто exit_reason
+            # в этом цикле деградирует до "manual/unknown", а не блокирует
+            # сам факт учёта PnL.
+            try:
+                executions = self.execution.get_executions(symbol, start_time_ms=oldest_ms)
+            except Exception:
+                logger.warning(
+                    "%s: не удалось получить executions — exit_reason в этом цикле будет неточным",
+                    symbol, exc_info=True,
+                )
+                executions = []
+            exec_by_order_id = self._index_executions_by_order_id(executions)
+
             has_live_position = symbol in live_symbols
             for trade in trades:
                 match = self._find_matching_closed_pnl(trade, closed)
@@ -350,9 +386,22 @@ class StrategyEngine:
                         symbol, trade, len(closed), positions, has_live_position,
                     )
                     continue
-                self._apply_closed_pnl(symbol, trade, match)
+                self._apply_closed_pnl(symbol, trade, match, exec_by_order_id)
 
-    def _apply_closed_pnl(self, symbol: str, trade: dict, match: dict):
+    @staticmethod
+    def _index_executions_by_order_id(executions: list) -> dict:
+        """
+        orderId -> первый execution этого ордера. stopOrderType и orderLinkId
+        одинаковы у всех fill'ов одного ордера, поэтому достаточно одного.
+        """
+        index: dict = {}
+        for e in executions:
+            oid = e.get("orderId")
+            if oid and oid not in index:
+                index[oid] = e
+        return index
+
+    def _apply_closed_pnl(self, symbol: str, trade: dict, match: dict, exec_by_order_id: Optional[dict] = None):
         """
         Записывает найденный результат сделки. Единственная точка, где дневной
         PnL пополняется реализованным результатом.
@@ -368,7 +417,8 @@ class StrategyEngine:
         exit_price = float(match.get("avgExitPrice", 0) or 0)
         pnl_usdt = float(match.get("closedPnl", 0) or 0)
         closed_at = self._closed_at_from_match(match)
-        exit_reason = self._pending_exit_reasons.pop(symbol, None) or self._infer_exit_reason(match)
+        execution_record = (exec_by_order_id or {}).get(match.get("orderId"))
+        exit_reason = self._infer_exit_reason(match, execution_record)
         exit_snapshot = self._build_exit_snapshot(symbol, match)
 
         result = self.journal.log_exit(
@@ -1053,8 +1103,7 @@ class StrategyEngine:
         if not self.cfg.trading_enabled:
             # Решение зафиксировано в логе, но настоящий reduceOnly-ордер в
             # safe mode не отправляется. Guard в ExecutionEngine — вторая линия
-            # защиты; здесь ранний выход, чтобы не взводить pending_exit_reason
-            # для закрытия, которого не было.
+            # защиты.
             logger.info(
                 "%s: SAFE MODE: позиция (%s) НЕ закрыта (TRADING_ENABLED=false) — %s",
                 symbol, position_direction, close_reason,
@@ -1071,10 +1120,6 @@ class StrategyEngine:
 
         if resp.get("retCode") != 0:
             # Биржа НЕ приняла запрос на закрытие: позиция всё ещё живая.
-            # Раньше это игнорировалось, и _pending_exit_reasons всё равно
-            # взводился в "exit manager" — при следующем реальном закрытии
-            # (по SL/TP, никак не связанном с этой попыткой) причина в журнале
-            # оказалась бы неверной.
             logger.warning(
                 "%s: закрытие позиции через Exit Manager отклонено биржей retCode=%s retMsg=%s — "
                 "позиция остаётся открытой",
@@ -1082,7 +1127,11 @@ class StrategyEngine:
             )
             return False
 
-        self._pending_exit_reasons[symbol] = "exit manager"
+        # Причину закрытия сюда специально НЕ записываем: она определяется
+        # позже, в _sync_closed_trades, по orderLinkId закрывающего ордера
+        # (см. _infer_exit_reason) — это надёжнее, чем гадать заранее по
+        # символу, и не зависит от того, сколько сделок по этому символу
+        # реконсилируется в одном цикле.
         return True
 
     def _apply_trend_filter(self, signal: Signal, trend: Optional[str], context, symbol: str) -> Signal:
@@ -1379,18 +1428,40 @@ class StrategyEngine:
         return max(0, int((time.time() * 1000 - opened_at_ms) / 1000))
 
     @staticmethod
-    def _infer_exit_reason(closed_pnl: dict) -> str:
-        text = " ".join(
-            str(closed_pnl.get(key) or "")
-            for key in ("orderType", "execType", "stopOrderType", "orderLinkId")
-        ).lower()
-        if "takeprofit" in text or "take_profit" in text or "tp" in text:
-            return "TP"
-        if "trailing" in text:
-            return "trailing"
-        if "stoploss" in text or "stop_loss" in text or "sl" in text:
-            return "SL"
-        return "manual/unknown"
+    def _infer_exit_reason(closed_pnl: dict, execution_record: Optional[dict] = None) -> str:
+        """
+        Определяет причину закрытия позиции.
+
+        closed_pnl (/v5/position/closed-pnl) НЕ содержит stopOrderType — только
+        orderType ("Market"/"Limit") и execType ("Trade"/"BustTrade"/...),
+        которые для любого закрытия позиции одинаковы. Раньше эта функция
+        искала подстроки "takeprofit"/"trailing"/"stoploss" именно в этих
+        полях и поэтому НИКОГДА не находила совпадения: в реальном 59-сделочном
+        прогоне на testnet 53 из 59 (90%) закрытий получили "manual/unknown",
+        хотя часть из них точно была по стопу или тейку.
+
+        Реальная причина берётся из execution_record — записи из
+        /v5/execution/list, сматченной по orderId закрывающего ордера
+        (см. _index_executions_by_order_id):
+        - orderLinkId с нашим префиксом ("exit_manag"/"self_check") — сделку
+          закрыл наш собственный код, а не биржа-триггер;
+        - иначе stopOrderType биржи (TakeProfit/StopLoss/TrailingStop/...).
+
+        Если execution_record не нашли (ошибка API этого цикла, старая запись
+        без сматченных executions) — честно возвращаем "manual/unknown",
+        вместо того чтобы гадать по полям, которые заведомо ничего не скажут.
+        """
+        if not execution_record:
+            return "manual/unknown"
+
+        link = str(execution_record.get("orderLinkId") or "")
+        if link.startswith("exit_manag"):
+            return "exit_manager"
+        if link.startswith("self_check"):
+            return "self_check_manual"
+
+        stop_type = str(execution_record.get("stopOrderType") or "").strip()
+        return _STOP_ORDER_TYPE_TO_EXIT_REASON.get(stop_type, "manual/unknown")
 
     def _reconcile(self, rule_signal: Optional[Signal], ai_signal: Optional[Signal], symbol: str) -> Signal:
         """

@@ -151,7 +151,6 @@ def _bare_engine(cfg) -> StrategyEngine:
     engine.cfg = cfg
     engine.execution = _RecordingExecution()
     engine.risk_manager = RiskManager(cfg)
-    engine._pending_exit_reasons = {}
     engine._orphan_attempts = {}
     return engine
 
@@ -177,7 +176,6 @@ class EngineSafeModeTest(unittest.TestCase):
             changed = engine._manage_exit("ETHUSDT", dict(self.PROFITABLE_LONG), reversal, "short")
         self.assertFalse(changed)
         self.assertEqual(engine.execution.closed_orders, [])
-        self.assertEqual(engine._pending_exit_reasons, {})  # причина не взводится
         self.assertTrue(any("SAFE MODE" in m and "НЕ закрыта" in m for m in logs.output))
 
     def test_enabled_mode_still_closes(self):
@@ -199,10 +197,9 @@ class _RejectingExecution(_RecordingExecution):
 class ExitManagerRejectedCloseTest(unittest.TestCase):
     """
     Регрессия: _manage_exit раньше игнорировал retCode ответа close_position
-    и считал закрытие успешным, даже если биржа его отклонила. Из-за этого
-    _pending_exit_reasons получал "exit manager" для позиции, которая на самом
-    деле осталась открытой — и следующее реальное закрытие (например, по SL)
-    записало бы в журнал неверную причину.
+    и считал закрытие успешным, даже если биржа его отклонила — вызывающий
+    код продолжал бы вести себя так, будто позиция закрыта, хотя она осталась
+    открытой на бирже.
     """
 
     def test_rejected_close_is_not_treated_as_success(self):
@@ -218,10 +215,6 @@ class ExitManagerRejectedCloseTest(unittest.TestCase):
             changed = engine._manage_exit("ETHUSDT", position, reversal, "short")
 
         self.assertFalse(changed)
-        # Ордер отправлен (биржа его увидела), но отклонён -- pending reason
-        # не должен взводиться, иначе он приклеится к следующему, никак не
-        # связанному закрытию этой позиции.
-        self.assertEqual(engine._pending_exit_reasons, {})
         self.assertTrue(any("отклонено биржей" in m for m in logs.output))
 
 

@@ -71,6 +71,7 @@ class FakeExecution:
         self.positions = []
         self.opened = []
         self.closed_pnl = {}
+        self.executions = {}
         self.confirmation = OrderConfirmation(status=FillStatus.FILLED, filled_qty=1.0)
         self.since_calls = []
 
@@ -93,6 +94,12 @@ class FakeExecution:
     def get_closed_pnl_since(self, symbol, start_time_ms=None, max_pages=5):
         self.since_calls.append((symbol, start_time_ms))
         return self.closed_pnl.get(symbol, [])
+
+    def get_executions(self, symbol, order_link_id=None, start_time_ms=None, max_pages=5):
+        # По умолчанию пусто -> exit_reason падает в fallback "manual/unknown",
+        # как и раньше. Тесты, которым нужна конкретная причина, кладут сюда
+        # свои executions через self.executions[symbol].
+        return self.executions.get(symbol, [])
 
 
 class FakeJournal:
@@ -166,7 +173,6 @@ def _bare_engine(cfg, execution, journal, risk_manager) -> StrategyEngine:
     engine.journal = journal
     engine.risk_manager = risk_manager
     engine._orphan_attempts = {}
-    engine._pending_exit_reasons = {}
     engine._last_entry_ts = None
     return engine
 

@@ -83,6 +83,12 @@ class FakeExecution:
     def get_closed_pnl_since(self, symbol, start_time_ms=None, max_pages=5):
         return self.closed_pnl.get(symbol, [])
 
+    def get_executions(self, symbol, order_link_id=None, start_time_ms=None, max_pages=5):
+        # Тесты в этом файле не проверяют определение exit_reason по
+        # executions — пустой список даёт тот же fallback "manual/unknown",
+        # что и раньше, ничего не ломая.
+        return []
+
     def confirm_order(self, symbol, order_link_id, attempts=3, delay_seconds=0.6):
         self.confirm_calls.append((symbol, order_link_id))
         return self.confirmation
@@ -448,7 +454,6 @@ class IntegrationPipelineTest(unittest.TestCase):
         engine.execution = FakeExecution()
         engine.journal = FakeJournal()
         engine._trailing_activated = set()
-        engine._pending_exit_reasons = {}
         engine._orphan_attempts = {}
         engine._last_entry_ts = None
 
