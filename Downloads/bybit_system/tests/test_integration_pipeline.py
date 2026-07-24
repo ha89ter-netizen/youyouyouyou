@@ -101,6 +101,7 @@ class FakeJournal:
         self.exits = []
         self.orphaned = []
         self.closed = []
+        self.exit_triggers = {}
         self.log_entry_ok = True
 
     def log_entry(self, **kwargs):
@@ -119,6 +120,10 @@ class FakeJournal:
 
     def get_open_trades(self, symbol=None):
         return [t for t in self.open if symbol is None or t["symbol"] == symbol]
+
+    def record_exit_trigger(self, order_link_id, trigger):
+        self.exit_triggers[order_link_id] = trigger
+        return True
 
     def log_exit(self, order_link_id, exit_price, pnl_usdt, exit_reason="manual/unknown",
                  closed_at=None, **kwargs):

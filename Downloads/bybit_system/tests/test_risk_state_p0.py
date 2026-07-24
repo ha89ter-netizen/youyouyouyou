@@ -108,7 +108,12 @@ class FakeJournal:
         self.entries = []
         self.orphaned = []
         self.closed = []
+        self.exit_triggers = {}
         self.log_entry_ok = True
+
+    def record_exit_trigger(self, order_link_id, trigger):
+        self.exit_triggers[order_link_id] = trigger
+        return True
 
     def log_entry(self, **kwargs):
         if not self.log_entry_ok:

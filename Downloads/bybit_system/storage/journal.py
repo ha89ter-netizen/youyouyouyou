@@ -272,6 +272,43 @@ class TradeJournal:
             "opened_at_ms": to_epoch_ms(r.opened_at),
         }
 
+    def record_exit_trigger(self, order_link_id: str, trigger: dict) -> bool:
+        """
+        Сохраняет снимок решения, из-за которого инициировано закрытие сделки
+        (обычно — Exit Manager: разворотный сигнал прошёл тот же барьер
+        комитета, что и вход). Вызывать СРАЗУ после того, как биржа приняла
+        close-ордер, а не задним числом при сверке.
+
+        Ключ — order_link_id ОТКРЫВАЮЩЕЙ сделки, а не символ. Это осознанно:
+        symbol-keyed кэш (_pending_exit_reasons) раньше был источником риска
+        неверной атрибуции, если по одному символу реконсилируется несколько
+        записей за цикл. Запись прямо в строку конкретной сделки этого риска
+        не несёт — перепутать её с чужой строкой невозможно.
+
+        Не блокирует и не участвует в идемпотентности закрытия: это
+        вспомогательный снимок для последующего анализа, а не источник PnL.
+        Тихо игнорирует отсутствующую или уже закрытую запись — потеря этого
+        снимка ухудшает наблюдаемость, но не должна прерывать закрытие позиции.
+        """
+        session = self.db.get_session()
+        try:
+            row = session.query(TradeLog).filter(TradeLog.order_link_id == order_link_id).first()
+            if row is None:
+                logger.warning(
+                    "Журнал: не найдена запись %s для exit_trigger — снимок решения потерян",
+                    order_link_id,
+                )
+                return False
+            row.exit_trigger = safe_json(trigger)
+            session.commit()
+            return True
+        except Exception:
+            logger.exception("Не удалось сохранить exit_trigger для %s", order_link_id)
+            session.rollback()
+            return False
+        finally:
+            session.close()
+
     def mark_orphaned(self, order_link_id: str, reason: str) -> bool:
         """
         Помечает сделку как orphaned: журнал считал её открытой, но ни живой

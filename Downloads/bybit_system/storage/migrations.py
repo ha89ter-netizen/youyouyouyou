@@ -24,6 +24,7 @@ TRADE_LOG_ANALYTICS_COLUMNS: Dict[str, str] = {
     "exit_reason": "VARCHAR(100)",
     "exit_type": "VARCHAR(30)",
     "exit_snapshot": "JSONB",
+    "exit_trigger": "JSONB",
     "holding_seconds": "INTEGER",
 }
 

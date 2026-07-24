@@ -1127,12 +1127,53 @@ class StrategyEngine:
             )
             return False
 
-        # Причину закрытия сюда специально НЕ записываем: она определяется
-        # позже, в _sync_closed_trades, по orderLinkId закрывающего ордера
-        # (см. _infer_exit_reason) — это надёжнее, чем гадать заранее по
-        # символу, и не зависит от того, сколько сделок по этому символу
-        # реконсилируется в одном цикле.
+        # Категория причины закрытия (TP/SL/trailing/exit_manager/manual) сюда
+        # специально НЕ записывается: она определяется позже, в
+        # _sync_closed_trades, по orderLinkId закрывающего ордера (см.
+        # _infer_exit_reason) — надёжнее, чем гадать заранее по символу.
+        #
+        # А вот САМО решение — какой разворотный сигнал вызвал закрытие —
+        # больше нигде не появится: closed_pnl/execution list с биржи ничего
+        # не знают про наш DecisionEngine. Сохраняем его сразу, в строку
+        # конкретной открывающей сделки (по order_link_id, не по символу —
+        # неверная атрибуция здесь невозможна в принципе). Потеря снимка
+        # ухудшает наблюдаемость, но не должна мешать закрытию.
+        self._record_exit_trigger(symbol, final_signal)
         return True
+
+    def _record_exit_trigger(self, symbol: str, final_signal: Signal):
+        try:
+            open_trades = self.journal.get_open_trades(symbol)
+        except Exception:
+            logger.exception("%s: не удалось прочитать журнал для записи exit_trigger", symbol)
+            return
+        if not open_trades:
+            logger.warning(
+                "%s: Exit Manager закрыл позицию, но в журнале нет открытой сделки — "
+                "снимок решения записать некуда", symbol,
+            )
+            return
+        if len(open_trades) > 1:
+            logger.warning(
+                "%s: в журнале %d открытых сделок одновременно (ожидалась одна) — "
+                "снимок решения записываю в самую старую", symbol, len(open_trades),
+            )
+        order_link_id = min(
+            open_trades, key=lambda t: t.get("opened_at_ms") or 0
+        )["order_link_id"]
+
+        expected_rr = None
+        if final_signal.stop_loss_pct and final_signal.take_profit_pct and final_signal.stop_loss_pct > 0:
+            expected_rr = round(final_signal.take_profit_pct / final_signal.stop_loss_pct, 3)
+
+        trigger = {
+            "action": final_signal.action.value,
+            "source": final_signal.source,
+            "confidence": final_signal.confidence,
+            "reason": final_signal.reason,
+            "expected_rr": expected_rr,
+        }
+        self.journal.record_exit_trigger(order_link_id, trigger)
 
     def _apply_trend_filter(self, signal: Signal, trend: Optional[str], context, symbol: str) -> Signal:
         """

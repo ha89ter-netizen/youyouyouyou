@@ -180,10 +180,30 @@ class EngineSafeModeTest(unittest.TestCase):
 
     def test_enabled_mode_still_closes(self):
         engine = _bare_engine(_cfg(trading_enabled=True))
-        reversal = Signal("ETHUSDT", Action.OPEN_SHORT, "decision:test", 0.8, "разворот")
+        db = SessionBackedDb()
+        engine.journal = TradeJournal(db)
+        engine.journal.log_entry(
+            "ETHUSDT", Action.OPEN_LONG, "test", "entry",
+            100.0, 50.0, 1, 1.5, 3.0, "oid-eth",
+        )
+        reversal = Signal(
+            "ETHUSDT", Action.OPEN_SHORT, "decision:test", 0.8, "разворот",
+            stop_loss_pct=1.5, take_profit_pct=3.0,
+        )
         changed = engine._manage_exit("ETHUSDT", dict(self.PROFITABLE_LONG), reversal, "short")
         self.assertTrue(changed)
         self.assertEqual(engine.execution.closed_orders, ["ETHUSDT"])
+
+        session = db.get_session()
+        try:
+            row = session.query(TradeLog).filter(TradeLog.order_link_id == "oid-eth").one()
+            self.assertIsNotNone(row.exit_trigger)
+            self.assertEqual(row.exit_trigger["action"], "open_short")
+            self.assertEqual(row.exit_trigger["source"], "decision:test")
+            self.assertAlmostEqual(row.exit_trigger["confidence"], 0.8)
+            self.assertAlmostEqual(row.exit_trigger["expected_rr"], 2.0)
+        finally:
+            session.close()
 
 
 class _RejectingExecution(_RecordingExecution):

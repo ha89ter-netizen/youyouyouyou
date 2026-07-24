@@ -58,6 +58,14 @@ class TradeLog(Base):
     pnl_pct = Column(Numeric, nullable=True)
     mfe_pct = Column(Numeric, nullable=True)
     mae_pct = Column(Numeric, nullable=True)
+    # exit_reason/exit_type — КАТЕГОРИЯ закрытия (TP/SL/trailing/exit_manager/
+    # manual), определяется постфактум при сверке с биржей (см. strategy/engine.py
+    # _infer_exit_reason). exit_trigger — это ДРУГОЕ: снимок решения, из-за
+    # которого Exit Manager инициировал закрытие (если оно было инициировано
+    # им), записанный СРАЗУ в момент отправки close-ордера, а не задним числом.
+    # Без него нельзя понять, почему сработал разворотный выход — только то,
+    # что он сработал.
+    exit_trigger = Column(JSONB_COMPAT, nullable=True)
     exit_reason = Column(String(100), nullable=True)
     exit_type = Column(String(30), nullable=True)
     exit_snapshot = Column(JSONB_COMPAT, nullable=True)
