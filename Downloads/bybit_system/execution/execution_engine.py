@@ -224,13 +224,10 @@ class ExecutionEngine:
         self, symbol: str, price: float, pct: float, side: str, is_stop_loss: bool
     ) -> float:
         """Цена SL/TP со смещением в процентах, прижатая к сетке тика инструмента."""
-        # ВАЖНО: считаем смещение в полной точности. _calc_price_offset округляет
-        # до 4 знаков, и для дешёвых монет это разрушало сам стоп: у 1000PEPEUSDT
-        # с ценой входа 0.00271 стоп 1.5% превращался в 0.37%.
-        direction = 1 if side == "Buy" else -1
-        if is_stop_loss:
-            direction *= -1
-        raw = price * (1 + direction * pct / 100)
+        # ВАЖНО: считаем смещение в ПОЛНОЙ точности, без промежуточного
+        # round(,4) -- для дешёвых монет такое округление разрушало сам стоп:
+        # у 1000PEPEUSDT с ценой входа 0.00271 стоп 1.5% превращался в 0.37%.
+        raw = self._raw_price_offset(price, pct, side, is_stop_loss)
         try:
             tick_size = self._get_lot_size(symbol)["tickSize"]
         except Exception:
@@ -672,8 +669,15 @@ class ExecutionEngine:
         return None
 
     @staticmethod
-    def _calc_price_offset(price: float, pct: float, side: str, is_stop_loss: bool) -> float:
+    def _raw_price_offset(price: float, pct: float, side: str, is_stop_loss: bool) -> float:
+        """
+        Цена со смещением в процентах, БЕЗ округления до сетки тика -- этим
+        занимается вызывающий код (_price_with_offset), который знает
+        tickSize конкретного инструмента. Единственное место, где считается
+        эта формула, чтобы не завести повторно дублирующую (и потенциально
+        расходящуюся) копию, как это уже было с прежним _calc_price_offset.
+        """
         direction = 1 if side == "Buy" else -1
         if is_stop_loss:
             direction *= -1  # SL всегда против направления позиции
-        return round(price * (1 + direction * pct / 100), 4)
+        return price * (1 + direction * pct / 100)
