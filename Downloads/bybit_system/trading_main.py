@@ -16,12 +16,14 @@
 
 import logging
 import os
+import signal
 
 from config.settings import BybitConfig
 from logging_config import configure_app_logging
 from storage.migrations import run_safe_migrations
 from storage.db import Database
 from strategy.engine import StrategyEngine
+from runtime_control import RuntimeService
 
 configure_app_logging("trading", "trading.log")
 logger = logging.getLogger("trading_main")
@@ -50,12 +52,21 @@ def main():
         logger.error("БД недоступна. Запустите docker compose up -d и python -m storage.init_db")
         return
     run_safe_migrations(db.engine)
+    runtime = RuntimeService(db, cfg.run_id, "trader")
+    runtime.start()
 
     engine = StrategyEngine(cfg, db)
+    def stop_signal(_signum, _frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, stop_signal)
+    signal.signal(signal.SIGINT, stop_signal)
     try:
         engine.run_forever()
     except KeyboardInterrupt:
         logger.info("Остановлено пользователем.")
+    finally:
+        runtime.stop()
 
 
 if __name__ == "__main__":

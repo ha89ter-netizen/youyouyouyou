@@ -9,6 +9,8 @@ WebSocket пишет живой поток через MarketDataStore (с буф
 """
 
 import logging
+import os
+import signal
 import time
 
 from config.settings import BybitConfig
@@ -17,6 +19,8 @@ from logging_config import configure_app_logging
 from data.ws_client import BybitPublicStream
 from storage.db import Database
 from storage.repository import MarketDataStore
+from storage.migrations import run_safe_migrations
+from runtime_control import RuntimeService
 
 configure_app_logging("main", "main.log")
 logger = logging.getLogger("main")
@@ -24,6 +28,9 @@ logger = logging.getLogger("main")
 
 def main():
     cfg = BybitConfig()
+    if os.getenv("BYBIT_TESTNET", "").lower() != "true" or not cfg.testnet:
+        logger.error("Market collector refuses to start outside explicit Testnet mode")
+        return
     logger.info("Символы для отслеживания: %s", cfg.symbols)
 
     # --- БД ---
@@ -34,6 +41,9 @@ def main():
             "и выполните: python -m storage.init_db"
         )
         return
+    run_safe_migrations(db.engine)
+    runtime = RuntimeService(db, cfg.run_id, "collector")
+    runtime.start()
     store = MarketDataStore(db)
 
     # --- 1. REST: исторические данные сразу в БД ---
@@ -69,12 +79,19 @@ def main():
         stream.subscribe_ticker(symbol, on_message=store.on_ticker_ws)
 
     logger.info("Поток запущен, данные пишутся в БД. Ctrl+C для остановки.")
+    def stop_signal(_signum, _frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, stop_signal)
+    signal.signal(signal.SIGINT, stop_signal)
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
         logger.info("Останавливаюсь, сбрасываю буферы в БД...")
+    finally:
         store.stop()
+        runtime.stop()
         logger.info("Готово.")
 
 

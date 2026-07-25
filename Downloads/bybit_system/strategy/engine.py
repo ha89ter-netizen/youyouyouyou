@@ -46,6 +46,15 @@ def _unknown_confirmation(detail: str) -> OrderConfirmation:
     return OrderConfirmation(status=FillStatus.UNKNOWN, detail=detail)
 
 
+def _optional_float(value) -> Optional[float]:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _orphan_breaker_reason(order_link_id: str, symbol: str) -> str:
     """
     Единый текст причины breaker для orphaned-сделки.
@@ -418,6 +427,15 @@ class StrategyEngine:
         execution_record = (exec_by_order_id or {}).get(match.get("orderId"))
         exit_reason = self._infer_exit_reason(match, execution_record)
         exit_snapshot = self._build_exit_snapshot(symbol, match)
+        exit_fee = _optional_float(
+            match.get("closeFee") or (execution_record or {}).get("execFee")
+        )
+        open_fee = _optional_float(match.get("openFee"))
+        total_fee = (
+            open_fee + exit_fee
+            if open_fee is not None and exit_fee is not None
+            else None
+        )
 
         result = self.journal.log_exit(
             order_link_id,
@@ -426,6 +444,9 @@ class StrategyEngine:
             exit_reason=exit_reason,
             exit_snapshot=exit_snapshot,
             closed_at=closed_at,
+            exchange_exit_order_id=match.get("orderId"),
+            exit_fee_usdt=exit_fee,
+            total_fee_usdt=total_fee,
         )
         if not result.recorded:
             if result.already_closed:
@@ -927,6 +948,24 @@ class StrategyEngine:
 
             sl_pct = final_signal.stop_loss_pct or self.cfg.default_stop_loss_pct
             tp_pct = final_signal.take_profit_pct
+            stop_loss_price = self._price_from_pct(
+                last_price, final_signal.action, sl_pct, is_stop=True
+            )
+            take_profit_price = self._price_from_pct(
+                last_price, final_signal.action, tp_pct, is_stop=False
+            )
+            stop_loss_price = _optional_float(
+                resp.get("local_stop_loss_price")
+            ) or stop_loss_price
+            take_profit_price = _optional_float(
+                resp.get("local_take_profit_price")
+            ) or take_profit_price
+            exchange_entry_order_id = (
+                confirmation.raw.get("orderId")
+                or resp.get("result", {}).get("orderId")
+            )
+            fee_reader = getattr(self.execution, "get_order_fee_usdt", None)
+            entry_fee_usdt = fee_reader(symbol, order_link_id) if fee_reader else None
             logger.info(
                 "TRADE_OPEN symbol=%s direction=%s size_usdt=%.4f leverage=%sx entry=%.6f "
                 "sl_pct=%s sl_price=%s tp_pct=%s tp_price=%s orderLinkId=%s supporters=%s reason=%s",
@@ -936,9 +975,9 @@ class StrategyEngine:
                 check.approved_leverage,
                 entry_price,
                 sl_pct,
-                self._price_from_pct(last_price, final_signal.action, sl_pct, is_stop=True),
+                stop_loss_price,
                 tp_pct,
-                self._price_from_pct(last_price, final_signal.action, tp_pct, is_stop=False),
+                take_profit_price,
                 order_link_id,
                 self._supporting_experts(decision_report),
                 final_signal.reason,
@@ -965,6 +1004,11 @@ class StrategyEngine:
                 entry_reason=decision_report.journal_reason(limit=2000),
                 entry_snapshot=candidate.entry_snapshot,
                 expert_votes=candidate.expert_vote_rows,
+                run_id=self.cfg.run_id,
+                exchange_entry_order_id=exchange_entry_order_id,
+                stop_loss_price=stop_loss_price,
+                take_profit_price=take_profit_price,
+                entry_fee_usdt=entry_fee_usdt,
             )
             if not journal_saved:
                 # Счётчик и cooldown уже зафиксированы выше, поэтому повторного

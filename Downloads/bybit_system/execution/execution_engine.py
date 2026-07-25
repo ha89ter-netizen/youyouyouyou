@@ -20,6 +20,7 @@ from enum import Enum
 from typing import Optional, Dict, Any, List
 
 from pybit.unified_trading import HTTP
+from pybit.exceptions import InvalidRequestError
 
 from config.settings import BybitConfig
 from strategy.signal import Action
@@ -280,7 +281,8 @@ class ExecutionEngine:
         if action not in (Action.OPEN_LONG, Action.OPEN_SHORT):
             raise ValueError(f"open_position accepts only OPEN_LONG/OPEN_SHORT, got {action}")
         side = "Buy" if action == Action.OPEN_LONG else "Sell"
-        qty = self._round_qty(symbol, size_usdt / last_price)
+        order_price = self._current_order_price(symbol, last_price)
+        qty = self._round_qty(symbol, size_usdt / order_price)
 
         self.set_leverage(symbol, leverage)
 
@@ -297,19 +299,53 @@ class ExecutionEngine:
         }
 
         if stop_loss_pct:
-            sl_price = self._price_with_offset(symbol, last_price, stop_loss_pct, side, is_stop_loss=True)
+            sl_price = self._price_with_offset(symbol, order_price, stop_loss_pct, side, is_stop_loss=True)
             params["stopLoss"] = str(sl_price)
         if take_profit_pct:
-            tp_price = self._price_with_offset(symbol, last_price, take_profit_pct, side, is_stop_loss=False)
+            tp_price = self._price_with_offset(symbol, order_price, take_profit_pct, side, is_stop_loss=False)
             params["takeProfit"] = str(tp_price)
 
         logger.info("Отправляю ордер: %s", params)
-        resp = self.session.place_order(**params)
+        try:
+            resp = self.session.place_order(**params)
+        except InvalidRequestError as exc:
+            logger.warning("%s: биржа окончательно отклонила ордер до принятия: %s", symbol, exc)
+            return {
+                "retCode": getattr(exc, "status_code", 10001) or 10001,
+                "retMsg": str(exc),
+                "result": {},
+                "definitive_rejection": True,
+            }
         resp["local_order_link_id"] = order_link_id
+        resp["local_order_price"] = order_price
+        resp["local_stop_loss_price"] = params.get("stopLoss")
+        resp["local_take_profit_price"] = params.get("takeProfit")
         logger.info("Ответ биржи: retCode=%s retMsg=%s orderId=%s orderLinkId=%s",
                      resp.get("retCode"), resp.get("retMsg"),
                      resp.get("result", {}).get("orderId"), order_link_id)
         return resp
+
+    def _current_order_price(self, symbol: str, fallback: float) -> float:
+        """Use a fresh Testnet ticker for protective prices; candle close is only fallback."""
+        try:
+            response = self.session.get_tickers(category=self.cfg.category, symbol=symbol)
+            rows = (response.get("result") or {}).get("list") or []
+            if rows:
+                raw = rows[0].get("markPrice") or rows[0].get("lastPrice")
+                price = float(raw or 0)
+                if price > 0:
+                    if fallback > 0 and abs(price - fallback) / fallback > 0.001:
+                        logger.info(
+                            "%s: execution price refreshed %.8f -> %.8f before order",
+                            symbol, fallback, price,
+                        )
+                    return price
+        except Exception:
+            logger.warning(
+                "%s: current ticker unavailable; using latest database price %.8f",
+                symbol, fallback, exc_info=True,
+            )
+        return fallback
 
     def close_position(self, symbol: str, side_to_close: str, qty: float, source: str = "unknown") -> Dict[str, Any]:
         """side_to_close — сторона ТЕКУЩЕЙ позиции ('Buy'/'Sell'); закрываем встречным ордером."""
@@ -508,6 +544,24 @@ class ExecutionEngine:
         if order_link_id:
             params["orderLinkId"] = order_link_id
         return self._paginate(self.session.get_executions, params, max_pages, symbol, "executions")
+
+    def get_order_fee_usdt(self, symbol: str, order_link_id: str) -> Optional[float]:
+        """Return summed execution fees when Bybit supplies them; unknown stays NULL."""
+        try:
+            fills = self.get_executions(symbol, order_link_id=order_link_id, max_pages=2)
+        except Exception:
+            logger.warning("%s: fee lookup failed for %s", symbol, order_link_id, exc_info=True)
+            return None
+        fees = []
+        for fill in fills:
+            raw = fill.get("execFee")
+            if raw in (None, ""):
+                continue
+            try:
+                fees.append(float(raw))
+            except (TypeError, ValueError):
+                continue
+        return sum(fees) if fees else None
 
     def confirm_order(
         self,

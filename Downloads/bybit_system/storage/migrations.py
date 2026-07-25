@@ -3,7 +3,7 @@ from typing import Dict
 
 from sqlalchemy import inspect, text
 
-from storage.models import RiskState, TradeExpertVote
+from storage.models import RiskState, RunMetadata, TradeExpertVote
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +26,16 @@ TRADE_LOG_ANALYTICS_COLUMNS: Dict[str, str] = {
     "exit_snapshot": "JSONB",
     "exit_trigger": "JSONB",
     "holding_seconds": "INTEGER",
+    "run_id": "VARCHAR(100)",
+    "exchange_entry_order_id": "VARCHAR(100)",
+    "exchange_exit_order_id": "VARCHAR(100)",
+    "stop_loss_price": "NUMERIC",
+    "take_profit_price": "NUMERIC",
+    "entry_fee_usdt": "NUMERIC",
+    "exit_fee_usdt": "NUMERIC",
+    "total_fee_usdt": "NUMERIC",
+    "legacy_orphan_reason": "VARCHAR(500)",
+    "legacy_classified_at": "TIMESTAMP WITH TIME ZONE",
 }
 
 
@@ -46,9 +56,6 @@ def ensure_trade_log_analytics_columns(engine) -> None:
         for name, sql_type in TRADE_LOG_ANALYTICS_COLUMNS.items()
         if name not in existing
     ]
-    if not missing:
-        return
-
     dialect = engine.dialect.name
     with engine.begin() as conn:
         for name, sql_type in missing:
@@ -60,6 +67,8 @@ def ensure_trade_log_analytics_columns(engine) -> None:
                 statement = f"ALTER TABLE trade_log ADD COLUMN {name} {sql_type}"
             conn.execute(text(statement))
             logger.info("DB migration: trade_log.%s added", name)
+        if dialect == "postgresql":
+            conn.execute(text("ALTER TABLE trade_log ALTER COLUMN status TYPE VARCHAR(20)"))
 
 
 def ensure_trade_expert_votes_table(engine) -> None:
@@ -69,6 +78,10 @@ def ensure_trade_expert_votes_table(engine) -> None:
         logger.warning("DB migration: trade_log missing, skip trade_expert_votes creation")
         return
     TradeExpertVote.__table__.create(bind=engine, checkfirst=True)
+
+
+def ensure_run_metadata_table(engine) -> None:
+    RunMetadata.__table__.create(bind=engine, checkfirst=True)
 
 
 RISK_STATE_COLUMNS: Dict[str, str] = {
@@ -120,6 +133,7 @@ def ensure_analytics_indexes(engine) -> None:
         # status+symbol — горячий путь гейта повторного входа и реконсиляции:
         # на каждый цикл спрашиваем "есть ли открытые сделки по этому символу"
         "CREATE INDEX IF NOT EXISTS ix_trade_log_status_symbol ON trade_log (status, symbol)",
+        "CREATE INDEX IF NOT EXISTS ix_trade_log_run_id ON trade_log (run_id)",
     ]
     inspector = inspect(engine)
     if not inspector.has_table("trade_log") or not inspector.has_table("trade_expert_votes"):
@@ -133,4 +147,5 @@ def run_safe_migrations(engine) -> None:
     ensure_trade_log_analytics_columns(engine)
     ensure_trade_expert_votes_table(engine)
     ensure_risk_state_table(engine)
+    ensure_run_metadata_table(engine)
     ensure_analytics_indexes(engine)

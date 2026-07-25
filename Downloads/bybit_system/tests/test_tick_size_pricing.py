@@ -142,6 +142,19 @@ class PriceWithOffsetTest(unittest.TestCase):
         got = execution._price_with_offset("FOOUSDT", 100.0, 1.5, "Buy", True)
         self.assertAlmostEqual(got, 98.5, places=4)
 
+
+class CurrentOrderPriceTest(unittest.TestCase):
+    def test_fresh_ticker_replaces_stale_candle_price(self):
+        execution = _execution()
+
+        class Session:
+            @staticmethod
+            def get_tickers(**_kwargs):
+                return {"result": {"list": [{"markPrice": "0.8017"}]}}
+
+        execution.session = Session()
+        self.assertEqual(execution._current_order_price("DOTUSDT", 0.8225), 0.8017)
+
     def test_unknown_symbol_falls_back_without_network(self):
         """Инструмента нет в кэше и сессии нет — не падаем, а логируем и откатываемся."""
         execution = _execution()

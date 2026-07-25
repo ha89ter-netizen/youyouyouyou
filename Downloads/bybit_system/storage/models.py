@@ -37,6 +37,8 @@ class TradeLog(Base):
     reason = Column(String(1000), nullable=False)
     entry_reason = Column(String(2000), nullable=True)
     order_link_id = Column(String(100), nullable=False, unique=True)
+    run_id = Column(String(100), nullable=True, index=True)
+    exchange_entry_order_id = Column(String(100), nullable=True)
 
     market_context = Column(String(2000), nullable=True)
     regime = Column(String(30), nullable=True)
@@ -52,6 +54,9 @@ class TradeLog(Base):
     leverage = Column(Integer, nullable=False)
     stop_loss_pct = Column(Numeric, nullable=True)
     take_profit_pct = Column(Numeric, nullable=True)
+    stop_loss_price = Column(Numeric, nullable=True)
+    take_profit_price = Column(Numeric, nullable=True)
+    entry_fee_usdt = Column(Numeric, nullable=True)
 
     exit_price = Column(Numeric, nullable=True)
     pnl_usdt = Column(Numeric, nullable=True)
@@ -69,12 +74,17 @@ class TradeLog(Base):
     exit_reason = Column(String(100), nullable=True)
     exit_type = Column(String(30), nullable=True)
     exit_snapshot = Column(JSONB_COMPAT, nullable=True)
+    exchange_exit_order_id = Column(String(100), nullable=True)
+    exit_fee_usdt = Column(Numeric, nullable=True)
+    total_fee_usdt = Column(Numeric, nullable=True)
     holding_seconds = Column(Integer, nullable=True)
     # open      — позиция считается живой
     # closed    — выход подтверждён реальным closed PnL с биржи
     # orphaned  — журнал считал сделку открытой, но ни живой позиции, ни closed PnL
     #             найти не удалось: финансовый результат неизвестен (см. circuit breaker)
-    status = Column(String(10), nullable=False, default="open")
+    status = Column(String(20), nullable=False, default="open")
+    legacy_orphan_reason = Column(String(500), nullable=True)
+    legacy_classified_at = Column(DateTime(timezone=True), nullable=True)
 
     # default=utcnow (а не только server_default) — чтобы время входа было
     # timezone-aware уже в момент создания объекта и не зависело от того,
@@ -145,6 +155,22 @@ class TradeExpertVote(Base):
     __table_args__ = (
         UniqueConstraint("order_link_id", "source", name="uq_trade_expert_vote_order_source"),
     )
+
+
+class RunMetadata(Base):
+    """Immutable run identity plus lightweight service liveness."""
+    __tablename__ = "run_metadata"
+
+    run_id = Column(String(100), primary_key=True)
+    commit_sha = Column(String(64), nullable=False)
+    started_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+    environment_summary = Column(JSONB_COMPAT, nullable=False)
+    status = Column(String(20), nullable=False, default="starting")
+    collector_pid = Column(Integer, nullable=True)
+    trader_pid = Column(Integer, nullable=True)
+    collector_heartbeat_at = Column(DateTime(timezone=True), nullable=True)
+    trader_heartbeat_at = Column(DateTime(timezone=True), nullable=True)
+    stopped_at = Column(DateTime(timezone=True), nullable=True)
 
 
 class Candle(Base):

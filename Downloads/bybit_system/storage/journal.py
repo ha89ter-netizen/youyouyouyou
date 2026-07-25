@@ -77,6 +77,11 @@ class TradeJournal:
         entry_reason: Optional[str] = None,
         entry_snapshot: Optional[dict] = None,
         expert_votes: Optional[list[dict]] = None,
+        run_id: Optional[str] = None,
+        exchange_entry_order_id: Optional[str] = None,
+        stop_loss_price: Optional[float] = None,
+        take_profit_price: Optional[float] = None,
+        entry_fee_usdt: Optional[float] = None,
     ) -> bool:
         if not order_link_id:
             logger.error("Журнал: отказ записи входа %s без order_link_id", symbol)
@@ -102,6 +107,11 @@ class TradeJournal:
                 entry_snapshot=safe_json(entry_snapshot) if entry_snapshot is not None else None,
                 entry_price=entry_price, size_usdt=size_usdt, leverage=leverage,
                 stop_loss_pct=stop_loss_pct, take_profit_pct=take_profit_pct,
+                stop_loss_price=safe_float(stop_loss_price, "stop_loss_price"),
+                take_profit_price=safe_float(take_profit_price, "take_profit_price"),
+                entry_fee_usdt=safe_float(entry_fee_usdt, "entry_fee_usdt"),
+                run_id=sanitize_text(run_id, 100),
+                exchange_entry_order_id=sanitize_text(exchange_entry_order_id, 100),
                 status="open",
             )
             session.add(entry)
@@ -141,6 +151,9 @@ class TradeJournal:
         exit_type: Optional[str] = None,
         exit_snapshot: Optional[dict] = None,
         closed_at: Optional[datetime] = None,
+        exchange_exit_order_id: Optional[str] = None,
+        exit_fee_usdt: Optional[float] = None,
+        total_fee_usdt: Optional[float] = None,
     ) -> ExitResult:
         """
         Фиксирует выход. Работает и для status="open" (обычное закрытие), и для
@@ -173,6 +186,9 @@ class TradeJournal:
             row.exit_reason = sanitize_text(exit_reason, 100) or "manual/unknown"
             row.exit_type = exit_type or normalize_exit_type(row.exit_reason)
             row.exit_snapshot = safe_json(exit_snapshot) if exit_snapshot is not None else None
+            row.exchange_exit_order_id = sanitize_text(exchange_exit_order_id, 100)
+            row.exit_fee_usdt = safe_float(exit_fee_usdt, "exit_fee_usdt")
+            row.total_fee_usdt = safe_float(total_fee_usdt, "total_fee_usdt")
             row.status = "closed"
             real_closed_at = ensure_aware_utc(closed_at) or utcnow()
             row.closed_at = real_closed_at

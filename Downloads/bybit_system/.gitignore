@@ -4,5 +4,7 @@ venv/
 logs/
 *.log
 *.bak
+.runtime/
+backups/
 
 .DS_Store
