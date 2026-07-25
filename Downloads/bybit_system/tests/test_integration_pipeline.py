@@ -437,7 +437,6 @@ class IntegrationPipelineTest(unittest.TestCase):
         engine = object.__new__(StrategyEngine)
         engine.cfg = cfg
         engine.db = None
-        engine.rule_strategy = None
         engine.experts = FixedTrendExperts()
         engine.market_context_engine = MarketContextEngine()
         engine.meta_strategy = MetaStrategyManager()

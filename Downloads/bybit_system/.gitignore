@@ -2,5 +2,7 @@ venv/
 .venv/
 .env
 logs/
+*.log
+*.bak
 
 .DS_Store

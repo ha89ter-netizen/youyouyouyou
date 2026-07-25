@@ -29,7 +29,6 @@ from storage.journal import TradeJournal
 from storage.risk_state import RiskStateStore
 from strategy.signal import Signal, Action
 from timeutils import from_epoch_ms, utc_today, utcnow
-from strategy.rule_based import TechnicalRuleCommittee
 from strategy.experts import ExpertSignalCollector
 from strategy.indicators import compute_all_indicators, trend_direction
 from market_context import MarketContextEngine
@@ -117,7 +116,6 @@ class StrategyEngine:
     def __init__(self, cfg: BybitConfig, db: Database):
         self.cfg = cfg
         self.db = db
-        self.rule_strategy = TechnicalRuleCommittee()
         self.experts = ExpertSignalCollector()
         self.market_context_engine = MarketContextEngine()
         self.meta_strategy = MetaStrategyManager()
@@ -1503,46 +1501,6 @@ class StrategyEngine:
 
         stop_type = str(execution_record.get("stopOrderType") or "").strip()
         return _STOP_ORDER_TYPE_TO_EXIT_REASON.get(stop_type, "manual/unknown")
-
-    def _reconcile(self, rule_signal: Optional[Signal], ai_signal: Optional[Signal], symbol: str) -> Signal:
-        """
-        Простая, объяснимая логика примирения:
-        - Если оба источника предлагают одно и то же направление — уверенный сигнал.
-        - Если направления противоречат друг другу — HOLD (перестраховка).
-        - Если один HOLD, а другой уверен (confidence >= 0.7) — пропускаем сигнал уверенного.
-          Это и есть "AI сам видит выгодное — торгует по нему, схема совпала — торгует по ней".
-        - Иначе HOLD.
-        """
-        rs = rule_signal.action if rule_signal else Action.HOLD
-        as_ = ai_signal.action if ai_signal else Action.HOLD
-
-        both_open = {Action.OPEN_LONG, Action.OPEN_SHORT}
-
-        if rs in both_open and as_ in both_open:
-            if rs == as_:
-                return Signal(
-                    symbol=symbol, action=rs, source="rule+ai",
-                    confidence=max(rule_signal.confidence, ai_signal.confidence),
-                    reason=f"Совпадение схемы и ИИ: {rule_signal.reason} | {ai_signal.reason}",
-                    stop_loss_pct=min(
-                        rule_signal.stop_loss_pct or 1.5, ai_signal.stop_loss_pct or 1.5
-                    ),
-                    take_profit_pct=rule_signal.take_profit_pct or ai_signal.take_profit_pct,
-                )
-            else:
-                return Signal(symbol=symbol, action=Action.HOLD, source="rule+ai",
-                               reason="Схема и ИИ дали противоположные сигналы — перестраховка")
-
-        if rs in both_open and as_ == Action.HOLD:
-            return rule_signal  # чистое срабатывание схемы
-
-        if as_ in both_open and rs == Action.HOLD:
-            if ai_signal.confidence >= 0.7:
-                return ai_signal  # ИИ нашёл что-то своё и достаточно уверен
-            return Signal(symbol=symbol, action=Action.HOLD, source="ai",
-                           reason=f"ИИ предложил сигнал, но confidence={ai_signal.confidence:.2f} < 0.7")
-
-        return Signal(symbol=symbol, action=Action.HOLD, source="rule+ai", reason="Нет сигналов")
 
     # ------------------------------------------------------------------
 
