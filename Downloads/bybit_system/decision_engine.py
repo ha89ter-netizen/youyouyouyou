@@ -100,6 +100,22 @@ class DecisionEngine:
         self.default_take_profit_rr = default_take_profit_rr
         self.min_confirming_families = min_confirming_families
 
+    # Некоторые режимы объявляют через MetaStrategyManager, какое семейство
+    # экспертов для них — "якорь" (RANGE_EXPERTS/REVERSAL_EXPERTS в
+    # meta_strategy.py прямо перечисляют rsi/funding как приоритетные), но
+    # DecisionEngine это раньше никак не проверял: любые min_confirming_families
+    # семейств засчитывались одинаково, независимо от того, какие именно.
+    #
+    # Подтверждено на 59 реальных testnet-сделках: 10 из 10 (100%) решений в
+    # RANGE-режиме подтвердились парой vwap+rule:committee (price_location +
+    # multi_indicator), ни разу не спросив RSI (mean_reversion) или funding
+    # (positioning) — ровно те два семейства, которые meta_strategy.py считает
+    # приоритетными для RANGE. Win rate 20%, net -10.91 USDT — 53% всего
+    # убытка тестового прогона.
+    _REGIME_REQUIRES_ANY_FAMILY: Dict[str, set] = {
+        "RANGE": {"mean_reversion", "positioning"},
+    }
+
     def decide(
         self,
         symbol: str,
@@ -127,6 +143,12 @@ class DecisionEngine:
         confirmation_families = self._confirmation_families(open_votes)
         expected_rr = self._expected_rr(open_votes, base_signal)
 
+        regime_required_families = self._REGIME_REQUIRES_ANY_FAMILY.get(context.regime)
+        regime_family_gate_failed = bool(
+            regime_required_families
+            and not (set(confirmation_families) & regime_required_families)
+        )
+
         if best_open_score < self.min_open_confidence:
             winning_action = Action.HOLD
             rejected[best_open.value] = (
@@ -138,6 +160,13 @@ class DecisionEngine:
                 f"Недостаточно независимых подтверждений: "
                 f"{len(confirmation_families)}/{self.min_confirming_families} "
                 f"({', '.join(confirmation_families) if confirmation_families else 'нет активных семейств'})"
+            )
+        elif regime_family_gate_failed:
+            winning_action = Action.HOLD
+            rejected[best_open.value] = (
+                f"Режим {context.regime} требует подтверждения хотя бы одного семейства из "
+                f"{sorted(regime_required_families)}, но подтвердили только "
+                f"{', '.join(confirmation_families) if confirmation_families else 'нет активных семейств'}"
             )
         elif best_open_score - opposite_score < self.min_margin and opposite_score > 0:
             winning_action = Action.HOLD
