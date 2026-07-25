@@ -7,11 +7,59 @@ import os
 import threading
 from pathlib import Path
 
+from sqlalchemy import text
+
 from storage.models import RunMetadata
 from timeutils import utcnow
 
 
 RUNTIME_DIR = Path(__file__).resolve().parent / ".runtime"
+_DATABASE_LOCK_IDS = {
+    "supervisor": 4_259_001_001,
+    "collector": 4_259_001_002,
+    "trader": 4_259_001_003,
+}
+
+
+class DatabaseProcessLock:
+    """PostgreSQL advisory lock that prevents duplicates across containers."""
+
+    def __init__(self, db, service: str):
+        if service not in _DATABASE_LOCK_IDS:
+            raise ValueError(f"Unknown lock service: {service}")
+        self.db = db
+        self.service = service
+        self._connection = None
+
+    def start(self) -> None:
+        if self.db.engine.dialect.name != "postgresql":
+            return
+        connection = self.db.engine.connect()
+        try:
+            acquired = connection.execute(
+                text("SELECT pg_try_advisory_lock(:lock_id)"),
+                {"lock_id": _DATABASE_LOCK_IDS[self.service]},
+            ).scalar()
+            if not acquired:
+                raise RuntimeError(
+                    f"Duplicate {self.service} process is already running"
+                )
+            self._connection = connection
+        except Exception:
+            connection.close()
+            raise
+
+    def stop(self) -> None:
+        if self._connection is None:
+            return
+        try:
+            self._connection.execute(
+                text("SELECT pg_advisory_unlock(:lock_id)"),
+                {"lock_id": _DATABASE_LOCK_IDS[self.service]},
+            )
+        finally:
+            self._connection.close()
+            self._connection = None
 
 
 class RuntimeService:
@@ -25,6 +73,7 @@ class RuntimeService:
         self.service = service
         self.interval_sec = interval_sec
         self._lock_file = None
+        self._database_lock = DatabaseProcessLock(db, service)
         self._stop = threading.Event()
         self._thread = None
 
@@ -37,23 +86,30 @@ class RuntimeService:
         except BlockingIOError as exc:
             raise RuntimeError(f"Duplicate {self.service} process is already running") from exc
 
-        info = {
-            "service": self.service,
-            "run_id": self.run_id,
-            "pid": os.getpid(),
-            "started_at": utcnow().isoformat(),
-        }
-        (RUNTIME_DIR / f"{self.service}.json").write_text(
-            json.dumps(info, indent=2), encoding="utf-8"
-        )
-        self._heartbeat()
-        self._thread = threading.Thread(
-            target=self._heartbeat_loop,
-            name=f"{self.service}-heartbeat",
-            daemon=True,
-        )
-        self._thread.start()
-        atexit.register(self.stop)
+        try:
+            self._database_lock.start()
+            info = {
+                "service": self.service,
+                "run_id": self.run_id,
+                "pid": os.getpid(),
+                "started_at": utcnow().isoformat(),
+            }
+            (RUNTIME_DIR / f"{self.service}.json").write_text(
+                json.dumps(info, indent=2), encoding="utf-8"
+            )
+            self._heartbeat()
+            self._thread = threading.Thread(
+                target=self._heartbeat_loop,
+                name=f"{self.service}-heartbeat",
+                daemon=True,
+            )
+            self._thread.start()
+            atexit.register(self.stop)
+        except Exception:
+            self._database_lock.stop()
+            self._lock_file.close()
+            self._lock_file = None
+            raise
 
     def _heartbeat_loop(self) -> None:
         while not self._stop.wait(self.interval_sec):
@@ -90,3 +146,4 @@ class RuntimeService:
             self._lock_file.close()
         finally:
             self._lock_file = None
+            self._database_lock.stop()

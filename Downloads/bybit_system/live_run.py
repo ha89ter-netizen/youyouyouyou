@@ -11,12 +11,14 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 from sqlalchemy import func
+from sqlalchemy.engine import make_url
 
 from config.settings import BybitConfig
 from execution.execution_engine import ExecutionEngine
-from runtime_control import RUNTIME_DIR
+from runtime_control import DatabaseProcessLock, RUNTIME_DIR
 from storage.db import Database
 from storage.journal import TradeJournal
 from storage.migrations import run_safe_migrations
@@ -50,9 +52,20 @@ def _reload_config():
 
 
 def _commit_sha() -> str:
-    return subprocess.check_output(
-        ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
-    ).strip()
+    configured = os.getenv("COMMIT_SHA") or os.getenv("RAILWAY_GIT_COMMIT_SHA")
+    if configured:
+        return configured.strip()
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=ROOT,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError(
+            "Commit SHA is unavailable; set COMMIT_SHA in this container"
+        ) from exc
 
 
 def _process_alive(pid) -> bool:
@@ -71,6 +84,53 @@ def _service_info(service: str) -> dict:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
+
+
+def _validate_runtime_config(cfg: BybitConfig) -> None:
+    if cfg.runtime_mode not in ("local", "railway"):
+        raise RuntimeError("RUNTIME_MODE must be either 'local' or 'railway'")
+    if cfg.runtime_mode != "railway":
+        return
+
+    raw_url = os.getenv("DATABASE_URL", "").strip()
+    if not raw_url:
+        raise RuntimeError(
+            "DATABASE_URL is required in Railway mode; local fallback is forbidden"
+        )
+    try:
+        url = make_url(raw_url)
+    except Exception as exc:
+        raise RuntimeError("DATABASE_URL is invalid in Railway mode") from exc
+    if url.get_backend_name() != "postgresql":
+        raise RuntimeError("Railway mode requires a PostgreSQL DATABASE_URL")
+    host = (url.host or "").strip("[]").lower()
+    if host in ("", "localhost", "127.0.0.1", "::1") or host.endswith(".localhost"):
+        raise RuntimeError(
+            "Railway mode requires external PostgreSQL; localhost DATABASE_URL is forbidden"
+        )
+
+
+def _find_resumable_run(db: Database, commit_sha: str) -> Optional[RunMetadata]:
+    """Find the durable active Testnet run without consulting ephemeral files."""
+    session = db.get_session()
+    try:
+        candidates = (
+            session.query(RunMetadata)
+            .filter(
+                RunMetadata.commit_sha == commit_sha,
+                RunMetadata.status.in_(("starting", "running")),
+            )
+            .order_by(RunMetadata.started_at.desc())
+            .all()
+        )
+        for row in candidates:
+            summary = row.environment_summary or {}
+            if summary.get("testnet") is True:
+                session.expunge(row)
+                return row
+        return None
+    finally:
+        session.close()
 
 
 def _assert_clean_exchange(cfg: BybitConfig) -> None:
@@ -103,12 +163,17 @@ def _environment_summary(cfg: BybitConfig) -> dict:
     for path in source_files:
         digest.update(str(path.relative_to(ROOT)).encode())
         digest.update(path.read_bytes())
-    dirty = bool(subprocess.check_output(
-        ["git", "status", "--porcelain", "--", str(ROOT)],
-        cwd=ROOT,
-        text=True,
-    ).strip())
+    try:
+        dirty = bool(subprocess.check_output(
+            ["git", "status", "--porcelain", "--", str(ROOT)],
+            cwd=ROOT,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip())
+    except (OSError, subprocess.CalledProcessError):
+        dirty = False
     return {
+        "runtime_mode": cfg.runtime_mode,
         "testnet": cfg.testnet,
         "paper_trading": cfg.paper_trading,
         "trading_enabled_at_launch": True,
@@ -121,74 +186,106 @@ def _environment_summary(cfg: BybitConfig) -> dict:
     }
 
 
-def _prepare() -> tuple[str, BybitConfig, Database]:
+def _prepare(
+    acquire_supervisor_lock: bool = False,
+) -> tuple[str, BybitConfig, Database, Optional[DatabaseProcessLock]]:
     _load_env_file()
+    requested_testnet = os.getenv("BYBIT_TESTNET", "")
+    requested_runtime_mode = os.getenv("RUNTIME_MODE", "local").strip().lower()
+    if requested_runtime_mode == "railway" and requested_testnet.lower() != "true":
+        raise RuntimeError("BYBIT_TESTNET=true is mandatory in Railway mode")
     os.environ["BYBIT_TESTNET"] = "true"
     os.environ["TRADING_ENABLED"] = "true"
     _reload_config()
     cfg = BybitConfig()
+    _validate_runtime_config(cfg)
     if not cfg.testnet:
         raise RuntimeError("Testnet safety gate failed")
     if not (cfg.api_key and cfg.api_secret):
         raise RuntimeError("Testnet API credentials are missing")
-    for service in ("collector", "trader"):
-        info = _service_info(service)
-        if _process_alive(info.get("pid")):
-            raise RuntimeError(f"Duplicate {service} process is already alive")
+    if cfg.runtime_mode == "local":
+        for service in ("collector", "trader"):
+            info = _service_info(service)
+            if _process_alive(info.get("pid")):
+                raise RuntimeError(f"Duplicate {service} process is already alive")
 
     db = Database(cfg)
     if not db.check_connection():
         raise RuntimeError("Database is unavailable")
     run_safe_migrations(db.engine)
+    if cfg.runtime_mode == "railway" and db.engine.dialect.name != "postgresql":
+        raise RuntimeError("Railway durability check failed: database is not PostgreSQL")
+
+    supervisor_lock = None
+    if acquire_supervisor_lock:
+        supervisor_lock = DatabaseProcessLock(db, "supervisor")
+        supervisor_lock.start()
+
     journal = TradeJournal(db)
     remaining = journal.get_orphaned_trades()
     if remaining:
+        if supervisor_lock is not None:
+            supervisor_lock.stop()
         raise RuntimeError(f"{len(remaining)} active orphaned trade(s) remain")
-    _assert_clean_exchange(cfg)
 
     sha = _commit_sha()
-    run_id = (
-        f"testnet-{utcnow():%Y%m%dT%H%M%SZ}-"
-        f"{sha[:7]}-{secrets.token_hex(3)}"
-    )
-    session = db.get_session()
-    try:
-        session.add(RunMetadata(
-            run_id=run_id,
-            commit_sha=sha,
-            started_at=utcnow(),
-            environment_summary=_environment_summary(cfg),
-            status="starting",
-        ))
-        session.commit()
-    finally:
-        session.close()
+    durable_run = _find_resumable_run(db, sha) if cfg.runtime_mode == "railway" else None
+    if durable_run is not None:
+        run_id = durable_run.run_id
+    else:
+        try:
+            _assert_clean_exchange(cfg)
+        except Exception:
+            if supervisor_lock is not None:
+                supervisor_lock.stop()
+            raise
+        run_id = (
+            f"testnet-{utcnow():%Y%m%dT%H%M%SZ}-"
+            f"{sha[:7]}-{secrets.token_hex(3)}"
+        )
+        session = db.get_session()
+        try:
+            session.add(RunMetadata(
+                run_id=run_id,
+                commit_sha=sha,
+                started_at=utcnow(),
+                environment_summary=_environment_summary(cfg),
+                status="starting",
+            ))
+            session.commit()
+        finally:
+            session.close()
     RUNTIME_DIR.mkdir(exist_ok=True)
     CURRENT_RUN.write_text(
         json.dumps({"run_id": run_id, "commit_sha": sha}, indent=2),
         encoding="utf-8",
     )
-    return run_id, cfg, db
+    return run_id, cfg, db, supervisor_lock
 
 
-def _spawn(script: str, run_id: str, sha: str) -> int:
+def _spawn_process(script: str, run_id: str, sha: str) -> subprocess.Popen:
     env = os.environ.copy()
     env.update({
         "BYBIT_TESTNET": "true",
         "TRADING_ENABLED": "true",
         "RUN_ID": run_id,
         "COMMIT_SHA": sha,
+        "PYTHONUNBUFFERED": "1",
     })
-    proc = subprocess.Popen(
-        [sys.executable, str(ROOT / script)],
+    railway_mode = env.get("RUNTIME_MODE", "local").strip().lower() == "railway"
+    return subprocess.Popen(
+        [sys.executable, "-u", str(ROOT / script)],
         cwd=ROOT,
         env=env,
         stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=None if railway_mode else subprocess.DEVNULL,
+        stderr=None if railway_mode else subprocess.DEVNULL,
         start_new_session=True,
     )
-    return proc.pid
+
+
+def _spawn(script: str, run_id: str, sha: str) -> int:
+    return _spawn_process(script, run_id, sha).pid
 
 
 def _wait_for_collector(db: Database, run_id: str, timeout: int = 180) -> None:
@@ -216,26 +313,87 @@ def _wait_for_collector(db: Database, run_id: str, timeout: int = 180) -> None:
 
 
 def cmd_start(_args) -> int:
-    run_id, _cfg, db = _prepare()
+    run_id, _cfg, db, _lock = _prepare()
     sha = _commit_sha()
     collector_pid = _spawn("main.py", run_id, sha)
-    print(f"collector_pid={collector_pid}")
+    print(f"collector_pid={collector_pid}", flush=True)
     _wait_for_collector(db, run_id)
     trader_pid = _spawn("trading_main.py", run_id, sha)
-    print(f"trader_pid={trader_pid}")
-    print(f"run_id={run_id}")
+    print(f"trader_pid={trader_pid}", flush=True)
+    print(f"run_id={run_id}", flush=True)
     return 0
+
+
+def _terminate_children(children: list[subprocess.Popen]) -> None:
+    for child in reversed(children):
+        if child.poll() is None:
+            child.terminate()
+    deadline = time.time() + 15
+    for child in reversed(children):
+        if child.poll() is not None:
+            continue
+        try:
+            child.wait(timeout=max(0.1, deadline - time.time()))
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait(timeout=5)
+
+
+def cmd_run(_args) -> int:
+    """Railway foreground supervisor: keep children attached and observable."""
+    run_id, _cfg, db, supervisor_lock = _prepare(acquire_supervisor_lock=True)
+    sha = _commit_sha()
+    children: list[subprocess.Popen] = []
+
+    def stop_signal(_signum, _frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, stop_signal)
+    signal.signal(signal.SIGINT, stop_signal)
+    try:
+        collector = _spawn_process("main.py", run_id, sha)
+        children.append(collector)
+        print(f"collector_pid={collector.pid}", flush=True)
+        _wait_for_collector(db, run_id)
+
+        trader = _spawn_process("trading_main.py", run_id, sha)
+        children.append(trader)
+        print(f"trader_pid={trader.pid}", flush=True)
+        print(f"run_id={run_id}", flush=True)
+
+        while True:
+            for name, child in (("collector", collector), ("trader", trader)):
+                code = child.poll()
+                if code is not None:
+                    raise RuntimeError(
+                        f"{name} process exited unexpectedly with status {code}"
+                    )
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("Railway supervisor stopping children", flush=True)
+        return 0
+    finally:
+        _terminate_children(children)
+        if supervisor_lock is not None:
+            supervisor_lock.stop()
 
 
 def cmd_status(_args) -> int:
     _load_env_file()
     _reload_config()
-    if not CURRENT_RUN.exists():
+    cfg = BybitConfig()
+    _validate_runtime_config(cfg)
+    db = Database(cfg)
+    current = None
+    if cfg.runtime_mode == "railway":
+        row = _find_resumable_run(db, _commit_sha())
+        if row is not None:
+            current = {"run_id": row.run_id, "commit_sha": row.commit_sha}
+    elif CURRENT_RUN.exists():
+        current = json.loads(CURRENT_RUN.read_text(encoding="utf-8"))
+    if current is None:
         print("No current run")
         return 1
-    current = json.loads(CURRENT_RUN.read_text(encoding="utf-8"))
-    cfg = BybitConfig()
-    db = Database(cfg)
     session = db.get_session()
     try:
         row = session.query(RunMetadata).filter_by(run_id=current["run_id"]).first()
@@ -279,10 +437,16 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("start")
+    sub.add_parser("run")
     sub.add_parser("status")
     sub.add_parser("stop")
     args = parser.parse_args()
-    handlers = {"start": cmd_start, "status": cmd_status, "stop": cmd_stop}
+    handlers = {
+        "start": cmd_start,
+        "run": cmd_run,
+        "status": cmd_status,
+        "stop": cmd_stop,
+    }
     raise SystemExit(handlers[args.command](args))
 
 

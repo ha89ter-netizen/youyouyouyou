@@ -42,6 +42,7 @@ def _symbols_from_env() -> List[str]:
 class BybitConfig:
     run_id: str = os.getenv("RUN_ID", "")
     commit_sha: str = os.getenv("COMMIT_SHA", "")
+    runtime_mode: str = os.getenv("RUNTIME_MODE", "local").strip().lower()
 
     # ==========================================================
     # API

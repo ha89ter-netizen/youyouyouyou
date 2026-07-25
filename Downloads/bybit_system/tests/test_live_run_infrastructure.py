@@ -1,16 +1,22 @@
+import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 from config.settings import BybitConfig
-from runtime_control import RuntimeService
+import live_run
+from risk.risk_manager import RiskManager
+from runtime_control import DatabaseProcessLock, RuntimeService
 import runtime_control
 from storage.db import Database
 from storage.journal import TradeJournal
 from storage.legacy_orphans import LEGACY_ORPHAN_IDS, classify_known_legacy_orphans
 from storage.models import Base, RunMetadata, TradeLog
+from storage.risk_state import RiskStateStore
 from strategy.engine import StrategyEngine
-from timeutils import utcnow
+from timeutils import utc_day_str, utcnow
 
 
 class LiveRunInfrastructureTest(unittest.TestCase):
@@ -142,12 +148,19 @@ class LiveRunInfrastructureTest(unittest.TestCase):
     def test_pid_lock_rejects_duplicate_and_heartbeat_records_run(self):
         old_dir = runtime_control.RUNTIME_DIR
         runtime_control.RUNTIME_DIR = Path(self.tmp.name) / "runtime"
+        runtime_control.RUNTIME_DIR.mkdir()
+        (runtime_control.RUNTIME_DIR / "collector.json").write_text(
+            json.dumps({"pid": os.getpid(), "run_id": "stale-run"}),
+            encoding="utf-8",
+        )
         session = self.db.get_session()
         try:
             session.add(RunMetadata(
                 run_id=self.cfg.run_id,
                 commit_sha=self.cfg.commit_sha,
                 environment_summary={"testnet": True},
+                collector_pid=999999,
+                collector_heartbeat_at=utcnow(),
             ))
             session.commit()
         finally:
@@ -162,13 +175,102 @@ class LiveRunInfrastructureTest(unittest.TestCase):
             try:
                 row = session.query(RunMetadata).filter_by(run_id=self.cfg.run_id).one()
                 self.assertIsNotNone(row.collector_heartbeat_at)
-                self.assertIsNotNone(row.collector_pid)
+                self.assertEqual(row.collector_pid, os.getpid())
             finally:
                 session.close()
         finally:
             second.stop()
             first.stop()
             runtime_control.RUNTIME_DIR = old_dir
+
+    def test_railway_subprocess_inherits_output_and_is_unbuffered(self):
+        process = Mock(pid=1234)
+        with patch.dict(os.environ, {"RUNTIME_MODE": "railway"}, clear=False):
+            with patch.object(live_run.subprocess, "Popen", return_value=process) as popen:
+                result = live_run._spawn_process("main.py", "run-1", "sha-1")
+
+        self.assertIs(result, process)
+        args, kwargs = popen.call_args
+        self.assertEqual(args[0][1], "-u")
+        self.assertIsNone(kwargs["stdout"])
+        self.assertIsNone(kwargs["stderr"])
+        self.assertEqual(kwargs["env"]["PYTHONUNBUFFERED"], "1")
+        self.assertEqual(kwargs["env"]["RUN_ID"], "run-1")
+
+    def test_postgresql_advisory_lock_rejects_duplicate_container(self):
+        connection = Mock()
+        connection.execute.return_value.scalar.return_value = False
+        db = Mock()
+        db.engine.dialect.name = "postgresql"
+        db.engine.connect.return_value = connection
+
+        lock = DatabaseProcessLock(db, "trader")
+        with self.assertRaisesRegex(RuntimeError, "Duplicate trader"):
+            lock.start()
+        connection.close.assert_called_once()
+
+    def test_railway_rejects_missing_or_localhost_database_url(self):
+        missing = BybitConfig(runtime_mode="railway", db_url="")
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "DATABASE_URL is required"):
+                live_run._validate_runtime_config(missing)
+
+        localhost = BybitConfig(
+            runtime_mode="railway",
+            db_url="postgresql://user:pass@localhost:5432/bybit",
+        )
+        with patch.dict(
+            os.environ,
+            {"DATABASE_URL": localhost.db_url},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "localhost"):
+                live_run._validate_runtime_config(localhost)
+
+    def test_restart_recovers_run_identity_and_risk_state_from_database(self):
+        session = self.db.get_session()
+        try:
+            session.add(RunMetadata(
+                run_id="durable-railway-run",
+                commit_sha="railway-sha",
+                environment_summary={"testnet": True, "runtime_mode": "railway"},
+                status="running",
+                collector_pid=111,
+                trader_pid=222,
+                collector_heartbeat_at=utcnow(),
+                trader_heartbeat_at=utcnow(),
+            ))
+            session.commit()
+        finally:
+            session.close()
+
+        durable_run = live_run._find_resumable_run(self.db, "railway-sha")
+        self.assertIsNotNone(durable_run)
+        self.assertEqual(durable_run.run_id, "durable-railway-run")
+
+        store = RiskStateStore(self.db)
+        self.assertTrue(store.save({
+            "day_utc": utc_day_str(),
+            "daily_start_balance": 1000,
+            "daily_pnl_usdt": -12.5,
+            "daily_trade_count": 3,
+            "symbol_trade_counts": {"ETHUSDT": 2},
+            "last_entry_ts_by_symbol": {"ETHUSDT": 100.0},
+            "pending_entries": {"SOLUSDT": 200.0},
+            "blocked_symbols": {"XRPUSDT": "manual review"},
+            "circuit_breaker_causes": {
+                "orphan:test": {"reason": "unknown result", "sticky": True}
+            },
+            "circuit_breaker_tripped": True,
+            "circuit_breaker_reason": "unknown result",
+            "circuit_breaker_sticky": True,
+        }))
+        restored = RiskManager(self.cfg, state_store=RiskStateStore(self.db))
+        self.assertEqual(restored._daily_pnl_usdt, -12.5)
+        self.assertEqual(restored._daily_trade_count, 3)
+        self.assertEqual(restored.pending_entry_symbols(), ["SOLUSDT"])
+        self.assertEqual(restored.blocked_symbols()["XRPUSDT"], "manual review")
+        self.assertIn("orphan:test", restored.breaker_causes())
 
 
 if __name__ == "__main__":

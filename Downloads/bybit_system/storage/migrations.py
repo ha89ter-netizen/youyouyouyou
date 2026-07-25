@@ -3,7 +3,7 @@ from typing import Dict
 
 from sqlalchemy import inspect, text
 
-from storage.models import RiskState, RunMetadata, TradeExpertVote
+from storage.models import Base, RiskState, RunMetadata, TradeExpertVote
 
 logger = logging.getLogger(__name__)
 
@@ -144,6 +144,10 @@ def ensure_analytics_indexes(engine) -> None:
 
 
 def run_safe_migrations(engine) -> None:
+    # Railway PostgreSQL may be empty on the first deployment. create_all is
+    # idempotent and only creates missing tables; column upgrades remain in the
+    # explicit additive migrations below.
+    Base.metadata.create_all(engine)
     ensure_trade_log_analytics_columns(engine)
     ensure_trade_expert_votes_table(engine)
     ensure_risk_state_table(engine)

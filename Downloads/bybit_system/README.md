@@ -85,6 +85,42 @@ PID locks находятся в игнорируемом каталоге `.runt
 принудительно использует Testnet и откажется стартовать при живых позициях,
 активных ордерах, обычных `orphaned`-сделках или уже запущенном процессе.
 
+### Railway Testnet
+
+В Railway задайте корневой каталог сервиса `Downloads/bybit_system`. Команда
+запуска уже зафиксирована в `railway.json`; точное значение:
+
+```bash
+python -u live_run.py run
+```
+
+Обязательные переменные Railway:
+
+```bash
+RUNTIME_MODE=railway
+BYBIT_TESTNET=true
+BYBIT_API_KEY=<отдельный Testnet key>
+BYBIT_API_SECRET=<отдельный Testnet secret>
+DATABASE_URL=${{Postgres.DATABASE_URL}}
+RAILWAY_DEPLOYMENT_DRAINING_SECONDS=30
+```
+
+`DATABASE_URL` обязан указывать на внешний PostgreSQL: Railway-режим отвергает
+отсутствующее значение, SQLite и localhost. `RAILWAY_GIT_COMMIT_SHA`
+предоставляется Railway автоматически; при другом способе сборки задайте
+`COMMIT_SHA` явно. `OPENAI_API_KEY` нужен только если текущая конфигурация
+использует OpenAI-анализ. 30-секундный draining window даёт collector время
+сбросить буферы в PostgreSQL после SIGTERM.
+
+В Railway дочерние collector/trader работают под foreground-supervisor,
+наследуют stdout/stderr и запускаются с unbuffered Python. Файлы `logs/` и
+`.runtime/` считаются временными и не используются как источник истины.
+Активный `run_id`, журнал сделок, комиссии, exchange order IDs, historical
+orphans, heartbeat и RiskManager state восстанавливаются из PostgreSQL.
+PostgreSQL advisory locks предотвращают второй supervisor, collector или
+trader даже в другом контейнере. Старые PID и heartbeat в таблице являются
+только диагностикой и не блокируют новый процесс после рестарта.
+
 Статус `historical_orphan` предназначен только для явно проверенных старых
 Testnet-сделок, результат которых уже вышел за окно хранения биржи. Новые
 `orphaned`-сделки по-прежнему взводят circuit breaker и не переводятся в этот

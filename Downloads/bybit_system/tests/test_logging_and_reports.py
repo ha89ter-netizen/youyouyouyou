@@ -1,4 +1,5 @@
 import logging
+import io
 import os
 import sys
 import tempfile
@@ -7,8 +8,9 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect
 from sqlalchemy.orm import sessionmaker
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -34,12 +36,24 @@ class SessionBackedDb:
 
 
 class LoggingAndReportTest(unittest.TestCase):
+    def setUp(self):
+        self._runtime_mode = os.environ.get("RUNTIME_MODE")
+        self._run_id = os.environ.get("RUN_ID")
+
     def tearDown(self):
         root = logging.getLogger()
         for handler in list(root.handlers):
             if getattr(handler, "_bybit_managed_handler", False):
                 root.removeHandler(handler)
                 handler.close()
+        if self._runtime_mode is None:
+            os.environ.pop("RUNTIME_MODE", None)
+        else:
+            os.environ["RUNTIME_MODE"] = self._runtime_mode
+        if self._run_id is None:
+            os.environ.pop("RUN_ID", None)
+        else:
+            os.environ["RUN_ID"] = self._run_id
 
     def test_logging_creates_file_without_duplicate_handlers_and_masks_secrets(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -62,6 +76,39 @@ class LoggingAndReportTest(unittest.TestCase):
             self.assertIn("visible=ok", content)
             self.assertNotIn("super-secret-value", content)
             self.assertIn("***", content)
+
+    def test_railway_logging_uses_stdout_stderr_without_local_file_or_duplicates(self):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        os.environ["RUNTIME_MODE"] = "railway"
+        os.environ["RUN_ID"] = "testnet-railway-run"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("sys.stdout", stdout), patch("sys.stderr", stderr):
+                log_path = configure_app_logging(
+                    "trading", "trading.log", log_dir=Path(tmpdir)
+                )
+                configure_app_logging(
+                    "trading", "trading.log", log_dir=Path(tmpdir)
+                )
+                logger = logging.getLogger("test.railway")
+                logger.info("market data flowing", extra={"symbol": "ETHUSDT"})
+                logger.error("runtime failure", extra={"symbol": "SOLUSDT"})
+                for handler in logging.getLogger().handlers:
+                    if getattr(handler, "_bybit_managed_handler", False):
+                        handler.flush()
+
+            self.assertIsNone(log_path)
+            self.assertEqual(list(Path(tmpdir).iterdir()), [])
+
+        stdout_text = stdout.getvalue()
+        stderr_text = stderr.getvalue()
+        self.assertEqual(stdout_text.count("market data flowing"), 1)
+        self.assertEqual(stderr_text.count("runtime failure"), 1)
+        self.assertNotIn("runtime failure", stdout_text)
+        self.assertIn("process=trading", stdout_text)
+        self.assertIn("level=INFO", stdout_text)
+        self.assertIn("run_id=testnet-railway-run", stdout_text)
+        self.assertIn("symbol=ETHUSDT", stdout_text)
 
     def test_trade_report_stats_ignore_open_trades_for_win_rate(self):
         rows = [
@@ -184,16 +231,14 @@ class LoggingAndReportTest(unittest.TestCase):
             session.close()
 
     def test_safe_migration_is_idempotent(self):
-        db = SessionBackedDb()
-        run_safe_migrations(db.engine)
-        run_safe_migrations(db.engine)
-
-        session = db.get_session()
-        try:
-            self.assertEqual(session.query(TradeLog).count(), 0)
-            self.assertEqual(session.query(TradeExpertVote).count(), 0)
-        finally:
-            session.close()
+        engine = create_engine("sqlite:///:memory:", future=True)
+        run_safe_migrations(engine)
+        run_safe_migrations(engine)
+        tables = set(inspect(engine).get_table_names())
+        self.assertIn("trade_log", tables)
+        self.assertIn("trade_expert_votes", tables)
+        self.assertIn("run_metadata", tables)
+        self.assertIn("risk_state", tables)
 
     def test_export_trade_dataset_writes_csv_and_jsonl_row(self):
         db = SessionBackedDb()
