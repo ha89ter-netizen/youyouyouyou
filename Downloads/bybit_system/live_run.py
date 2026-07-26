@@ -292,7 +292,11 @@ def _wait_for_collector(db: Database, run_id: str, timeout: int = 180) -> None:
     deadline = time.time() + timeout
     while time.time() < deadline:
         info = _service_info("collector")
-        if info and not _process_alive(info.get("pid")):
+        if (
+            info
+            and info.get("run_id") == run_id
+            and not _process_alive(info.get("pid"))
+        ):
             raise RuntimeError("Collector exited during refresh")
         session = db.get_session()
         try:

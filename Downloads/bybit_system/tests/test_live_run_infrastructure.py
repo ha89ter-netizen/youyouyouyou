@@ -197,6 +197,32 @@ class LiveRunInfrastructureTest(unittest.TestCase):
         self.assertEqual(kwargs["env"]["PYTHONUNBUFFERED"], "1")
         self.assertEqual(kwargs["env"]["RUN_ID"], "run-1")
 
+    def test_collector_wait_ignores_stale_pid_from_previous_run(self):
+        now = 1_800_000_000.0
+        session = Mock()
+        run_query = Mock()
+        run_query.filter_by.return_value.first.return_value = Mock(
+            collector_heartbeat_at=utcnow()
+        )
+        candle_query = Mock()
+        candle_query.scalar.return_value = int(now * 1000)
+        book_query = Mock()
+        book_query.scalar.return_value = int(now * 1000)
+        session.query.side_effect = [run_query, candle_query, book_query]
+        db = Mock()
+        db.get_session.return_value = session
+
+        with patch.object(
+            live_run,
+            "_service_info",
+            return_value={"run_id": "previous-run", "pid": 999999},
+        ), patch.object(live_run, "_process_alive", return_value=False), patch.object(
+            live_run.time, "time", return_value=now
+        ):
+            live_run._wait_for_collector(db, "current-run", timeout=1)
+
+        session.close.assert_called_once()
+
     def test_postgresql_advisory_lock_rejects_duplicate_container(self):
         connection = Mock()
         connection.execute.return_value.scalar.return_value = False
