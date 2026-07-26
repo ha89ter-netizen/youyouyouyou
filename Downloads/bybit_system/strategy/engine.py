@@ -627,12 +627,14 @@ class StrategyEngine:
         candidates = []
         for c in closed_pnl_list:
             avg_entry = c.get("avgEntryPrice")
-            created_time = c.get("createdTime")
-            if avg_entry is None or created_time is None:
+            # In Bybit closed_pnl, createdTime can describe the opening order;
+            # updatedTime is the actual close/update timestamp.
+            closed_time = c.get("updatedTime") or c.get("createdTime")
+            if avg_entry is None or closed_time is None:
                 continue
             try:
                 avg_entry = float(avg_entry)
-                created_time_ms = int(created_time)
+                closed_time_ms = int(closed_time)
             except (TypeError, ValueError):
                 continue
 
@@ -640,12 +642,12 @@ class StrategyEngine:
             if expected_close_side and side and side != expected_close_side:
                 continue  # закрытие позиции другого направления
 
-            if trade["opened_at_ms"] is not None and created_time_ms < trade["opened_at_ms"]:
+            if trade["opened_at_ms"] is not None and closed_time_ms < trade["opened_at_ms"]:
                 continue  # закрытие раньше открытия -- не может относиться к этой сделке
 
             price_diff_pct = abs(avg_entry - entry_price) / entry_price * 100
             if price_diff_pct <= tolerance_pct:
-                candidates.append((price_diff_pct, created_time_ms, c))
+                candidates.append((price_diff_pct, closed_time_ms, c))
 
         if not candidates:
             return None

@@ -113,6 +113,15 @@ class OrphanClassificationTest(unittest.TestCase):
         self.assertEqual(item["record"]["closedPnl"], "-2.0")
         self.assertAlmostEqual(item["fill"]["price"], 100.0)
 
+    def test_updated_time_allows_close_after_journal_entry(self):
+        record = _closed(created=OPENED_MS - 500)
+        record["updatedTime"] = str(OPENED_MS + 60_000)
+        status, _item = self._status(
+            _trade(),
+            _evidence(order=_order(), executions=[_execution()], closed=[record]),
+        )
+        self.assertEqual(status, CONFIRMED_CLOSED)
+
     def test_never_filled_when_order_rejected_without_fill(self):
         status, item = self._status(
             _trade(),

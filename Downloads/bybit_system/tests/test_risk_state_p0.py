@@ -989,6 +989,16 @@ class ClosedPnlMatchingTest(unittest.TestCase):
                  "avgExitPrice": "101", "closedPnl": "1"}]
         self.assertIsNone(StrategyEngine._find_matching_closed_pnl(self._trade(), rows))
 
+    def test_updated_time_is_used_when_created_time_precedes_journal_entry(self):
+        rows = [{
+            "avgEntryPrice": "100.0", "side": "Sell",
+            "createdTime": "999500", "updatedTime": "2000000",
+            "avgExitPrice": "101", "closedPnl": "1",
+        }]
+        self.assertIsNotNone(
+            StrategyEngine._find_matching_closed_pnl(self._trade(), rows)
+        )
+
     def test_price_outside_tolerance_is_rejected(self):
         rows = [{"avgEntryPrice": "105.0", "side": "Sell", "createdTime": "2000000",
                  "avgExitPrice": "101", "closedPnl": "1"}]

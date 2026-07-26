@@ -82,12 +82,14 @@ def _record_matches_trade(trade: dict, record: dict) -> bool:
 
     try:
         avg_entry = float(record.get("avgEntryPrice"))
-        created_ms = int(record.get("createdTime"))
+        # Bybit uses createdTime for the opening-side record in closed_pnl;
+        # updatedTime is when the position was actually closed.
+        closed_ms = int(record.get("updatedTime") or record.get("createdTime"))
     except (TypeError, ValueError):
         return False
 
     opened_ms = trade.get("opened_at_ms")
-    if opened_ms is not None and created_ms < opened_ms:
+    if opened_ms is not None and closed_ms < opened_ms:
         return False
 
     entry_price = trade.get("entry_price") or 0
