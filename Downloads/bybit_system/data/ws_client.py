@@ -9,6 +9,7 @@ pybit сам управляет reconnect и heartbeat, но мы добавля
 """
 
 import logging
+import time
 from typing import Callable, Optional
 
 from pybit.unified_trading import WebSocket
@@ -18,11 +19,13 @@ from config.settings import BybitConfig
 logger = logging.getLogger(__name__)
 
 
-def _safe_callback(name: str, fn: Callable):
+def _safe_callback(name: str, fn: Callable, on_activity: Optional[Callable] = None):
     """Оборачивает пользовательский колбэк, чтобы исключения не убивали WS-поток."""
 
     def wrapper(message):
         try:
+            if on_activity is not None:
+                on_activity()
             fn(message)
         except Exception:
             logger.exception("Ошибка в колбэке '%s' на сообщении: %s", name, message)
@@ -35,27 +38,45 @@ class BybitPublicStream:
 
     def __init__(self, cfg: BybitConfig):
         self.cfg = cfg
+        self._last_message_monotonic = time.monotonic()
         self.ws = WebSocket(
             testnet=cfg.testnet,
             channel_type=cfg.ws_channel_type,
         )
         logger.info("Публичный WS-поток инициализирован (testnet=%s)", cfg.testnet)
 
+    def _mark_activity(self):
+        self._last_message_monotonic = time.monotonic()
+
+    def seconds_since_message(self) -> float:
+        """Возраст последнего полезного сообщения, включая время ожидания первого."""
+        return max(0.0, time.monotonic() - self._last_message_monotonic)
+
+    def close(self):
+        """Закрывает текущий pybit WebSocket перед созданием новой сессии."""
+        try:
+            self.ws.exit()
+        except Exception:
+            logger.warning("Ошибка при закрытии публичного WebSocket", exc_info=True)
+
     def subscribe_orderbook(self, symbol: str, depth: int, on_message: Callable):
         """depth для linear: 1, 50, 200, 500"""
         self.ws.orderbook_stream(
-            depth=depth, symbol=symbol, callback=_safe_callback("orderbook", on_message)
+            depth=depth,
+            symbol=symbol,
+            callback=_safe_callback("orderbook", on_message, self._mark_activity),
         )
 
     def subscribe_trades(self, symbol: str, on_message: Callable):
         self.ws.trade_stream(
-            symbol=symbol, callback=_safe_callback("trades", on_message)
+            symbol=symbol,
+            callback=_safe_callback("trades", on_message, self._mark_activity),
         )
 
     def subscribe_kline(self, symbol: str, interval: str, on_message: Callable):
         self.ws.kline_stream(
             interval=interval, symbol=symbol,
-            callback=_safe_callback("kline", on_message),
+            callback=_safe_callback("kline", on_message, self._mark_activity),
         )
 
     def subscribe_liquidations(self, symbol: str, on_message: Callable):
@@ -64,13 +85,15 @@ class BybitPublicStream:
         Метод всё ещё принимает конкретный symbol, несмотря на название 'all'.
         """
         self.ws.all_liquidation_stream(
-            symbol=symbol, callback=_safe_callback("liquidation", on_message)
+            symbol=symbol,
+            callback=_safe_callback("liquidation", on_message, self._mark_activity),
         )
 
     def subscribe_ticker(self, symbol: str, on_message: Callable):
         """Тикер включает funding rate и open interest в реальном времени."""
         self.ws.ticker_stream(
-            symbol=symbol, callback=_safe_callback("ticker", on_message)
+            symbol=symbol,
+            callback=_safe_callback("ticker", on_message, self._mark_activity),
         )
 
 

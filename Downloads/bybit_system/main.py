@@ -26,6 +26,28 @@ configure_app_logging("main", "main.log")
 logger = logging.getLogger("main")
 
 
+def _start_public_stream(cfg, store):
+    stream = BybitPublicStream(cfg)
+    try:
+        for symbol in cfg.symbols:
+            stream.subscribe_orderbook(symbol, depth=50, on_message=store.on_orderbook_ws)
+            stream.subscribe_trades(symbol, on_message=store.on_trade_ws)
+            stream.subscribe_kline(
+                symbol,
+                interval=cfg.primary_interval,
+                on_message=store.on_kline_ws,
+            )
+            stream.subscribe_liquidations(
+                symbol,
+                on_message=store.on_liquidation_ws,
+            )
+            stream.subscribe_ticker(symbol, on_message=store.on_ticker_ws)
+    except Exception:
+        stream.close()
+        raise
+    return stream
+
+
 def main():
     cfg = BybitConfig()
     if os.getenv("BYBIT_TESTNET", "").lower() != "true" or not cfg.testnet:
@@ -70,15 +92,20 @@ def main():
             )
 
     # --- 2. WebSocket: живой поток пишем через store, буферизация внутри ---
-    stream = BybitPublicStream(cfg)
-    for symbol in cfg.symbols:
-        stream.subscribe_orderbook(symbol, depth=50, on_message=store.on_orderbook_ws)
-        stream.subscribe_trades(symbol, on_message=store.on_trade_ws)
-        stream.subscribe_kline(symbol, interval=cfg.primary_interval, on_message=store.on_kline_ws)
-        stream.subscribe_liquidations(symbol, on_message=store.on_liquidation_ws)
-        stream.subscribe_ticker(symbol, on_message=store.on_ticker_ws)
+    stream = _start_public_stream(cfg, store)
+    ws_stale_timeout = max(
+        30.0,
+        float(os.getenv("WS_STALE_TIMEOUT_SECONDS", "120")),
+    )
+    ws_reconnect_delay = max(
+        1.0,
+        float(os.getenv("WS_RECONNECT_DELAY_SECONDS", "5")),
+    )
 
-    logger.info("Поток запущен, данные пишутся в БД. Ctrl+C для остановки.")
+    logger.info(
+        "Поток запущен, данные пишутся в БД; WS watchdog=%.0fs. Ctrl+C для остановки.",
+        ws_stale_timeout,
+    )
     def stop_signal(_signum, _frame):
         raise KeyboardInterrupt
 
@@ -87,9 +114,32 @@ def main():
     try:
         while True:
             time.sleep(1)
+            age = stream.seconds_since_message()
+            if age <= ws_stale_timeout:
+                continue
+
+            logger.error(
+                "WS watchdog: сообщений нет %.1fs (лимит %.1fs); "
+                "пересоздаю Testnet WebSocket и подписки",
+                age,
+                ws_stale_timeout,
+            )
+            stream.close()
+            while True:
+                try:
+                    stream = _start_public_stream(cfg, store)
+                    logger.info("WS watchdog: WebSocket и подписки восстановлены")
+                    break
+                except Exception:
+                    logger.exception(
+                        "WS watchdog: переподключение не удалось; повтор через %.1fs",
+                        ws_reconnect_delay,
+                    )
+                    time.sleep(ws_reconnect_delay)
     except KeyboardInterrupt:
         logger.info("Останавливаюсь, сбрасываю буферы в БД...")
     finally:
+        stream.close()
         store.stop()
         runtime.stop()
         logger.info("Готово.")
