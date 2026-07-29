@@ -279,6 +279,19 @@ class TradeJournal:
             "action": r.action,
             "entry_price": float(r.entry_price),
             "size_usdt": float(r.size_usdt),
+            "stop_loss_price": float(r.stop_loss_price) if r.stop_loss_price is not None else None,
+            "take_profit_price": (
+                float(r.take_profit_price) if r.take_profit_price is not None else None
+            ),
+            "range_tightened_at": ensure_aware_utc(r.range_tightened_at),
+            "tightened_stop_loss_price": (
+                float(r.tightened_stop_loss_price)
+                if r.tightened_stop_loss_price is not None else None
+            ),
+            "tightened_take_profit_price": (
+                float(r.tightened_take_profit_price)
+                if r.tightened_take_profit_price is not None else None
+            ),
             "source": r.source,
             "status": r.status,
             "opened_at": ensure_aware_utc(r.opened_at),
@@ -287,6 +300,47 @@ class TradeJournal:
             # и сломали сверку с closed PnL по времени.
             "opened_at_ms": to_epoch_ms(r.opened_at),
         }
+
+    def mark_range_tightened(
+        self,
+        order_link_id: str,
+        stop_loss_price: float,
+        take_profit_price: float,
+    ) -> bool:
+        """Идемпотентно фиксирует однократное сужение защиты открытой сделки."""
+        session = self.db.get_session()
+        try:
+            row = session.query(TradeLog).filter(
+                TradeLog.order_link_id == order_link_id,
+                TradeLog.status == "open",
+            ).first()
+            if row is None:
+                logger.warning(
+                    "Журнал: открытая сделка %s не найдена для фиксации сужения",
+                    order_link_id,
+                )
+                return False
+            if row.range_tightened_at is not None:
+                return False
+            row.range_tightened_at = utcnow()
+            row.tightened_stop_loss_price = safe_float(
+                stop_loss_price, "tightened_stop_loss_price"
+            )
+            row.tightened_take_profit_price = safe_float(
+                take_profit_price, "tightened_take_profit_price"
+            )
+            session.commit()
+            logger.info(
+                "Журнал: сужение защиты %s сохранено (SL=%s TP=%s)",
+                order_link_id, stop_loss_price, take_profit_price,
+            )
+            return True
+        except Exception:
+            logger.exception("Не удалось сохранить сужение защиты для %s", order_link_id)
+            session.rollback()
+            return False
+        finally:
+            session.close()
 
     def record_exit_trigger(self, order_link_id: str, trigger: dict) -> bool:
         """

@@ -260,6 +260,21 @@ class BybitConfig:
         os.getenv("TRAILING_DISTANCE_PCT", "0.8")
     )
 
+    # Однократное сужение оставшегося диапазона защиты для затянувшейся
+    # позиции. Значения зафиксированы явно по подтверждённому оператором
+    # правилу; это не адаптивная настройка стратегии.
+    time_range_tightening_enabled: bool = (
+        os.getenv("TIME_RANGE_TIGHTENING_ENABLED", "true").lower() == "true"
+    )
+
+    time_range_tightening_after_seconds: int = int(
+        os.getenv("TIME_RANGE_TIGHTENING_AFTER_SECONDS", "3600")
+    )
+
+    time_range_tightening_factor: float = float(
+        os.getenv("TIME_RANGE_TIGHTENING_FACTOR", "0.5")
+    )
+
     # ==========================================================
     # ЛОГИРОВАНИЕ
     # ==========================================================

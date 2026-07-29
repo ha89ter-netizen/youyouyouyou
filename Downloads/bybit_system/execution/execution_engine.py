@@ -393,6 +393,53 @@ class ExecutionEngine:
         )
         return resp
 
+    def set_position_protection(
+        self,
+        symbol: str,
+        side: str,
+        mark_price: float,
+        stop_loss_price: float,
+        take_profit_price: float,
+    ) -> Dict[str, Any]:
+        """Атомарно обновляет static SL/TP, сохраняя цены на безопасных сторонах mark."""
+        blocked = self._safe_mode_block("set_position_protection", symbol)
+        if blocked is not None:
+            return blocked
+
+        tick_size = self._get_lot_size(symbol)["tickSize"]
+        is_long = side == "Buy"
+        # Всегда округляем к mark: стоп не расширяется, тейк не отдаляется.
+        stop_loss = self._snap_to_tick(
+            stop_loss_price, tick_size, round_down=not is_long
+        )
+        take_profit = self._snap_to_tick(
+            take_profit_price, tick_size, round_down=is_long
+        )
+        valid = (
+            stop_loss < mark_price < take_profit
+            if is_long else take_profit < mark_price < stop_loss
+        )
+        if side not in ("Buy", "Sell") or not valid:
+            raise ValueError(
+                f"{symbol}: invalid tightened protection side={side} "
+                f"SL={stop_loss} mark={mark_price} TP={take_profit}"
+            )
+
+        resp = self.session.set_trading_stop(
+            category=self.cfg.category,
+            symbol=symbol,
+            stopLoss=str(stop_loss),
+            takeProfit=str(take_profit),
+            positionIdx=0,
+        )
+        resp["local_stop_loss_price"] = stop_loss
+        resp["local_take_profit_price"] = take_profit
+        logger.info(
+            "%s: защита обновлена SL=%s TP=%s retCode=%s retMsg=%s",
+            symbol, stop_loss, take_profit, resp.get("retCode"), resp.get("retMsg"),
+        )
+        return resp
+
     def get_closed_pnl(self, symbol: str, limit: int = 20) -> list:
         """Последние закрытые сделки с реализованным PnL — источник для журнала и Risk Manager."""
         resp = self.session.get_closed_pnl(category=self.cfg.category, symbol=symbol, limit=limit)

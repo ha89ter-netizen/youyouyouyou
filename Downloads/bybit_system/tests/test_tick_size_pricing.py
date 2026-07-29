@@ -223,5 +223,39 @@ class TrailingStopTickTest(unittest.TestCase):
         self.assertEqual(distance, 0.10)
 
 
+class PositionProtectionTickTest(unittest.TestCase):
+    class FakeSession:
+        def __init__(self):
+            self.last = None
+
+        def set_trading_stop(self, **kwargs):
+            self.last = kwargs
+            return {"retCode": 0, "retMsg": "OK"}
+
+    def test_long_and_short_are_rounded_toward_mark(self):
+        execution = _execution()
+        execution.session = self.FakeSession()
+
+        long_resp = execution.set_position_protection(
+            "BNBUSDT", "Buy", 573.3, 570.04, 578.06
+        )
+        self.assertEqual(long_resp["local_stop_loss_price"], 570.1)
+        self.assertEqual(long_resp["local_take_profit_price"], 578.0)
+
+        short_resp = execution.set_position_protection(
+            "BNBUSDT", "Sell", 573.3, 578.06, 570.04
+        )
+        self.assertEqual(short_resp["local_stop_loss_price"], 578.0)
+        self.assertEqual(short_resp["local_take_profit_price"], 570.1)
+
+    def test_rejects_prices_on_wrong_side_of_mark(self):
+        execution = _execution()
+        execution.session = self.FakeSession()
+        with self.assertRaises(ValueError):
+            execution.set_position_protection(
+                "BNBUSDT", "Buy", 573.3, 574.0, 578.0
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

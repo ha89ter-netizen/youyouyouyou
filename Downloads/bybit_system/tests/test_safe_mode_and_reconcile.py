@@ -111,6 +111,12 @@ class SafeModeGuardTest(unittest.TestCase):
         resp = self.execution.set_trailing_stop("ETHUSDT", 100.0, 0.8)
         self.assertEqual(resp["retCode"], SAFE_MODE_RET_CODE)
 
+    def test_set_position_protection_blocked(self):
+        resp = self.execution.set_position_protection(
+            "ETHUSDT", "Buy", 100.0, 99.0, 102.0
+        )
+        self.assertEqual(resp["retCode"], SAFE_MODE_RET_CODE)
+
     def test_set_leverage_blocked(self):
         self.assertIsNone(self.execution.set_leverage("ETHUSDT", 3))  # и не взорвался
 

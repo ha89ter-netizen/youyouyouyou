@@ -56,6 +56,11 @@ class TradeLog(Base):
     take_profit_pct = Column(Numeric, nullable=True)
     stop_loss_price = Column(Numeric, nullable=True)
     take_profit_price = Column(Numeric, nullable=True)
+    # Факт однократного time-based сужения хранится в PostgreSQL, чтобы
+    # рестарт trader не применил правило повторно к той же позиции.
+    range_tightened_at = Column(DateTime(timezone=True), nullable=True)
+    tightened_stop_loss_price = Column(Numeric, nullable=True)
+    tightened_take_profit_price = Column(Numeric, nullable=True)
     entry_fee_usdt = Column(Numeric, nullable=True)
 
     exit_price = Column(Numeric, nullable=True)

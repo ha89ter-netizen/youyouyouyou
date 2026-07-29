@@ -41,6 +41,7 @@ class FakeExecution:
         self.opened = []
         self.closed_pnl = {}
         self.trailing = []
+        self.protection = []
         self.closed_orders = []
         # Чем confirm_order отвечает по умолчанию; тесты переопределяют.
         self.confirmation = OrderConfirmation(status=FillStatus.FILLED, filled_qty=1.0)
@@ -76,6 +77,14 @@ class FakeExecution:
     def set_trailing_stop(self, symbol, mark_price, distance_pct):
         self.trailing.append((symbol, mark_price, distance_pct))
         return {"retCode": 0}
+
+    def set_position_protection(self, symbol, side, mark, stop_loss, take_profit):
+        self.protection.append((symbol, side, mark, stop_loss, take_profit))
+        return {
+            "retCode": 0,
+            "local_stop_loss_price": stop_loss,
+            "local_take_profit_price": take_profit,
+        }
 
     def get_closed_pnl(self, symbol, limit=50):
         return self.closed_pnl.get(symbol, [])
@@ -124,6 +133,17 @@ class FakeJournal:
     def record_exit_trigger(self, order_link_id, trigger):
         self.exit_triggers[order_link_id] = trigger
         return True
+
+    def mark_range_tightened(self, order_link_id, stop_loss_price, take_profit_price):
+        for trade in self.open:
+            if trade["order_link_id"] == order_link_id:
+                if trade.get("range_tightened_at") is not None:
+                    return False
+                trade["range_tightened_at"] = utcnow()
+                trade["tightened_stop_loss_price"] = stop_loss_price
+                trade["tightened_take_profit_price"] = take_profit_price
+                return True
+        return False
 
     def log_exit(self, order_link_id, exit_price, pnl_usdt, exit_reason="manual/unknown",
                  closed_at=None, **kwargs):

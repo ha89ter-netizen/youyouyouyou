@@ -218,6 +218,7 @@ class StrategyEngine:
 
         self.risk_manager.ensure_daily_reset(balance)
         self._resolve_pending_entries(positions)
+        self._manage_time_range_tightening(positions)
         self._manage_trailing_stops(positions)
         self._sync_closed_trades(positions)
 
@@ -315,6 +316,146 @@ class StrategyEngine:
                     )
             except Exception:
                 logger.exception("Ошибка управления trailing stop для позиции %s", p.get("symbol"))
+
+    @staticmethod
+    def _protection_is_tighter_than_original(
+        side: str,
+        current_sl: float,
+        current_tp: float,
+        original_sl: Optional[float],
+        original_tp: Optional[float],
+    ) -> bool:
+        if not original_sl or not original_tp:
+            return False
+        if side == "Buy":
+            return current_sl > original_sl and current_tp < original_tp
+        if side == "Sell":
+            return current_sl < original_sl and current_tp > original_tp
+        return False
+
+    def _manage_time_range_tightening(self, positions: list):
+        """
+        После заданного времени один раз сокращает оставшиеся расстояния от
+        текущей mark price до static SL и TP. Факт хранится в trade_log, поэтому
+        рестарт не применяет правило повторно.
+        """
+        if not self.cfg.time_range_tightening_enabled:
+            return
+        factor = self.cfg.time_range_tightening_factor
+        if not 0 < factor < 1:
+            logger.error("TIME_RANGE_TIGHTENING_FACTOR=%s вне диапазона (0, 1)", factor)
+            return
+
+        open_by_symbol = {t["symbol"]: t for t in self.journal.get_open_trades()}
+        now = utcnow()
+        for p in positions:
+            symbol = p.get("symbol", "")
+            try:
+                if float(p.get("size", 0) or 0) <= 0:
+                    continue
+                trade = open_by_symbol.get(symbol)
+                if not trade or trade.get("range_tightened_at") is not None:
+                    continue
+                opened_at = trade.get("opened_at")
+                if opened_at is None:
+                    continue
+                age_seconds = (now - opened_at).total_seconds()
+                if age_seconds < self.cfg.time_range_tightening_after_seconds:
+                    continue
+
+                side = p.get("side")
+                mark_price = float(p.get("markPrice", 0) or 0)
+                current_sl = float(p.get("stopLoss", 0) or 0)
+                current_tp = float(p.get("takeProfit", 0) or 0)
+                if side not in ("Buy", "Sell") or min(mark_price, current_sl, current_tp) <= 0:
+                    logger.warning(
+                        "%s: time-based сужение пропущено — неполные данные защиты "
+                        "side=%s mark=%s SL=%s TP=%s",
+                        symbol, side, mark_price, current_sl, current_tp,
+                    )
+                    continue
+
+                # Консервативное восстановление после редкого сбоя между
+                # успешным ответом биржи и commit в БД: уже более узкую пару
+                # не сужаем второй раз, а только восстанавливаем durable-флаг.
+                if self._protection_is_tighter_than_original(
+                    side,
+                    current_sl,
+                    current_tp,
+                    trade.get("stop_loss_price"),
+                    trade.get("take_profit_price"),
+                ):
+                    self.journal.mark_range_tightened(
+                        trade["order_link_id"], current_sl, current_tp
+                    )
+                    logger.warning(
+                        "%s: обнаружена уже суженная защита; durable-флаг восстановлен "
+                        "без повторного изменения ордеров",
+                        symbol,
+                    )
+                    continue
+
+                valid_current = (
+                    current_sl < mark_price < current_tp
+                    if side == "Buy" else current_tp < mark_price < current_sl
+                )
+                if not valid_current:
+                    logger.warning(
+                        "%s: time-based сужение пропущено — текущая защита не окружает "
+                        "mark (side=%s SL=%s mark=%s TP=%s)",
+                        symbol, side, current_sl, mark_price, current_tp,
+                    )
+                    continue
+
+                new_sl = mark_price + (current_sl - mark_price) * factor
+                new_tp = mark_price + (current_tp - mark_price) * factor
+                if not self.cfg.trading_enabled:
+                    logger.info(
+                        "%s: SAFE MODE: time-based сужение НЕ применено, age=%.0fs",
+                        symbol, age_seconds,
+                    )
+                    continue
+                resp = self.execution.set_position_protection(
+                    symbol, side, mark_price, new_sl, new_tp
+                )
+                if resp.get("retCode") != 0:
+                    logger.error(
+                        "%s: биржа отклонила time-based сужение retCode=%s retMsg=%s",
+                        symbol, resp.get("retCode"), resp.get("retMsg"),
+                    )
+                    continue
+                applied_sl = float(resp["local_stop_loss_price"])
+                applied_tp = float(resp["local_take_profit_price"])
+                # Защита от будущих изменений округления/API: ни при каких
+                # обстоятельствах не фиксируем расширившийся SL или TP.
+                is_tighter = (
+                    applied_sl > current_sl and applied_tp < current_tp
+                    if side == "Buy"
+                    else applied_sl < current_sl and applied_tp > current_tp
+                )
+                if not is_tighter:
+                    logger.critical(
+                        "%s: ответ сужения нарушил инвариант oldSL=%s newSL=%s "
+                        "oldTP=%s newTP=%s",
+                        symbol, current_sl, applied_sl, current_tp, applied_tp,
+                    )
+                    continue
+                if not self.journal.mark_range_tightened(
+                    trade["order_link_id"], applied_sl, applied_tp
+                ):
+                    logger.error(
+                        "%s: защита сужена на бирже, но durable-флаг не записан; "
+                        "следующий цикл восстановит его по exchange state",
+                        symbol,
+                    )
+                logger.info(
+                    "%s: time-based диапазон сужен один раз после %.1f мин: "
+                    "SL %s -> %s, TP %s -> %s, factor=%s",
+                    symbol, age_seconds / 60, current_sl, applied_sl,
+                    current_tp, applied_tp, factor,
+                )
+            except Exception:
+                logger.exception("Ошибка time-based сужения защиты для %s", symbol)
 
     def _sync_closed_trades(self, positions: Optional[list] = None):
         """
