@@ -22,6 +22,7 @@ from config.settings import BybitConfig
 from logging_config import configure_app_logging
 from storage.migrations import run_safe_migrations
 from storage.db import Database
+from storage.telemetry import TelemetryStore
 from strategy.engine import StrategyEngine
 from runtime_control import RuntimeService
 
@@ -52,7 +53,13 @@ def main():
         logger.error("БД недоступна. Запустите docker compose up -d и python -m storage.init_db")
         return
     run_safe_migrations(db.engine)
-    runtime = RuntimeService(db, cfg.run_id, "trader")
+    telemetry = TelemetryStore(db, cfg)
+    runtime = RuntimeService(
+        db, cfg.run_id, "trader",
+        health_callback=lambda event, severity, status, error: telemetry.record_health(
+            "runtime_control", event, severity, status, error=error
+        ),
+    )
     runtime.start()
 
     engine = StrategyEngine(cfg, db)

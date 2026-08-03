@@ -15,6 +15,7 @@ Strategy Engine: главный оркестратор торгового цик
 """
 
 import logging
+import hashlib
 import math
 import time
 from dataclasses import dataclass
@@ -27,6 +28,7 @@ from storage.db import Database
 from storage.models import Candle, FundingRate, OpenInterest, Liquidation, Trade, OrderbookSnapshot
 from storage.journal import TradeJournal
 from storage.risk_state import RiskStateStore
+from storage.telemetry import TelemetryStore
 from strategy.signal import Signal, Action
 from timeutils import from_epoch_ms, utc_today, utcnow
 from strategy.experts import ExpertSignalCollector
@@ -38,8 +40,23 @@ from portfolio_risk import PortfolioRiskEngine
 from ai_market_analyst import AIMarketAnalyst
 from risk.risk_manager import RiskManager, orphan_cause
 from execution.execution_engine import ExecutionEngine, FillStatus, OrderConfirmation
+from execution.reconciliation import (
+    MATCHED as RECONCILIATION_MATCHED,
+    plan_closed_pnl_reconciliation,
+)
 
 logger = logging.getLogger(__name__)
+
+
+class _NullTelemetry:
+    """Compatibility for isolated unit helpers that construct an engine via __new__."""
+    def account_snapshot_due(self): return False
+    def position_snapshot_due(self): return False
+    def __getattr__(self, _name):
+        return lambda *args, **kwargs: False
+
+
+_NULL_TELEMETRY = _NullTelemetry()
 
 
 def _unknown_confirmation(detail: str) -> OrderConfirmation:
@@ -119,9 +136,18 @@ class EntryCandidate:
     rank_score: float
     entry_snapshot: Optional[dict] = None
     expert_vote_rows: Optional[list] = None
+    evaluation_id: Optional[str] = None
 
 
 class StrategyEngine:
+    @property
+    def telemetry(self):
+        return getattr(self, "_telemetry", _NULL_TELEMETRY)
+
+    @telemetry.setter
+    def telemetry(self, value):
+        self._telemetry = value
+
     def __init__(self, cfg: BybitConfig, db: Database):
         self.cfg = cfg
         self.db = db
@@ -143,11 +169,16 @@ class StrategyEngine:
         self.risk_manager = RiskManager(cfg, state_store=RiskStateStore(db))
         self.execution = ExecutionEngine(cfg)
         self.journal = TradeJournal(db)
+        self.telemetry = TelemetryStore(db, cfg)
         self._trailing_activated: set = set()  # order_link_id, для которых уже включили trailing
         self._last_entry_ts: Optional[float] = None
         # order_link_id -> сколько циклов подряд не можем найти закрытие
         self._orphan_attempts: dict[str, int] = {}
         self._reconcile_daily_pnl_with_journal()
+        self.telemetry.record_health(
+            "strategy_engine", "restart_recovery", "info", "completed",
+            details={"risk_manager_restored": True},
+        )
 
     def _reconcile_daily_pnl_with_journal(self):
         """
@@ -205,27 +236,97 @@ class StrategyEngine:
     def run_forever(self):
         logger.info("Strategy Engine запущен, интервал решений: %d сек", self.cfg.decision_interval_sec)
         while True:
+            cycle_started = time.monotonic()
             try:
                 self.run_once()
             except Exception:
                 logger.exception("Ошибка в торговом цикле, продолжаю после паузы")
+            cycle_elapsed = time.monotonic() - cycle_started
+            if cycle_elapsed > self.cfg.decision_interval_sec:
+                self.telemetry.record_health(
+                    "strategy_engine", "missed_cycle", "warning", "delayed",
+                    details={"cycle_seconds": cycle_elapsed,
+                             "configured_interval_seconds": self.cfg.decision_interval_sec},
+                )
             time.sleep(self.cfg.decision_interval_sec)
 
     def run_once(self):
-        balance = self.execution.get_account_balance_usdt()
-        positions = self.execution.get_open_positions()
-        logger.info("Баланс: %.2f USDT, открытых позиций: %d", balance, len(positions))
-
-        self.risk_manager.ensure_daily_reset(balance)
+        # Position state is fetched and managed independently from account
+        # balance. A wallet endpoint failure must never suppress protection,
+        # reconciliation, or Exit Manager work for existing exposure.
+        try:
+            positions = self.execution.get_open_positions()
+        except Exception as exc:
+            self.telemetry.record_health(
+                "strategy_engine", "position_fetch_failure", "critical", "failed", error=exc,
+            )
+            raise
         self._resolve_pending_entries(positions)
         self._manage_time_range_tightening(positions)
         self._manage_trailing_stops(positions)
+        reconciliation_started = time.monotonic()
         self._sync_closed_trades(positions)
+        reconciliation_seconds = time.monotonic() - reconciliation_started
+        if reconciliation_seconds > self.cfg.decision_interval_sec:
+            self.telemetry.record_health(
+                "reconciliation", "delayed_reconciliation", "warning", "delayed",
+                details={"duration_seconds": reconciliation_seconds},
+            )
+
+        if self.telemetry.position_snapshot_due():
+            protection = {}
+            for position in positions:
+                symbol = position.get("symbol")
+                if not symbol or float(position.get("size") or 0) <= 0:
+                    continue
+                try:
+                    protection[symbol] = self.execution.get_active_protective_orders(symbol)
+                except Exception as exc:
+                    self.telemetry.record_health(
+                        "position_telemetry", "protective_order_fetch_failure", "error", "failed",
+                        symbol=symbol, error=exc,
+                    )
+            self.telemetry.persist_position_snapshots(positions, protective_orders=protection)
+
+        balance = None
+        try:
+            account_reader = getattr(self.execution, "get_account_state", None)
+            account = (
+                account_reader()
+                if account_reader else {
+                    "wallet_balance": self.execution.get_account_balance_usdt(),
+                    "source": "legacy execution adapter", "fetch_status": "ok",
+                }
+            )
+            source_timestamp = account.get("source_timestamp")
+            if source_timestamp is not None:
+                drift = abs((utcnow() - source_timestamp).total_seconds())
+                if drift > 5:
+                    self.telemetry.record_health(
+                        "exchange_clock", "exchange_clock_drift", "warning", "degraded",
+                        data_timestamp=source_timestamp, data_age_seconds=drift,
+                    )
+            balance = float(account.get("wallet_balance") or 0)
+            self.risk_manager.ensure_daily_reset(balance)
+            if self.telemetry.account_snapshot_due():
+                self.telemetry.persist_account_snapshot(account, positions)
+            logger.info("Баланс: %.2f USDT, открытых позиций: %d", balance, len(positions))
+        except Exception as exc:
+            self.telemetry.persist_account_failure(exc, positions)
+            self.telemetry.record_health(
+                "strategy_engine", "account_fetch_failure", "error", "degraded", error=exc,
+                details={"position_management_continued": True, "new_entries_allowed": False},
+            )
+            logger.exception(
+                "Баланс недоступен: управление открытыми позициями продолжено, новые входы запрещены"
+            )
 
         candidates = []
         for symbol in self.cfg.symbols:
+            if balance is None and self._find_open_position(symbol, positions) is None:
+                continue
             try:
-                result = self._process_symbol(symbol, balance, positions, execute=False)
+                result = self._process_symbol(symbol, balance or 0.0, positions, execute=False)
                 if isinstance(result, EntryCandidate):
                     candidates.append(result)
                 elif result:
@@ -234,7 +335,8 @@ class StrategyEngine:
             except Exception:
                 logger.exception("Ошибка обработки символа %s", symbol)
 
-        self._execute_ranked_candidates(candidates, balance, positions)
+        if balance is not None:
+            self._execute_ranked_candidates(candidates, balance, positions)
 
     def _resolve_pending_entries(self, positions: list):
         """
@@ -284,12 +386,23 @@ class StrategyEngine:
         """
         if not self.cfg.trailing_stop_enabled:
             return
+        open_by_symbol = (
+            {t["symbol"]: t for t in self.journal.get_open_trades()}
+            if self.cfg.trading_enabled else {}
+        )
         for p in positions:
             try:
                 size = float(p.get("size", 0))
                 if size <= 0:
                     continue
                 symbol = p["symbol"]
+                trade = open_by_symbol.get(symbol)
+                if trade and self._is_inherited_trade(trade):
+                    logger.info(
+                        "%s: trailing stop не изменён — позиция принадлежит RUN_ID=%s",
+                        symbol, trade.get("run_id"),
+                    )
+                    continue
                 entry_price = float(p["avgPrice"])
                 mark_price = float(p["markPrice"])
                 side = p["side"]  # "Buy" (long) | "Sell" (short)
@@ -309,7 +422,16 @@ class StrategyEngine:
                             symbol, pnl_pct, self.cfg.trailing_activation_pct,
                         )
                         continue
-                    self.execution.set_trailing_stop(symbol, mark_price, self.cfg.trailing_distance_pct)
+                    response = self.execution.set_trailing_stop(
+                        symbol, mark_price, self.cfg.trailing_distance_pct
+                    )
+                    trade = trade or {"symbol": symbol}
+                    self.telemetry.record_protection_event(
+                        trade, "trailing_stop_activated", p.get("trailingStop"),
+                        {"distance_pct": self.cfg.trailing_distance_pct},
+                        reason="configured trailing activation threshold reached",
+                        source_module="strategy.engine", success=True, raw_status=response,
+                    )
                     logger.info(
                         "%s: активирован trailing stop, прибыль %.2f%% >= порога %.2f%%",
                         symbol, pnl_pct, self.cfg.trailing_activation_pct,
@@ -355,6 +477,12 @@ class StrategyEngine:
                     continue
                 trade = open_by_symbol.get(symbol)
                 if not trade or trade.get("range_tightened_at") is not None:
+                    continue
+                if self._is_inherited_trade(trade):
+                    logger.info(
+                        "%s: time-based сужение не применено — позиция принадлежит RUN_ID=%s",
+                        symbol, trade.get("run_id"),
+                    )
                     continue
                 opened_at = trade.get("opened_at")
                 if opened_at is None:
@@ -419,6 +547,13 @@ class StrategyEngine:
                     symbol, side, mark_price, new_sl, new_tp
                 )
                 if resp.get("retCode") != 0:
+                    self.telemetry.record_protection_event(
+                        trade, "protection_replacement_rejected",
+                        {"stop_loss": current_sl, "take_profit": current_tp},
+                        {"stop_loss": new_sl, "take_profit": new_tp},
+                        reason="time-range tightening", source_module="strategy.engine",
+                        success=False, raw_status=resp,
+                    )
                     logger.error(
                         "%s: биржа отклонила time-based сужение retCode=%s retMsg=%s",
                         symbol, resp.get("retCode"), resp.get("retMsg"),
@@ -448,6 +583,13 @@ class StrategyEngine:
                         "следующий цикл восстановит его по exchange state",
                         symbol,
                     )
+                self.telemetry.record_protection_event(
+                    trade, "protection_tightened",
+                    {"stop_loss": current_sl, "take_profit": current_tp},
+                    {"stop_loss": applied_sl, "take_profit": applied_tp},
+                    reason="time-range tightening", source_module="strategy.engine",
+                    success=True, raw_status=resp,
+                )
                 logger.info(
                     "%s: time-based диапазон сужен один раз после %.1f мин: "
                     "SL %s -> %s, TP %s -> %s, factor=%s",
@@ -463,13 +605,16 @@ class StrategyEngine:
         уже закрыта (по SL, TP, trailing stop или вручную) — подтягивает реальный
         PnL и обновляет запись + Risk Manager.
 
-        Матчинг closed PnL с нашей сделкой НЕ по orderLinkId: в ответе
-        get_closed_pnl этого поля нет вообще (закрывающий ордер при срабатывании
-        SL/TP создаётся биржей автоматически). Вместо этого матчим по символу +
-        цене входа (с допуском на проскальзывание) + времени (закрытие должно
-        быть позже открытия). Это надёжно, так как Risk Manager не даёт открыть
-        вторую позицию по тому же символу, пока текущая не закрыта — на символ
-        в любой момент максимум одна открытая сделка.
+        Closed-PnL не содержит opening orderLinkId, поэтому связь строится
+        глобальным консервативным планом. Приоритет имеют сохранённый exit
+        orderId и parentOrderLinkId защитного ордера. Символ, направление,
+        время, цена входа и полный closedSize — обязательные проверки. Одна
+        exchange-запись никогда не назначается двум внутренним сделкам;
+        неоднозначность остаётся unresolved и включает штатную защиту.
+
+        Несколько closed-PnL строк могут принадлежать одной позиции (Bybit
+        способен закрыть её несколькими protective orderId). Они агрегируются
+        только когда сумма closedSize совпала с подтверждённым entry fill.
 
         ПРИЧИНА закрытия (SL/TP/trailing/наш Exit Manager/ручное) берётся
         отдельно — из /v5/execution/list, сматченного по orderId с закрывающим
@@ -483,6 +628,7 @@ class StrategyEngine:
         }
 
         for symbol in self.cfg.symbols:
+            self._backfill_exchange_order_evidence(symbol)
             # И "open", и "orphaned": orphaned обязан пересверяться, иначе его
             # результат навсегда выпадет из дневного PnL. Раньше сюда попадали
             # только "open", и orphaned становился вечным тупиком.
@@ -525,16 +671,106 @@ class StrategyEngine:
                 )
                 executions = []
             exec_by_order_id = self._index_executions_by_order_id(executions)
+            executions_by_order_id = self._group_executions_by_order_id(executions)
+
+            try:
+                order_reader = getattr(self.execution, "get_all_order_history_since", None)
+                order_history = (
+                    order_reader(symbol, start_time_ms=oldest_ms) if order_reader else []
+                )
+            except Exception:
+                logger.warning(
+                    "%s: не удалось получить order history — точный parentOrderLinkId "
+                    "матчинг недоступен в этом цикле",
+                    symbol, exc_info=True,
+                )
+                order_history = []
+
+            plan = plan_closed_pnl_reconciliation(trades, closed, order_history)
 
             has_live_position = symbol in live_symbols
-            for trade in trades:
-                match = self._find_matching_closed_pnl(trade, closed)
-                if match is None:
+            for item in plan:
+                trade = item["trade"]
+                match = item.get("record")
+                if item["status"] != RECONCILIATION_MATCHED or match is None:
+                    if item["status"] != "NOT_FOUND":
+                        logger.error(
+                            "%s: closed-PnL для %s неоднозначен (%s) — запись не привязана",
+                            symbol, trade.get("order_link_id"), item.get("note"),
+                        )
                     self._handle_unmatched_trade(
                         symbol, trade, len(closed), positions, has_live_position,
                     )
                     continue
-                self._apply_closed_pnl(symbol, trade, match, exec_by_order_id)
+                self._persist_exchange_order_evidence(trade, order_history, match)
+                self._apply_closed_pnl(
+                    symbol, trade, match, exec_by_order_id, executions_by_order_id
+                )
+
+    def _backfill_exchange_order_evidence(self, symbol: str) -> None:
+        """Retry durable order linkage after transient order-history gaps.
+
+        This is read-only at the exchange and idempotent in PostgreSQL.  It is
+        deliberately independent from unresolved-trade reconciliation because
+        a trade may already be closed when Bybit order history becomes available.
+        """
+        finder = getattr(self.journal, "get_recent_trades_missing_exchange_order_evidence", None)
+        reader = getattr(self.execution, "get_all_order_history_since", None)
+        if finder is None or reader is None:
+            return
+        missing = finder(symbol, current_run_id=self.cfg.run_id)
+        if not missing:
+            return
+        oldest_ms = min(
+            (item["opened_at_ms"] for item in missing if item.get("opened_at_ms") is not None),
+            default=None,
+        )
+        try:
+            orders = reader(symbol, start_time_ms=oldest_ms)
+            active_reader = getattr(self.execution, "get_active_protective_orders", None)
+            if active_reader and any(item.get("status") in ("open", "orphaned") for item in missing):
+                # Untriggered SL/TP may be absent from historical endpoints until
+                # they reach a terminal state.  Active-order reads fill that gap.
+                active = active_reader(symbol) or []
+                known_ids = {item.get("orderId") for item in orders}
+                orders.extend(item for item in active if item.get("orderId") not in known_ids)
+        except Exception:
+            logger.warning(
+                "%s: exchange-order evidence backfill отложен — order history недоступна",
+                symbol, exc_info=True,
+            )
+            return
+        if not orders:
+            return
+        for trade in missing:
+            exit_ids = trade.get("known_exchange_exit_order_ids") or []
+            self._persist_exchange_order_evidence(
+                trade, orders, {"orderIds": exit_ids, "orderId": exit_ids[0] if exit_ids else None},
+            )
+
+    def _persist_exchange_order_evidence(self, trade: dict, orders: list, match: dict) -> None:
+        writer = getattr(self.journal, "upsert_exchange_order_evidence", None)
+        if writer is None:
+            return
+        exit_ids = set(match.get("orderIds") or [match.get("orderId")])
+        submitted_id = trade.get("submitted_exit_order_id")
+        submitted_link = trade.get("submitted_exit_order_link_id")
+        evidence = []
+        for order in orders:
+            role = None
+            if order.get("orderLinkId") == trade.get("order_link_id"):
+                role = "entry"
+            elif order.get("parentOrderLinkId") == trade.get("order_link_id"):
+                role = "protective"
+            elif order.get("orderId") in exit_ids:
+                role = "protective_exit" if order.get("stopOrderType") else "exit"
+            elif order.get("orderId") == submitted_id or (
+                submitted_link and order.get("orderLinkId") == submitted_link
+            ):
+                role = "exit_manager"
+            if role:
+                evidence.append({"role": role, "order": order})
+        writer(trade["order_link_id"], evidence)
 
     @staticmethod
     def _index_executions_by_order_id(executions: list) -> dict:
@@ -549,7 +785,23 @@ class StrategyEngine:
                 index[oid] = e
         return index
 
-    def _apply_closed_pnl(self, symbol: str, trade: dict, match: dict, exec_by_order_id: Optional[dict] = None):
+    @staticmethod
+    def _group_executions_by_order_id(executions: list) -> dict:
+        grouped: dict = {}
+        for execution in executions:
+            oid = execution.get("orderId")
+            if oid:
+                grouped.setdefault(oid, []).append(execution)
+        return grouped
+
+    def _apply_closed_pnl(
+        self,
+        symbol: str,
+        trade: dict,
+        match: dict,
+        exec_by_order_id: Optional[dict] = None,
+        executions_by_order_id: Optional[dict] = None,
+    ):
         """
         Записывает найденный результат сделки. Единственная точка, где дневной
         PnL пополняется реализованным результатом.
@@ -565,8 +817,17 @@ class StrategyEngine:
         exit_price = float(match.get("avgExitPrice", 0) or 0)
         pnl_usdt = float(match.get("closedPnl", 0) or 0)
         closed_at = self._closed_at_from_match(match)
-        execution_record = (exec_by_order_id or {}).get(match.get("orderId"))
-        exit_reason = self._infer_exit_reason(match, execution_record)
+        records = match.get("records") or [match]
+        execution_records = {
+            record.get("orderId"): (exec_by_order_id or {}).get(record.get("orderId"))
+            for record in records
+        }
+        reasons = {
+            self._infer_exit_reason(record, execution_records.get(record.get("orderId")))
+            for record in records
+        }
+        exit_reason = next(iter(reasons)) if len(reasons) == 1 else "mixed"
+        execution_record = execution_records.get(match.get("orderId"))
         exit_snapshot = self._build_exit_snapshot(symbol, match)
         exit_fee = _optional_float(
             match.get("closeFee") or (execution_record or {}).get("execFee")
@@ -588,6 +849,19 @@ class StrategyEngine:
             exchange_exit_order_id=match.get("orderId"),
             exit_fee_usdt=exit_fee,
             total_fee_usdt=total_fee,
+            closure_records=(
+                records
+                if all(
+                    record.get("orderId")
+                    and (record.get("closedSize") or record.get("qty")) not in (None, "")
+                    for record in records
+                )
+                else None
+            ),
+            closure_executions={
+                oid: list((executions_by_order_id or {}).get(oid, []))
+                for oid in execution_records
+            },
         )
         if not result.recorded:
             if result.already_closed:
@@ -612,6 +886,26 @@ class StrategyEngine:
 
         if result.recovered_from_orphan:
             self._on_orphan_recovered(symbol, order_link_id, pnl_usdt, effective_closed_at)
+
+        self.telemetry.finalize_trade(
+            order_link_id,
+            actual_exit_reason=exit_reason,
+            records=records,
+            executions_by_order=executions_by_order_id or {},
+            realized_pnl=pnl_usdt,
+            fees=total_fee,
+            # Bybit closedPnl incorporates funding effects but does not expose a
+            # trade-scoped funding component in this response; unknown stays NULL.
+            funding=None,
+            reconciliation_status=RECONCILIATION_MATCHED,
+        )
+        self.telemetry.record_protection_event(
+            trade, "final_trigger", None,
+            {"exit_reason": exit_reason, "closing_order_ids": [r.get("orderId") for r in records]},
+            reason="exchange-confirmed position closure", source_module="strategy.engine",
+            success=True, raw_status={"records": records},
+            exchange_order_id=match.get("orderId"), observed_at=effective_closed_at,
+        )
 
         holding_seconds = self._holding_seconds(trade.get("opened_at_ms"))
         pnl_pct = self._position_pnl_pct(trade, exit_price)
@@ -747,7 +1041,11 @@ class StrategyEngine:
         tolerance_pct: float = _PRICE_TOLERANCE_PCT,
     ) -> Optional[dict]:
         """
-        Ищет запись closed_pnl, соответствующую нашей неразобранной сделке.
+        Устаревший одиночный эвристический помощник для operator tooling.
+
+        Live path его не вызывает: там используется глобальный
+        plan_closed_pnl_reconciliation с exchange identifiers, контролем
+        уникальности и полного объёма.
 
         Критерии, от жёсткого к мягкому:
         1. направление: сторона закрывающего ордера должна быть ПРОТИВОПОЛОЖНА
@@ -760,39 +1058,31 @@ class StrategyEngine:
         самую раннюю по времени. Раньше отбор шёл только по времени, из-за чего
         при нескольких близких по цене закрытиях мог выиграть не тот кандидат.
         """
+        # Compatibility helper for operator tooling and older tests.  The live
+        # reconciliation path no longer calls this heuristic; it uses the
+        # conservative global planner above.
         entry_price = trade.get("entry_price")
         if not entry_price:
             return None
         expected_close_side = cls._expected_close_side(trade.get("action"))
-
         candidates = []
-        for c in closed_pnl_list:
-            avg_entry = c.get("avgEntryPrice")
-            # In Bybit closed_pnl, createdTime can describe the opening order;
-            # updatedTime is the actual close/update timestamp.
-            closed_time = c.get("updatedTime") or c.get("createdTime")
-            if avg_entry is None or closed_time is None:
-                continue
+        for record in closed_pnl_list:
             try:
-                avg_entry = float(avg_entry)
-                closed_time_ms = int(closed_time)
+                avg_entry = float(record.get("avgEntryPrice"))
+                closed_time_ms = int(record.get("updatedTime") or record.get("createdTime"))
             except (TypeError, ValueError):
                 continue
-
-            side = c.get("side")
+            side = record.get("side")
             if expected_close_side and side and side != expected_close_side:
-                continue  # закрытие позиции другого направления
-
-            if trade["opened_at_ms"] is not None and closed_time_ms < trade["opened_at_ms"]:
-                continue  # закрытие раньше открытия -- не может относиться к этой сделке
-
+                continue
+            if trade.get("opened_at_ms") is not None and closed_time_ms < trade["opened_at_ms"]:
+                continue
             price_diff_pct = abs(avg_entry - entry_price) / entry_price * 100
             if price_diff_pct <= tolerance_pct:
-                candidates.append((price_diff_pct, closed_time_ms, c))
-
+                candidates.append((price_diff_pct, closed_time_ms, record))
         if not candidates:
             return None
-        candidates.sort(key=lambda x: (round(x[0], 6), x[1]))
+        candidates.sort(key=lambda item: (round(item[0], 6), item[1]))
         return candidates[0][2]
 
     @staticmethod
@@ -807,9 +1097,19 @@ class StrategyEngine:
     # ------------------------------------------------------------------
 
     def _process_symbol(self, symbol: str, balance: float, positions: list, execute: bool = True):
+        evaluation_id = hashlib.sha256(
+            f"{self.cfg.run_id}:{symbol}:{time.time_ns()}".encode("utf-8")
+        ).hexdigest()
         candles_df = self._load_recent_candles(symbol, limit=210)
         if candles_df is None or len(candles_df) < 30:
             logger.debug("%s: недостаточно свечей в БД для анализа", symbol)
+            self.telemetry.record_decision({
+                "evaluation_id": evaluation_id, "phase": "data_quality", "symbol": symbol,
+                "accepted": False, "final_decision": "rejected",
+                "decision_reason": "insufficient candles",
+                "rejections": [{"stage": "data_quality", "code": "insufficient_candles",
+                                "reason": "fewer than 30 durable candles"}],
+            })
             return False
 
         funding_info = self._load_latest_funding(symbol)
@@ -820,8 +1120,35 @@ class StrategyEngine:
         trade_flow = self._load_trade_flow(symbol, minutes=15)
         liquidations = self._load_recent_liquidations(symbol, minutes=60)
         freshness = self._check_data_freshness(symbol, candles_df, funding_info, oi_trend, orderbook, trade_flow)
+        for warning in freshness["warnings"]:
+            event_type = "market_data_quality_warning"
+            if warning.startswith("orderbook stale") or warning.startswith("orderbook missing"):
+                event_type = "stale_orderbook"
+            elif warning.startswith("trade flow stale") or warning.startswith("trade flow missing"):
+                event_type = "stale_trade_flow"
+            elif warning.startswith("candles stale"):
+                event_type = "stale_candle"
+            self.telemetry.record_health(
+                "market_data", event_type, "warning", "stale", symbol=symbol,
+                details={"warning": warning},
+            )
         if freshness["critical"]:
             logger.warning("%s: пропускаю символ из-за устаревших критичных данных: %s", symbol, "; ".join(freshness["warnings"]))
+            candle_ts = from_epoch_ms(int(candles_df["start_time"].iloc[-1]))
+            candle_age = self._age_seconds(int(candles_df["start_time"].iloc[-1]))
+            self.telemetry.record_health(
+                "market_data", "stale_candle", "error", "stale", symbol=symbol,
+                data_timestamp=candle_ts, data_age_seconds=candle_age,
+                details={"warnings": freshness["warnings"]},
+            )
+            self.telemetry.record_decision({
+                "evaluation_id": evaluation_id, "phase": "data_quality", "symbol": symbol,
+                "market_data_timestamp": candle_ts, "market_data_age_seconds": candle_age,
+                "filter_results": {"freshness": freshness}, "accepted": False,
+                "final_decision": "rejected", "decision_reason": "; ".join(freshness["warnings"]),
+                "rejections": [{"stage": "data_quality", "code": "stale_market_data",
+                                "reason": warning} for warning in freshness["warnings"]],
+            })
             return False
 
         indicators = compute_all_indicators(candles_df)
@@ -846,6 +1173,36 @@ class StrategyEngine:
             ai_analysis=ai_analysis.conclusion,
         )
         final_signal = self._apply_trend_filter(decision_report.final_signal, trend, market_context, symbol)
+        market_ts = from_epoch_ms(int(candles_df["start_time"].iloc[-1]))
+        decision_payload = {
+            "evaluation_id": evaluation_id, "phase": "committee", "symbol": symbol,
+            "side": final_signal.action.value, "market_data_timestamp": market_ts,
+            "market_data_age_seconds": self._age_seconds(int(candles_df["start_time"].iloc[-1])),
+            "signal_outputs": [
+                {"source": vote.source, "action": vote.action.value,
+                 "confidence": vote.confidence, "reason": vote.reason,
+                 "expected_rr": vote.expected_rr, "ignored": vote.ignored,
+                 "ignored_reason": vote.ignored_reason}
+                for vote in decision_report.votes
+            ],
+            "confirmation_families": decision_report.confirmation_families,
+            "decision_score": decision_report.confidence,
+            "market_regime": market_context.regime,
+            "volatility_regime": getattr(market_context, "volatility", None),
+            "trend_state": trend, "spread": orderbook.get("spread_pct") if orderbook else None,
+            "funding": funding_rate, "risk_score": decision_report.risk_score,
+            "filter_results": {"freshness": freshness, "trend_filter": trend,
+                               "rejected_actions": decision_report.rejected_actions},
+            "final_decision": final_signal.action.value,
+            "decision_reason": final_signal.reason,
+            "accepted": final_signal.action != Action.HOLD,
+        }
+        if final_signal.action == Action.HOLD:
+            decision_payload["rejections"] = [{
+                "stage": "committee", "code": "committee_hold", "reason": final_signal.reason,
+                "context": {"rejected_actions": decision_report.rejected_actions},
+            }]
+        self.telemetry.record_decision(decision_payload)
         self._log_decision_summary(symbol, decision_report, final_signal, market_context, trend)
 
         logger.info(
@@ -872,11 +1229,15 @@ class StrategyEngine:
         block_reason = self._entry_block_reason(symbol, positions)
         if block_reason:
             logger.info("%s: новый вход заблокирован: %s", symbol, block_reason)
+            self._record_candidate_rejection(decision_payload, "entry_guard", "entry_blocked", block_reason)
             return False
 
         portfolio_check = self.portfolio_risk.evaluate(final_signal, positions)
         if not portfolio_check.approved:
             logger.info("%s: сигнал отклонён Portfolio Risk Engine: %s", symbol, portfolio_check.reason)
+            self._record_candidate_rejection(
+                decision_payload, "portfolio_risk", "portfolio_rejected", portfolio_check.reason
+            )
             return False
 
         last_price = float(candles_df["close"].iloc[-1])
@@ -890,6 +1251,9 @@ class StrategyEngine:
 
         if not check.approved:
             logger.info("%s: сигнал отклонён Risk Manager: %s", symbol, check.reason)
+            self._record_candidate_rejection(
+                decision_payload, "risk_manager", "risk_rejected", check.reason
+            )
             return False
 
         candidate = EntryCandidate(
@@ -917,7 +1281,33 @@ class StrategyEngine:
                 meta_decision=meta_decision,
             ),
             expert_vote_rows=self._expert_vote_rows(decision_report),
+            evaluation_id=evaluation_id,
         )
+        accepted_payload = dict(decision_payload)
+        proposed_sl_pct = final_signal.stop_loss_pct or self.cfg.default_stop_loss_pct
+        accepted_payload.update({
+            "phase": "risk_approved", "accepted": True, "final_decision": "candidate",
+            "decision_reason": check.reason, "proposed_entry": last_price,
+            "proposed_stop_loss": self._price_from_pct(
+                last_price, final_signal.action, proposed_sl_pct, is_stop=True
+            ),
+            "proposed_take_profit": self._price_from_pct(
+                last_price, final_signal.action, final_signal.take_profit_pct, is_stop=False
+            ),
+            "proposed_quantity": check.approved_size_usdt / last_price if last_price else None,
+            "estimated_risk": check.approved_size_usdt *
+                ((final_signal.stop_loss_pct or self.cfg.default_stop_loss_pct) / 100),
+            "filter_results": {
+                **decision_payload["filter_results"],
+                "portfolio_risk": {"approved": portfolio_check.approved,
+                                   "reason": portfolio_check.reason},
+                "risk_manager": {"approved": check.approved, "reason": check.reason},
+                "volatility_atr_pct": indicators.get("atr_pct_of_price") if indicators else None,
+                "spread_pct": orderbook.get("spread_pct") if orderbook else None,
+                "funding_rate": funding_rate,
+            },
+        })
+        self.telemetry.record_decision(accepted_payload)
         logger.info(
             "%s: кандидат на вход прошёл фильтры: action=%s confidence=%.3f expected_rr=%s "
             "rank=%.3f confirmations=%d families=%s regime=%s trend=%s rejected=%s",
@@ -935,6 +1325,15 @@ class StrategyEngine:
         if not execute:
             return candidate
         return self._execute_candidate(candidate)
+
+    def _record_candidate_rejection(self, base: dict, stage: str, code: str, reason: str) -> None:
+        payload = dict(base)
+        payload.update({
+            "phase": stage, "accepted": False, "final_decision": "rejected",
+            "decision_reason": reason,
+            "rejections": [{"stage": stage, "code": code, "reason": reason}],
+        })
+        self.telemetry.record_decision(payload)
 
     def _execute_ranked_candidates(self, candidates: list, balance: float, positions: list):
         if not candidates:
@@ -954,6 +1353,7 @@ class StrategyEngine:
                     "%s: кандидат отложен anti-burst: достигнут лимит новых входов за цикл %d",
                     candidate.symbol, max_new,
                 )
+                self._record_execution_stage(candidate, "anti_burst", False, "cycle entry limit")
                 continue
 
             # Повторная проверка перед самым ордером: между сбором кандидатов и
@@ -962,6 +1362,7 @@ class StrategyEngine:
             block_reason = self._entry_block_reason(candidate.symbol, positions)
             if block_reason:
                 logger.info("%s: кандидат пропущен: %s", candidate.symbol, block_reason)
+                self._record_execution_stage(candidate, "entry_guard_recheck", False, block_reason)
                 continue
 
             portfolio_check = self.portfolio_risk.evaluate(candidate.final_signal, positions)
@@ -969,6 +1370,9 @@ class StrategyEngine:
                 logger.info(
                     "%s: кандидат отклонён при повторной проверке Portfolio Risk: %s",
                     candidate.symbol, portfolio_check.reason,
+                )
+                self._record_execution_stage(
+                    candidate, "portfolio_risk_recheck", False, portfolio_check.reason
                 )
                 continue
 
@@ -986,6 +1390,9 @@ class StrategyEngine:
                     "%s: кандидат отклонён при повторной проверке Risk Manager: %s",
                     candidate.symbol, fresh_risk_check.reason,
                 )
+                self._record_execution_stage(
+                    candidate, "risk_manager_recheck", False, fresh_risk_check.reason
+                )
                 continue
             candidate.risk_check = fresh_risk_check
 
@@ -997,12 +1404,46 @@ class StrategyEngine:
                         "%s: кандидат отложен anti-burst: прошло %.1fs из %ds после последнего входа",
                         candidate.symbol, elapsed, self.cfg.min_seconds_between_entries,
                     )
+                    self._record_execution_stage(candidate, "entry_spacing", False, "minimum spacing")
                     continue
 
-            if self._execute_candidate(candidate):
+            submitted = self._execute_candidate(candidate)
+            self._record_execution_stage(
+                candidate, "order_submission", submitted,
+                "exchange accepted" if submitted else "exchange rejected or execution unresolved",
+            )
+            if submitted:
                 opened += 1
                 self._last_entry_ts = time.time()
                 positions = self.execution.get_open_positions()
+
+    def _record_execution_stage(
+        self, candidate: EntryCandidate, phase: str, accepted: bool, reason: str
+    ) -> None:
+        self.telemetry.record_decision({
+            "evaluation_id": candidate.evaluation_id,
+            "phase": phase,
+            "symbol": candidate.symbol,
+            "side": candidate.final_signal.action.value,
+            "decision_score": candidate.final_signal.confidence,
+            "risk_score": candidate.decision_report.risk_score,
+            "proposed_entry": candidate.last_price,
+            "proposed_quantity": (
+                candidate.risk_check.approved_size_usdt / candidate.last_price
+                if candidate.risk_check.approved_size_usdt and candidate.last_price else None
+            ),
+            "estimated_risk": (
+                candidate.risk_check.approved_size_usdt *
+                ((candidate.final_signal.stop_loss_pct or self.cfg.default_stop_loss_pct) / 100)
+                if candidate.risk_check.approved_size_usdt else None
+            ),
+            "final_decision": "accepted" if accepted else "rejected",
+            "decision_reason": reason,
+            "accepted": accepted,
+            "rejections": [] if accepted else [{
+                "stage": phase, "code": phase, "reason": reason,
+            }],
+        })
 
     @staticmethod
     def _rank_entry_candidate(signal: Signal, decision_report) -> float:
@@ -1149,6 +1590,10 @@ class StrategyEngine:
                 expert_votes=candidate.expert_vote_rows,
                 run_id=self.cfg.run_id,
                 exchange_entry_order_id=exchange_entry_order_id,
+                entry_requested_qty=_optional_float(resp.get("local_requested_qty")),
+                entry_filled_qty=(
+                    confirmation.filled_qty if confirmation.filled_qty > 0 else None
+                ),
                 stop_loss_price=stop_loss_price,
                 take_profit_price=take_profit_price,
                 entry_fee_usdt=entry_fee_usdt,
@@ -1164,6 +1609,16 @@ class StrategyEngine:
                     "%s: ордер создан, но вход не записан в trade_log; позиция требует ручной сверки. "
                     "Символ заблокирован для новых входов. order_link_id=%s",
                     symbol, order_link_id,
+                )
+            else:
+                self.telemetry.record_protection_event(
+                    {"symbol": symbol, "order_link_id": order_link_id},
+                    "initial_protection_created", None,
+                    {"stop_loss": stop_loss_price, "take_profit": take_profit_price},
+                    reason="position entry", source_module="execution.execution_engine",
+                    success=True, raw_status=resp,
+                    exchange_order_id=exchange_entry_order_id,
+                    exchange_order_link_id=order_link_id,
                 )
             return True
 
@@ -1226,6 +1681,13 @@ class StrategyEngine:
             if p.get("symbol") == symbol and float(p.get("size", 0)) > 0:
                 return p
         return None
+
+    def _is_inherited_trade(self, trade: dict) -> bool:
+        """Whether mutating this trade would cross an immutable run boundary."""
+        owner_run_id = trade.get("run_id")
+        processing_run_id = getattr(self.cfg, "run_id", None)
+        # Legacy rows without a run ID preserve their historical behaviour.
+        return bool(owner_run_id and processing_run_id and owner_run_id != processing_run_id)
 
     def _entry_block_reason(self, symbol: str, positions: list) -> Optional[str]:
         """
@@ -1295,6 +1757,21 @@ class StrategyEngine:
             )
             return False
 
+        try:
+            open_trades = self.journal.get_open_trades(symbol)
+        except Exception:
+            # Preserve the existing fail-safe exit behaviour when the journal
+            # itself is unavailable; exchange exposure still takes priority.
+            logger.exception("%s: ownership check unavailable before Exit Manager", symbol)
+            open_trades = []
+        if len(open_trades) == 1 and self._is_inherited_trade(open_trades[0]):
+            logger.info(
+                "%s: Exit Manager не изменяет унаследованную позицию RUN_ID=%s; "
+                "exchange-native SL/TP остаются активны",
+                symbol, open_trades[0].get("run_id"),
+            )
+            return False
+
         logger.info("%s: закрываю позицию (%s) -- %s", symbol, position_direction, close_reason)
 
         try:
@@ -1323,10 +1800,12 @@ class StrategyEngine:
         # конкретной открывающей сделки (по order_link_id, не по символу —
         # неверная атрибуция здесь невозможна в принципе). Потеря снимка
         # ухудшает наблюдаемость, но не должна мешать закрытию.
-        self._record_exit_trigger(symbol, final_signal)
+        self._record_exit_trigger(symbol, final_signal, resp)
         return True
 
-    def _record_exit_trigger(self, symbol: str, final_signal: Signal):
+    def _record_exit_trigger(
+        self, symbol: str, final_signal: Signal, exchange_response: Optional[dict] = None
+    ):
         try:
             open_trades = self.journal.get_open_trades(symbol)
         except Exception:
@@ -1358,6 +1837,14 @@ class StrategyEngine:
             "reason": final_signal.reason,
             "expected_rr": expected_rr,
         }
+        recorder = getattr(self.journal, "record_submitted_exit_order", None)
+        if recorder is not None and exchange_response is not None:
+            recorder(
+                order_link_id,
+                (exchange_response.get("result") or {}).get("orderId"),
+                exchange_response.get("local_order_link_id")
+                or (exchange_response.get("result") or {}).get("orderLinkId"),
+            )
         self.journal.record_exit_trigger(order_link_id, trigger)
 
     def _apply_trend_filter(self, signal: Signal, trend: Optional[str], context, symbol: str) -> Signal:

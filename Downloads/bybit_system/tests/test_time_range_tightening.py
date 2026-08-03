@@ -32,6 +32,7 @@ class SessionBackedDb:
 class RecordingExecution:
     def __init__(self):
         self.protection = []
+        self.trailing = []
 
     def set_position_protection(self, symbol, side, mark, stop_loss, take_profit):
         self.protection.append((symbol, side, mark, stop_loss, take_profit))
@@ -40,6 +41,10 @@ class RecordingExecution:
             "local_stop_loss_price": stop_loss,
             "local_take_profit_price": take_profit,
         }
+
+    def set_trailing_stop(self, symbol, mark_price, distance_pct):
+        self.trailing.append((symbol, mark_price, distance_pct))
+        return {"retCode": 0}
 
 
 def _cfg(trading_enabled=True):
@@ -61,11 +66,13 @@ class TimeRangeTighteningTest(unittest.TestCase):
         self.engine.journal = self.journal
         self.engine.execution = self.execution
 
-    def _entry(self, side, age_seconds=3601, sl=98.0, tp=104.0, oid="oid-1"):
+    def _entry(
+        self, side, age_seconds=3601, sl=98.0, tp=104.0, oid="oid-1", run_id=None,
+    ):
         action = Action.OPEN_LONG if side == "Buy" else Action.OPEN_SHORT
         self.assertTrue(self.journal.log_entry(
             "ETHUSDT", action, "test", "test", 100.0, 50.0, 1,
-            2.0, 4.0, oid, stop_loss_price=sl, take_profit_price=tp,
+            2.0, 4.0, oid, stop_loss_price=sl, take_profit_price=tp, run_id=run_id,
         ))
         session = self.db.get_session()
         try:
@@ -138,6 +145,20 @@ class TimeRangeTighteningTest(unittest.TestCase):
         self.assertIsNone(
             self.journal.get_open_trades("ETHUSDT")[0]["range_tightened_at"]
         )
+
+    def test_inherited_trade_is_observed_but_never_mutated(self):
+        self.engine.cfg.run_id = "new-run"
+        self.engine.cfg.trailing_stop_enabled = True
+        self.engine.cfg.trailing_activation_pct = 1.0
+        self._entry("Buy", run_id="old-run")
+        position = self._position("Buy")
+        position["avgPrice"] = "95"
+        position["trailingStop"] = "0"
+        self.engine._manage_time_range_tightening([position])
+        self.engine._manage_trailing_stops([position])
+        self.assertEqual(self.execution.protection, [])
+        self.assertEqual(self.execution.trailing, [])
+        self.assertIsNone(self.journal.get_open_trades("ETHUSDT")[0]["range_tightened_at"])
 
     def test_already_tighter_exchange_state_recovers_flag_without_repeating(self):
         self._entry("Buy", sl=98.0, tp=104.0)

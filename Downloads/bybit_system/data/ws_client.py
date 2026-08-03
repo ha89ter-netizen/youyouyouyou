@@ -19,7 +19,10 @@ from config.settings import BybitConfig
 logger = logging.getLogger(__name__)
 
 
-def _safe_callback(name: str, fn: Callable, on_activity: Optional[Callable] = None):
+def _safe_callback(
+    name: str, fn: Callable, on_activity: Optional[Callable] = None,
+    on_error: Optional[Callable] = None,
+):
     """Оборачивает пользовательский колбэк, чтобы исключения не убивали WS-поток."""
 
     def wrapper(message):
@@ -27,8 +30,10 @@ def _safe_callback(name: str, fn: Callable, on_activity: Optional[Callable] = No
             if on_activity is not None:
                 on_activity()
             fn(message)
-        except Exception:
+        except Exception as exc:
             logger.exception("Ошибка в колбэке '%s' на сообщении: %s", name, message)
+            if on_error is not None:
+                on_error(name, exc)
 
     return wrapper
 
@@ -36,8 +41,9 @@ def _safe_callback(name: str, fn: Callable, on_activity: Optional[Callable] = No
 class BybitPublicStream:
     """Публичные каналы: не требуют авторизации."""
 
-    def __init__(self, cfg: BybitConfig):
+    def __init__(self, cfg: BybitConfig, on_health_event: Optional[Callable] = None):
         self.cfg = cfg
+        self._on_health_event = on_health_event
         self._last_message_monotonic = time.monotonic()
         self.ws = WebSocket(
             testnet=cfg.testnet,
@@ -64,19 +70,21 @@ class BybitPublicStream:
         self.ws.orderbook_stream(
             depth=depth,
             symbol=symbol,
-            callback=_safe_callback("orderbook", on_message, self._mark_activity),
+            callback=_safe_callback(
+                "orderbook", on_message, self._mark_activity, self._on_health_event
+            ),
         )
 
     def subscribe_trades(self, symbol: str, on_message: Callable):
         self.ws.trade_stream(
             symbol=symbol,
-            callback=_safe_callback("trades", on_message, self._mark_activity),
+            callback=_safe_callback("trades", on_message, self._mark_activity, self._on_health_event),
         )
 
     def subscribe_kline(self, symbol: str, interval: str, on_message: Callable):
         self.ws.kline_stream(
             interval=interval, symbol=symbol,
-            callback=_safe_callback("kline", on_message, self._mark_activity),
+            callback=_safe_callback("kline", on_message, self._mark_activity, self._on_health_event),
         )
 
     def subscribe_liquidations(self, symbol: str, on_message: Callable):
@@ -86,14 +94,16 @@ class BybitPublicStream:
         """
         self.ws.all_liquidation_stream(
             symbol=symbol,
-            callback=_safe_callback("liquidation", on_message, self._mark_activity),
+            callback=_safe_callback(
+                "liquidation", on_message, self._mark_activity, self._on_health_event
+            ),
         )
 
     def subscribe_ticker(self, symbol: str, on_message: Callable):
         """Тикер включает funding rate и open interest в реальном времени."""
         self.ws.ticker_stream(
             symbol=symbol,
-            callback=_safe_callback("ticker", on_message, self._mark_activity),
+            callback=_safe_callback("ticker", on_message, self._mark_activity, self._on_health_event),
         )
 
 

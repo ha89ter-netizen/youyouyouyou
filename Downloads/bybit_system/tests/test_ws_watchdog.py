@@ -1,8 +1,10 @@
 import unittest
+import logging
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from data.ws_client import BybitPublicStream
+from main import _PybitTelemetryHandler
 
 
 class FakeWebSocket:
@@ -59,6 +61,26 @@ class PublicStreamWatchdogTests(unittest.TestCase):
         stream = self._stream()
         stream.ws.exit = unittest.mock.Mock(side_effect=RuntimeError("already closed"))
         stream.close()
+
+    def test_pybit_transport_lifecycle_is_forwarded_to_durable_health(self):
+        telemetry = unittest.mock.Mock()
+        handler = _PybitTelemetryHandler(telemetry)
+        logger = logging.getLogger("test.pybit.telemetry")
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+        try:
+            logger.error("WebSocket Unified V5 encountered error: ping timeout")
+            logger.info("WebSocket Unified V5 attempting connection...")
+            logger.info("WebSocket Unified V5 connected")
+            logger.info("unrelated library message")
+        finally:
+            logger.removeHandler(handler)
+
+        self.assertEqual(telemetry.record_health.call_count, 3)
+        self.assertEqual(
+            [call.args[1] for call in telemetry.record_health.call_args_list],
+            ["websocket_disconnect", "websocket_reconnect_attempt", "websocket_connected"],
+        )
 
 
 if __name__ == "__main__":

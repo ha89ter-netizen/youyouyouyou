@@ -22,7 +22,8 @@ from runtime_control import DatabaseProcessLock, RUNTIME_DIR
 from storage.db import Database
 from storage.journal import TradeJournal
 from storage.migrations import run_safe_migrations
-from storage.models import Candle, OrderbookSnapshot, RunMetadata
+from storage.models import Candle, OrderbookSnapshot, PositionSnapshot, RunMetadata, TradeLog
+from storage.telemetry import TelemetryStore
 from timeutils import utcnow
 
 ROOT = Path(__file__).resolve().parent
@@ -133,14 +134,99 @@ def _find_resumable_run(db: Database, commit_sha: str) -> Optional[RunMetadata]:
         session.close()
 
 
-def _assert_clean_exchange(cfg: BybitConfig) -> None:
+def _assert_clean_exchange(cfg: BybitConfig, db: Database) -> dict:
+    """Accept only an empty account or deterministically owned protected inheritance."""
     execution = ExecutionEngine(cfg)
+    account = execution.get_account_state()
     positions = [
         p for p in execution.get_open_positions()
         if float(p.get("size") or 0) > 0
     ]
-    if positions:
-        raise RuntimeError(f"Testnet has {len(positions)} live position(s)")
+    session = db.get_session()
+    try:
+        open_trades = session.query(TradeLog).filter_by(status="open").all()
+        for trade in open_trades:
+            session.expunge(trade)
+    finally:
+        session.close()
+
+    inherited = []
+    owned_order_ids: set[str] = set()
+    live_symbols: set[str] = set()
+    for position in positions:
+        symbol = position.get("symbol")
+        live_symbols.add(symbol)
+        action = "open_long" if position.get("side") == "Buy" else "open_short"
+        candidates = [
+            trade for trade in open_trades
+            if trade.symbol == symbol and trade.action == action and trade.run_id
+        ]
+        if len(candidates) != 1:
+            raise RuntimeError(
+                f"Testnet inherited position {symbol} has {len(candidates)} deterministic owners"
+            )
+        trade = candidates[0]
+        exchange_qty = float(position.get("size") or 0)
+        journal_qty = float(trade.entry_filled_qty or 0)
+        exchange_entry = float(position.get("avgPrice") or 0)
+        journal_entry = float(trade.entry_price or 0)
+        qty_tolerance = max(1e-8, abs(exchange_qty) * 1e-6)
+        price_tolerance = max(1e-8, abs(exchange_entry) * 1e-6)
+        if journal_qty <= 0 or abs(exchange_qty - journal_qty) > qty_tolerance:
+            raise RuntimeError(f"Inherited {symbol} quantity does not match its owner trade")
+        if journal_entry <= 0 or abs(exchange_entry - journal_entry) > price_tolerance:
+            raise RuntimeError(f"Inherited {symbol} entry does not match its owner trade")
+        if not position.get("stopLoss") or not position.get("takeProfit"):
+            raise RuntimeError(f"Inherited {symbol} lacks exchange-native SL/TP")
+
+        response = execution.session.get_open_orders(
+            category=cfg.category, symbol=symbol, openOnly=0, limit=50
+        )
+        active = [
+            order for order in response["result"]["list"]
+            if order.get("orderStatus") in ("New", "PartiallyFilled", "Untriggered")
+        ]
+        protective = [order for order in active if order.get("reduceOnly")]
+        kinds = {order.get("stopOrderType") for order in protective}
+        if not {"StopLoss", "TakeProfit"}.issubset(kinds):
+            raise RuntimeError(f"Inherited {symbol} lacks active reduceOnly SL/TP orders")
+        current_ids = {order.get("orderId") for order in protective if order.get("orderId")}
+        session = db.get_session()
+        try:
+            snapshot = session.query(PositionSnapshot).filter_by(
+                trade_log_id=trade.id
+            ).order_by(PositionSnapshot.observed_at.desc()).first()
+            expected_ids = set(snapshot.protective_order_ids or []) if snapshot else set()
+        finally:
+            session.close()
+        if expected_ids and current_ids != expected_ids:
+            raise RuntimeError(f"Inherited {symbol} protective order IDs changed unexpectedly")
+        owned_order_ids.update(current_ids)
+        inherited.append({
+            "classification": "inherited_live_protected",
+            "owner_run_id": trade.run_id,
+            "trade_log_id": trade.id,
+            "order_link_id": trade.order_link_id,
+            "symbol": symbol,
+            "side": action,
+            "quantity": exchange_qty,
+            "average_entry": exchange_entry,
+            "stop_loss": position.get("stopLoss"),
+            "take_profit": position.get("takeProfit"),
+            "protective_order_ids": sorted(current_ids),
+        })
+
+    for trade in open_trades:
+        if trade.symbol not in live_symbols:
+            inherited.append({
+                "classification": "inherited_pending_reconciliation",
+                "owner_run_id": trade.run_id,
+                "trade_log_id": trade.id,
+                "order_link_id": trade.order_link_id,
+                "symbol": trade.symbol,
+                "side": trade.action,
+            })
+
     active_orders = []
     for symbol in cfg.symbols:
         response = execution.session.get_open_orders(
@@ -150,8 +236,15 @@ def _assert_clean_exchange(cfg: BybitConfig) -> None:
             order for order in response["result"]["list"]
             if order.get("orderStatus") in ("New", "PartiallyFilled", "Untriggered")
         )
-    if active_orders:
-        raise RuntimeError(f"Testnet has {len(active_orders)} active order(s)")
+    unexpected = [
+        order for order in active_orders
+        if order.get("orderId") not in owned_order_ids
+    ]
+    if unexpected:
+        raise RuntimeError(f"Testnet has {len(unexpected)} unowned active order(s)")
+    account = dict(account)
+    account["inherited_positions"] = inherited
+    return account
 
 
 def _environment_summary(cfg: BybitConfig) -> dict:
@@ -229,12 +322,17 @@ def _prepare(
         raise RuntimeError(f"{len(remaining)} active orphaned trade(s) remain")
 
     sha = _commit_sha()
-    durable_run = _find_resumable_run(db, sha) if cfg.runtime_mode == "railway" else None
+    # Durable run identity lives in PostgreSQL in every runtime mode.  Local
+    # PID files are deliberately ephemeral and must not decide whether a run
+    # can be recovered after a clean process restart.
+    durable_run = _find_resumable_run(db, sha)
+    startup_account = None
     if durable_run is not None:
         run_id = durable_run.run_id
+        started_at = durable_run.started_at
     else:
         try:
-            _assert_clean_exchange(cfg)
+            startup_account = _assert_clean_exchange(cfg, db)
         except Exception:
             if supervisor_lock is not None:
                 supervisor_lock.stop()
@@ -243,18 +341,38 @@ def _prepare(
             f"testnet-{utcnow():%Y%m%dT%H%M%SZ}-"
             f"{sha[:7]}-{secrets.token_hex(3)}"
         )
+        started_at = utcnow()
         session = db.get_session()
         try:
             session.add(RunMetadata(
                 run_id=run_id,
                 commit_sha=sha,
-                started_at=utcnow(),
+                started_at=started_at,
                 environment_summary=_environment_summary(cfg),
                 status="starting",
             ))
             session.commit()
         finally:
             session.close()
+    # Capture values after every default/env override has been resolved.  The
+    # scientific run row is immutable; a changed config creates a policy epoch.
+    cfg.run_id = run_id
+    cfg.commit_sha = sha
+    telemetry = TelemetryStore(db, cfg)
+    telemetry.ensure_run(
+        root=ROOT,
+        started_at=started_at,
+        startup_account_snapshot=startup_account,
+        reason="new run" if durable_run is None else "container restart recovery",
+    )
+    if startup_account is not None:
+        telemetry.persist_account_snapshot(startup_account, [], observed_at=started_at)
+        for inherited in startup_account.get("inherited_positions", []):
+            telemetry.record_health(
+                "cross_run_recovery", inherited["classification"], "info", "classified",
+                symbol=inherited.get("symbol"), details=inherited,
+                observed_at=started_at,
+            )
     RUNTIME_DIR.mkdir(exist_ok=True)
     CURRENT_RUN.write_text(
         json.dumps({"run_id": run_id, "commit_sha": sha}, indent=2),
@@ -288,13 +406,19 @@ def _spawn(script: str, run_id: str, sha: str) -> int:
     return _spawn_process(script, run_id, sha).pid
 
 
-def _wait_for_collector(db: Database, run_id: str, timeout: int = 180) -> None:
+def _wait_for_collector(
+    db: Database,
+    run_id: str,
+    timeout: int = 180,
+    expected_pid: Optional[int] = None,
+) -> None:
     deadline = time.time() + timeout
     while time.time() < deadline:
         info = _service_info("collector")
         if (
             info
             and info.get("run_id") == run_id
+            and (expected_pid is None or info.get("pid") == expected_pid)
             and not _process_alive(info.get("pid"))
         ):
             raise RuntimeError("Collector exited during refresh")
@@ -321,7 +445,7 @@ def cmd_start(_args) -> int:
     sha = _commit_sha()
     collector_pid = _spawn("main.py", run_id, sha)
     print(f"collector_pid={collector_pid}", flush=True)
-    _wait_for_collector(db, run_id)
+    _wait_for_collector(db, run_id, expected_pid=collector_pid)
     trader_pid = _spawn("trading_main.py", run_id, sha)
     print(f"trader_pid={trader_pid}", flush=True)
     print(f"run_id={run_id}", flush=True)
@@ -358,7 +482,7 @@ def cmd_run(_args) -> int:
         collector = _spawn_process("main.py", run_id, sha)
         children.append(collector)
         print(f"collector_pid={collector.pid}", flush=True)
-        _wait_for_collector(db, run_id)
+        _wait_for_collector(db, run_id, expected_pid=collector.pid)
 
         trader = _spawn_process("trading_main.py", run_id, sha)
         children.append(trader)
@@ -421,6 +545,8 @@ def cmd_status(_args) -> int:
 
 def cmd_stop(_args) -> int:
     _load_env_file()
+    _reload_config()
+    cfg = BybitConfig()
     for service in ("trader", "collector"):
         info = _service_info(service)
         pid = info.get("pid")
@@ -434,6 +560,22 @@ def cmd_stop(_args) -> int:
             raise RuntimeError(f"PID {pid} does not match {expected}; refusing to signal")
         os.kill(int(pid), signal.SIGTERM)
         print(f"stopping_{service}_pid={pid}")
+    if CURRENT_RUN.exists():
+        current = json.loads(CURRENT_RUN.read_text(encoding="utf-8"))
+        cfg.run_id = current.get("run_id", "")
+        cfg.commit_sha = current.get("commit_sha", "")
+        if cfg.run_id:
+            db = Database(cfg)
+            TelemetryStore(db, cfg).finish_run()
+            session = db.get_session()
+            try:
+                row = session.query(RunMetadata).filter_by(run_id=cfg.run_id).first()
+                if row is not None and row.stopped_at is None:
+                    row.status = "stopped"
+                    row.stopped_at = utcnow()
+                    session.commit()
+            finally:
+                session.close()
     return 0
 
 

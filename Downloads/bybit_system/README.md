@@ -105,6 +105,19 @@ DATABASE_URL=${{Postgres.DATABASE_URL}}
 RAILWAY_DEPLOYMENT_DRAINING_SECONDS=30
 ```
 
+Research telemetry uses conservative defaults and may be configured without
+changing trading behaviour:
+
+```bash
+TELEMETRY_ACCOUNT_INTERVAL_SEC=60
+TELEMETRY_POSITION_INTERVAL_SEC=30
+STRATEGY_VERSION=frozen-current
+```
+
+These values affect observation cadence/identification only. The resolved
+values are included in immutable run metadata and any later change creates a
+new policy epoch.
+
 `DATABASE_URL` обязан указывать на внешний PostgreSQL: Railway-режим отвергает
 отсутствующее значение, SQLite и localhost. `RAILWAY_GIT_COMMIT_SHA`
 предоставляется Railway автоматически; при другом способе сборки задайте

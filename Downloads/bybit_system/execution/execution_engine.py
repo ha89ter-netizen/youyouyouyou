@@ -24,6 +24,7 @@ from pybit.exceptions import InvalidRequestError
 
 from config.settings import BybitConfig
 from strategy.signal import Action
+from timeutils import from_epoch_ms
 
 logger = logging.getLogger(__name__)
 
@@ -106,18 +107,61 @@ class ExecutionEngine:
         self._lot_size_cache: Dict[str, Dict[str, float]] = {}  # symbol -> {qtyStep, minOrderQty}
 
     def get_account_balance_usdt(self) -> float:
+        return float(self.get_account_state().get("wallet_balance") or 0)
+
+    def get_account_state(self) -> Dict[str, Any]:
+        """Return a normalized, read-only account snapshot without inventing fields."""
         resp = self.session.get_wallet_balance(accountType="UNIFIED", coin="USDT")
         try:
-            coins = resp["result"]["list"][0]["coin"]
+            account = resp["result"]["list"][0]
+            coins = account["coin"]
             usdt = next(c for c in coins if c["coin"] == "USDT")
-            return float(usdt["walletBalance"] or 0)
+            def number(*values):
+                for value in values:
+                    if value not in (None, ""):
+                        try:
+                            return float(value)
+                        except (TypeError, ValueError):
+                            continue
+                return None
+            return {
+                "wallet_balance": number(usdt.get("walletBalance"), account.get("totalWalletBalance")),
+                "equity": number(usdt.get("equity"), account.get("totalEquity")),
+                "available_balance": number(
+                    account.get("totalAvailableBalance"), usdt.get("availableToWithdraw")
+                ),
+                "total_unrealized_pnl": number(
+                    account.get("totalPerpUPL"), usdt.get("unrealisedPnl")
+                ),
+                # Bybit exposes cumulative coin realized PnL, not run-scoped realized PnL.
+                "total_realized_pnl": number(usdt.get("cumRealisedPnl")),
+                "margin_balance": number(account.get("totalMarginBalance")),
+                "used_margin": number(account.get("totalInitialMargin")),
+                "maintenance_margin": number(account.get("totalMaintenanceMargin")),
+                "source": "Bybit V5 wallet-balance",
+                "source_timestamp": from_epoch_ms(resp.get("time")),
+                "fetch_status": "ok",
+                "is_stale": False,
+                "raw_payload": resp,
+            }
         except (KeyError, IndexError, StopIteration):
             logger.warning("Не удалось прочитать баланс USDT из ответа: %s", resp)
-            return 0.0
+            raise RuntimeError("Bybit wallet response contains no USDT account state")
 
     def get_open_positions(self) -> list:
         resp = self.session.get_positions(category=self.cfg.category, settleCoin="USDT")
         return resp["result"]["list"]
+
+    def get_active_protective_orders(self, symbol: str) -> List[dict]:
+        """Read active conditional orders for telemetry; never changes exchange state."""
+        response = self.session.get_open_orders(
+            category=self.cfg.category,
+            symbol=symbol,
+            orderFilter="StopOrder",
+            openOnly=0,
+            limit=50,
+        )
+        return list((response.get("result") or {}).get("list") or [])
 
     def _safe_mode_block(self, operation: str, symbol: str = "") -> Optional[Dict[str, Any]]:
         """
@@ -318,6 +362,7 @@ class ExecutionEngine:
             }
         resp["local_order_link_id"] = order_link_id
         resp["local_order_price"] = order_price
+        resp["local_requested_qty"] = qty
         resp["local_stop_loss_price"] = params.get("stopLoss")
         resp["local_take_profit_price"] = params.get("takeProfit")
         logger.info("Ответ биржи: retCode=%s retMsg=%s orderId=%s orderLinkId=%s",
@@ -572,6 +617,31 @@ class ExecutionEngine:
         else:
             params = self._history_window_params(symbol, start_time_ms, "order history")
         return self._paginate(self.session.get_order_history, params, max_pages, symbol, "order history")
+
+    def get_all_order_history_since(
+        self,
+        symbol: str,
+        start_time_ms: Optional[int] = None,
+        max_pages: int = 5,
+    ) -> List[dict]:
+        """Read regular and conditional order history, deduplicated by orderId."""
+        base = self._history_window_params(symbol, start_time_ms, "order history")
+        rows: List[dict] = []
+        for order_filter in ("Order", "StopOrder"):
+            params = dict(base, orderFilter=order_filter)
+            rows.extend(self._paginate(
+                self.session.get_order_history, params, max_pages, symbol,
+                f"order history ({order_filter})",
+            ))
+        result = {}
+        anonymous = []
+        for row in rows:
+            oid = row.get("orderId")
+            if oid:
+                result[oid] = row
+            else:
+                anonymous.append(row)
+        return list(result.values()) + anonymous
 
     def get_executions(
         self,

@@ -280,3 +280,12 @@ class BybitConfig:
     # ==========================================================
 
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
+
+    # Research telemetry cadence. These affect persistence/API observation
+    # frequency only; they do not affect signals, orders, or risk policy.
+    telemetry_account_interval_sec: int = int(
+        os.getenv("TELEMETRY_ACCOUNT_INTERVAL_SEC", "60")
+    )
+    telemetry_position_interval_sec: int = int(
+        os.getenv("TELEMETRY_POSITION_INTERVAL_SEC", "30")
+    )

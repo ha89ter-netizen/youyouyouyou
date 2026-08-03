@@ -3,6 +3,7 @@
 import atexit
 import fcntl
 import json
+import logging
 import os
 import threading
 from pathlib import Path
@@ -11,6 +12,8 @@ from sqlalchemy import text
 
 from storage.models import RunMetadata
 from timeutils import utcnow
+
+logger = logging.getLogger(__name__)
 
 
 RUNTIME_DIR = Path(__file__).resolve().parent / ".runtime"
@@ -63,7 +66,10 @@ class DatabaseProcessLock:
 
 
 class RuntimeService:
-    def __init__(self, db, run_id: str, service: str, interval_sec: int = 10):
+    def __init__(
+        self, db, run_id: str, service: str, interval_sec: int = 10,
+        health_callback=None,
+    ):
         if service not in ("collector", "trader"):
             raise ValueError(f"Unknown runtime service: {service}")
         if not run_id:
@@ -72,6 +78,8 @@ class RuntimeService:
         self.run_id = run_id
         self.service = service
         self.interval_sec = interval_sec
+        self.health_callback = health_callback
+        self._heartbeat_failed = False
         self._lock_file = None
         self._database_lock = DatabaseProcessLock(db, service)
         self._stop = threading.Event()
@@ -113,7 +121,20 @@ class RuntimeService:
 
     def _heartbeat_loop(self) -> None:
         while not self._stop.wait(self.interval_sec):
-            self._heartbeat()
+            try:
+                self._heartbeat()
+                if self._heartbeat_failed and self.health_callback:
+                    self.health_callback(
+                        f"{self.service}_heartbeat_recovered", "info", "recovered", None
+                    )
+                self._heartbeat_failed = False
+            except Exception as exc:
+                self._heartbeat_failed = True
+                logger.exception("%s heartbeat write failed; retrying", self.service)
+                if self.health_callback:
+                    self.health_callback(
+                        f"{self.service}_heartbeat_failure", "error", "failed", exc
+                    )
 
     def _heartbeat(self) -> None:
         session = self.db.get_session()

@@ -223,6 +223,46 @@ class LiveRunInfrastructureTest(unittest.TestCase):
 
         session.close.assert_called_once()
 
+    def test_collector_wait_ignores_stale_pid_for_same_resumed_run(self):
+        now = 1_800_000_000.0
+        session = Mock()
+        run_query = Mock()
+        run_query.filter_by.return_value.first.return_value = Mock(
+            collector_heartbeat_at=utcnow()
+        )
+        candle_query = Mock()
+        candle_query.scalar.return_value = int(now * 1000)
+        book_query = Mock()
+        book_query.scalar.return_value = int(now * 1000)
+        session.query.side_effect = [run_query, candle_query, book_query]
+        db = Mock()
+        db.get_session.return_value = session
+
+        with patch.object(
+            live_run,
+            "_service_info",
+            return_value={"run_id": "resumed-run", "pid": 111},
+        ), patch.object(live_run, "_process_alive", return_value=False), patch.object(
+            live_run.time, "time", return_value=now
+        ):
+            live_run._wait_for_collector(
+                db, "resumed-run", timeout=1, expected_pid=222
+            )
+
+        session.close.assert_called_once()
+
+    def test_collector_wait_rejects_expected_new_pid_when_it_exits(self):
+        db = Mock()
+        with patch.object(
+            live_run,
+            "_service_info",
+            return_value={"run_id": "resumed-run", "pid": 222},
+        ), patch.object(live_run, "_process_alive", return_value=False):
+            with self.assertRaisesRegex(RuntimeError, "Collector exited"):
+                live_run._wait_for_collector(
+                    db, "resumed-run", timeout=1, expected_pid=222
+                )
+
     def test_postgresql_advisory_lock_rejects_duplicate_container(self):
         connection = Mock()
         connection.execute.return_value.scalar.return_value = False
@@ -297,6 +337,54 @@ class LiveRunInfrastructureTest(unittest.TestCase):
         self.assertEqual(restored.pending_entry_symbols(), ["SOLUSDT"])
         self.assertEqual(restored.blocked_symbols()["XRPUSDT"], "manual review")
         self.assertIn("orphan:test", restored.breaker_causes())
+
+    def test_safe_startup_classifies_protected_inherited_position(self):
+        session = self.db.get_session()
+        try:
+            session.add(TradeLog(
+                symbol="ETHUSDT", action="open_short", source="test", reason="owner",
+                order_link_id="inherited-owner", run_id="old-run", entry_price=100,
+                size_usdt=100, leverage=1, entry_filled_qty=1,
+                stop_loss_price=102, take_profit_price=96, status="open",
+                opened_at=utcnow(),
+            ))
+            session.commit()
+        finally:
+            session.close()
+        execution = Mock()
+        execution.get_account_state.return_value = {"wallet_balance": 1000}
+        execution.get_open_positions.return_value = [{
+            "symbol": "ETHUSDT", "side": "Sell", "size": "1", "avgPrice": "100",
+            "stopLoss": "102", "takeProfit": "96",
+        }]
+        protective = [{
+            "orderId": "native-sl", "orderStatus": "Untriggered", "reduceOnly": True,
+            "stopOrderType": "StopLoss",
+        }, {
+            "orderId": "native-tp", "orderStatus": "Untriggered", "reduceOnly": True,
+            "stopOrderType": "TakeProfit",
+        }]
+        execution.session.get_open_orders.side_effect = lambda **kwargs: {
+            "result": {"list": protective if kwargs.get("symbol") == "ETHUSDT" else []}
+        }
+        with patch.object(live_run, "ExecutionEngine", return_value=execution):
+            account = live_run._assert_clean_exchange(self.cfg, self.db)
+        inherited = account["inherited_positions"]
+        self.assertEqual(len(inherited), 1)
+        self.assertEqual(inherited[0]["classification"], "inherited_live_protected")
+        self.assertEqual(inherited[0]["owner_run_id"], "old-run")
+        self.assertEqual(inherited[0]["trade_log_id"], 1)
+
+    def test_safe_startup_rejects_unowned_live_position(self):
+        execution = Mock()
+        execution.get_account_state.return_value = {"wallet_balance": 1000}
+        execution.get_open_positions.return_value = [{
+            "symbol": "ETHUSDT", "side": "Sell", "size": "1", "avgPrice": "100",
+            "stopLoss": "102", "takeProfit": "96",
+        }]
+        with patch.object(live_run, "ExecutionEngine", return_value=execution):
+            with self.assertRaisesRegex(RuntimeError, "deterministic owners"):
+                live_run._assert_clean_exchange(self.cfg, self.db)
 
 
 if __name__ == "__main__":

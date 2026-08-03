@@ -7,11 +7,11 @@ TradeJournal: пишет причину каждого входа и резул�
 
 import logging
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import List, Optional, Tuple
 
 from storage.db import Database
-from storage.models import TradeExpertVote, TradeLog
+from storage.models import TradeClosure, TradeExchangeOrder, TradeExpertVote, TradeLog
 from storage.trade_memory import (
     clamp_confidence,
     non_negative_int,
@@ -22,7 +22,7 @@ from storage.trade_memory import (
     sanitize_text,
     validate_time_order,
 )
-from timeutils import ensure_aware_utc, to_epoch_ms, utc_today, utcnow
+from timeutils import ensure_aware_utc, from_epoch_ms, to_epoch_ms, utc_today, utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +79,8 @@ class TradeJournal:
         expert_votes: Optional[list[dict]] = None,
         run_id: Optional[str] = None,
         exchange_entry_order_id: Optional[str] = None,
+        entry_requested_qty: Optional[float] = None,
+        entry_filled_qty: Optional[float] = None,
         stop_loss_price: Optional[float] = None,
         take_profit_price: Optional[float] = None,
         entry_fee_usdt: Optional[float] = None,
@@ -112,6 +114,8 @@ class TradeJournal:
                 entry_fee_usdt=safe_float(entry_fee_usdt, "entry_fee_usdt"),
                 run_id=sanitize_text(run_id, 100),
                 exchange_entry_order_id=sanitize_text(exchange_entry_order_id, 100),
+                entry_requested_qty=safe_float(entry_requested_qty, "entry_requested_qty"),
+                entry_filled_qty=safe_float(entry_filled_qty, "entry_filled_qty"),
                 status="open",
             )
             session.add(entry)
@@ -154,6 +158,8 @@ class TradeJournal:
         exchange_exit_order_id: Optional[str] = None,
         exit_fee_usdt: Optional[float] = None,
         total_fee_usdt: Optional[float] = None,
+        closure_records: Optional[list[dict]] = None,
+        closure_executions: Optional[dict[str, list[dict]]] = None,
     ) -> ExitResult:
         """
         Фиксирует выход. Работает и для status="open" (обычное закрытие), и для
@@ -178,6 +184,69 @@ class TradeJournal:
             if row.status == "closed":
                 logger.info("Журнал: сделка %s уже закрыта, повторный выход игнорируется", order_link_id)
                 return ExitResult(recorded=False, reason="уже закрыта", already_closed=True)
+
+            closures = []
+            for record in closure_records or []:
+                exchange_oid = sanitize_text(record.get("orderId"), 100)
+                if not exchange_oid:
+                    session.rollback()
+                    return ExitResult(recorded=False, reason="closed-PnL без exchange orderId")
+                existing_closure = session.query(TradeClosure).filter(
+                    TradeClosure.exchange_exit_order_id == exchange_oid
+                ).first()
+                if existing_closure is not None:
+                    if existing_closure.trade_log_id != row.id:
+                        session.rollback()
+                        logger.critical(
+                            "RECONCILIATION_CONFLICT exchange order %s уже принадлежит trade_log.id=%s, "
+                            "не присваиваю trade_log.id=%s",
+                            exchange_oid, existing_closure.trade_log_id, row.id,
+                        )
+                        return ExitResult(recorded=False, reason="exchange order уже связан с другой сделкой")
+                    closures.append(existing_closure)
+                    continue
+                record_closed_at = from_epoch_ms(
+                    record.get("updatedTime") or record.get("createdTime")
+                ) or ensure_aware_utc(closed_at) or utcnow()
+                closure = TradeClosure(
+                    trade_log_id=row.id,
+                    order_link_id=row.order_link_id,
+                    exchange_exit_order_id=exchange_oid,
+                    closed_qty=safe_float(
+                        record.get("closedSize") or record.get("qty"), "closed_qty"
+                    ),
+                    avg_exit_price=safe_float(record.get("avgExitPrice"), "avg_exit_price"),
+                    closed_pnl=safe_float(record.get("closedPnl"), "closed_pnl"),
+                    open_fee=safe_float(record.get("openFee"), "open_fee"),
+                    close_fee=safe_float(record.get("closeFee"), "close_fee"),
+                    exit_reason=sanitize_text(exit_reason, 100),
+                    closed_at=record_closed_at,
+                    raw_record=safe_json(record),
+                    executions=safe_json((closure_executions or {}).get(exchange_oid, [])),
+                )
+                session.add(closure)
+                closures.append(closure)
+            if closures:
+                session.flush()
+                closed_qty_total = sum(float(c.closed_qty) for c in closures)
+                if closed_qty_total <= 0:
+                    session.rollback()
+                    return ExitResult(recorded=False, reason="суммарный closed qty равен нулю")
+                exit_price = sum(
+                    float(c.avg_exit_price) * float(c.closed_qty) for c in closures
+                ) / closed_qty_total
+                pnl_usdt = sum(float(c.closed_pnl) for c in closures)
+                open_fees = [float(c.open_fee) for c in closures if c.open_fee is not None]
+                close_fees = [float(c.close_fee) for c in closures if c.close_fee is not None]
+                exit_fee_usdt = sum(close_fees) if close_fees else None
+                total_fee_usdt = (
+                    sum(open_fees) + sum(close_fees)
+                    if len(open_fees) == len(closures) and len(close_fees) == len(closures)
+                    else None
+                )
+                closed_at = max(c.closed_at for c in closures)
+                exchange_exit_order_id = closures[0].exchange_exit_order_id
+                row.exchange_exit_order_ids = [c.exchange_exit_order_id for c in closures]
 
             recovered_from_orphan = row.status == "orphaned"
             row.exit_price = exit_price
@@ -271,10 +340,64 @@ class TradeJournal:
         finally:
             session.close()
 
+    def get_recent_trades_missing_exchange_order_evidence(
+        self,
+        symbol: str,
+        current_run_id: Optional[str] = None,
+        lookback_hours: int = 24,
+    ) -> List[dict]:
+        """Return recent/current trades whose durable order linkage is incomplete.
+
+        A transient empty Bybit order-history response must not make exchange
+        evidence permanently unavailable after a trade changes to ``closed``.
+        The caller can safely retry these rows: the evidence writer is keyed by
+        the immutable exchange order ID.
+        """
+        session = self.db.get_session()
+        try:
+            rows = (
+                session.query(TradeLog)
+                .filter(TradeLog.symbol == symbol)
+                .order_by(TradeLog.opened_at.desc())
+                .limit(100)
+                .all()
+            )
+            cutoff = utcnow() - timedelta(hours=max(1, lookback_hours))
+            result = []
+            for row in rows:
+                opened_at = ensure_aware_utc(row.opened_at)
+                if row.run_id != current_run_id and (opened_at is None or opened_at < cutoff):
+                    continue
+
+                evidence = session.query(TradeExchangeOrder).filter_by(trade_log_id=row.id).all()
+                observed_ids = {item.exchange_order_id for item in evidence}
+                observed_roles = {item.role for item in evidence}
+                closure_ids = {
+                    item.exchange_exit_order_id
+                    for item in session.query(TradeClosure).filter_by(trade_log_id=row.id).all()
+                }
+                needs_entry = bool(row.exchange_entry_order_id) and (
+                    row.exchange_entry_order_id not in observed_ids or "entry" not in observed_roles
+                )
+                needs_protection = bool(row.stop_loss_price or row.take_profit_price) and not (
+                    {"protective", "protective_exit"} & observed_roles
+                )
+                needs_exit = bool(closure_ids - observed_ids)
+                if not (needs_entry or needs_protection or needs_exit):
+                    continue
+
+                item = self._trade_row_to_dict(row)
+                item["known_exchange_exit_order_ids"] = sorted(closure_ids)
+                result.append(item)
+            return result
+        finally:
+            session.close()
+
     @staticmethod
     def _trade_row_to_dict(r: TradeLog) -> dict:
         return {
             "order_link_id": r.order_link_id,
+            "run_id": r.run_id,
             "symbol": r.symbol,
             "action": r.action,
             "entry_price": float(r.entry_price),
@@ -299,7 +422,88 @@ class TradeJournal:
             # до перехода на aware-время, дали бы смещение на часовой пояс
             # и сломали сверку с closed PnL по времени.
             "opened_at_ms": to_epoch_ms(r.opened_at),
+            "entry_filled_qty": (
+                float(r.entry_filled_qty) if r.entry_filled_qty is not None else None
+            ),
+            "exchange_entry_order_id": r.exchange_entry_order_id,
+            "submitted_exit_order_id": r.submitted_exit_order_id,
+            "submitted_exit_order_link_id": r.submitted_exit_order_link_id,
+            "known_exchange_exit_order_ids": list(r.exchange_exit_order_ids or []),
         }
+
+    def record_submitted_exit_order(
+        self, order_link_id: str, exchange_order_id: Optional[str], exchange_order_link_id: Optional[str]
+    ) -> bool:
+        """Persist an accepted Exit Manager order before asynchronous reconciliation."""
+        session = self.db.get_session()
+        try:
+            row = session.query(TradeLog).filter(
+                TradeLog.order_link_id == order_link_id,
+                TradeLog.status.in_(UNRESOLVED_STATUSES),
+            ).first()
+            if row is None:
+                return False
+            row.submitted_exit_order_id = sanitize_text(exchange_order_id, 100)
+            row.submitted_exit_order_link_id = sanitize_text(exchange_order_link_id, 100)
+            session.commit()
+            return True
+        except Exception:
+            logger.exception("Не удалось сохранить идентификаторы exit-ордера для %s", order_link_id)
+            session.rollback()
+            return False
+        finally:
+            session.close()
+
+    def upsert_exchange_order_evidence(self, order_link_id: str, evidence: list[dict]) -> None:
+        """Idempotently preserve exchange order/protection lifecycle records."""
+        session = self.db.get_session()
+        try:
+            trade = session.query(TradeLog).filter(TradeLog.order_link_id == order_link_id).first()
+            if trade is None:
+                return
+            now = utcnow()
+            for item in evidence:
+                order = item.get("order") or {}
+                exchange_oid = sanitize_text(order.get("orderId"), 100)
+                if not exchange_oid:
+                    continue
+                row = session.query(TradeExchangeOrder).filter(
+                    TradeExchangeOrder.exchange_order_id == exchange_oid
+                ).first()
+                if row is not None and row.trade_log_id != trade.id:
+                    logger.critical(
+                        "ORDER_LINK_CONFLICT exchange order %s уже связан с trade_log.id=%s",
+                        exchange_oid, row.trade_log_id,
+                    )
+                    continue
+                if row is None:
+                    row = TradeExchangeOrder(
+                        trade_log_id=trade.id,
+                        internal_order_link_id=order_link_id,
+                        exchange_order_id=exchange_oid,
+                        role=sanitize_text(item.get("role"), 30) or "unknown",
+                        first_observed_at=now,
+                    )
+                    session.add(row)
+                row.role = sanitize_text(item.get("role"), 30) or row.role
+                row.exchange_order_link_id = sanitize_text(order.get("orderLinkId"), 100)
+                row.parent_order_link_id = sanitize_text(order.get("parentOrderLinkId"), 100)
+                row.order_status = sanitize_text(order.get("orderStatus"), 40)
+                row.stop_order_type = sanitize_text(order.get("stopOrderType"), 40)
+                row.trigger_price = safe_float(order.get("triggerPrice"), "trigger_price")
+                row.requested_qty = safe_float(order.get("qty"), "requested_qty")
+                row.filled_qty = safe_float(order.get("cumExecQty"), "filled_qty")
+                row.avg_price = safe_float(order.get("avgPrice"), "avg_price")
+                row.exchange_created_at = from_epoch_ms(order.get("createdTime"))
+                row.exchange_updated_at = from_epoch_ms(order.get("updatedTime"))
+                row.last_observed_at = now
+                row.raw_payload = safe_json(order)
+            session.commit()
+        except Exception:
+            logger.exception("Не удалось сохранить exchange-order evidence для %s", order_link_id)
+            session.rollback()
+        finally:
+            session.close()
 
     def mark_range_tightened(
         self,

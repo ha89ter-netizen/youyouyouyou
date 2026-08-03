@@ -6,5 +6,12 @@ logs/
 *.bak
 .runtime/
 backups/
-
+.pytest_cache/
+__pycache__/
+*.py[cod]
 .DS_Store
+
+# Generated research/runtime deliverables stay local and are not deployment inputs.
+artifacts/
+output/
+reports/

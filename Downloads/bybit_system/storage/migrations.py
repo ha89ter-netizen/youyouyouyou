@@ -3,9 +3,47 @@ from typing import Dict
 
 from sqlalchemy import inspect, text
 
-from storage.models import Base, RiskState, RunMetadata, TradeExpertVote
+from storage.models import (
+    Base, RiskState, RunMetadata, TradeClosure, TradeExchangeOrder, TradeExpertVote,
+)
 
 logger = logging.getLogger(__name__)
+
+DATABASE_SCHEMA_VERSION = "telemetry-v2"
+MIGRATION_VERSION = "2026-08-01-cross-run-attribution-v2"
+
+
+TELEMETRY_ATTRIBUTION_COLUMNS: Dict[str, Dict[str, str]] = {
+    "position_snapshots": {"processing_run_id": "VARCHAR(100)"},
+    "trade_excursions": {
+        "last_processing_run_id": "VARCHAR(100)",
+        "finalized_by_run_id": "VARCHAR(100)",
+    },
+    "trade_protection_events": {"processing_run_id": "VARCHAR(100)"},
+    "trade_exit_events": {"processing_run_id": "VARCHAR(100)"},
+}
+
+
+def ensure_telemetry_attribution_columns(engine) -> None:
+    """Add nullable owner/processor attribution without rewriting history."""
+    inspector = inspect(engine)
+    dialect = engine.dialect.name
+    with engine.begin() as conn:
+        for table, columns in TELEMETRY_ATTRIBUTION_COLUMNS.items():
+            if not inspector.has_table(table):
+                continue
+            existing = {column["name"] for column in inspector.get_columns(table)}
+            for name, sql_type in columns.items():
+                if name in existing:
+                    continue
+                if dialect == "postgresql":
+                    statement = (
+                        f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {name} {sql_type}"
+                    )
+                else:
+                    statement = f"ALTER TABLE {table} ADD COLUMN {name} {sql_type}"
+                conn.execute(text(statement))
+                logger.info("DB migration: %s.%s added", table, name)
 
 
 TRADE_LOG_ANALYTICS_COLUMNS: Dict[str, str] = {
@@ -28,7 +66,12 @@ TRADE_LOG_ANALYTICS_COLUMNS: Dict[str, str] = {
     "holding_seconds": "INTEGER",
     "run_id": "VARCHAR(100)",
     "exchange_entry_order_id": "VARCHAR(100)",
+    "entry_requested_qty": "NUMERIC",
+    "entry_filled_qty": "NUMERIC",
     "exchange_exit_order_id": "VARCHAR(100)",
+    "exchange_exit_order_ids": "JSONB",
+    "submitted_exit_order_id": "VARCHAR(100)",
+    "submitted_exit_order_link_id": "VARCHAR(100)",
     "stop_loss_price": "NUMERIC",
     "take_profit_price": "NUMERIC",
     "range_tightened_at": "TIMESTAMP WITH TIME ZONE",
@@ -87,6 +130,11 @@ def ensure_run_metadata_table(engine) -> None:
     RunMetadata.__table__.create(bind=engine, checkfirst=True)
 
 
+def ensure_trade_exchange_evidence_tables(engine) -> None:
+    TradeClosure.__table__.create(bind=engine, checkfirst=True)
+    TradeExchangeOrder.__table__.create(bind=engine, checkfirst=True)
+
+
 RISK_STATE_COLUMNS: Dict[str, str] = {
     "pending_entries": "JSONB",
     "blocked_symbols": "JSONB",
@@ -137,6 +185,20 @@ def ensure_analytics_indexes(engine) -> None:
         # на каждый цикл спрашиваем "есть ли открытые сделки по этому символу"
         "CREATE INDEX IF NOT EXISTS ix_trade_log_status_symbol ON trade_log (status, symbol)",
         "CREATE INDEX IF NOT EXISTS ix_trade_log_run_id ON trade_log (run_id)",
+        "CREATE INDEX IF NOT EXISTS ix_trade_closures_trade_log_id ON trade_closures (trade_log_id)",
+        "CREATE INDEX IF NOT EXISTS ix_trade_exchange_orders_trade_log_id ON trade_exchange_orders (trade_log_id)",
+        "CREATE INDEX IF NOT EXISTS ix_run_policy_epochs_run_time ON run_policy_epochs (run_id, effective_at)",
+        "CREATE INDEX IF NOT EXISTS ix_account_snapshots_run_time ON account_snapshots (run_id, observed_at)",
+        "CREATE INDEX IF NOT EXISTS ix_position_snapshots_run_trade_time ON position_snapshots (run_id, trade_log_id, observed_at)",
+        "CREATE INDEX IF NOT EXISTS ix_position_snapshots_processing_run ON position_snapshots (processing_run_id, observed_at)",
+        "CREATE INDEX IF NOT EXISTS ix_trade_excursions_run_symbol ON trade_excursions (run_id, symbol)",
+        "CREATE INDEX IF NOT EXISTS ix_trade_protection_events_run_time ON trade_protection_events (run_id, observed_at)",
+        "CREATE INDEX IF NOT EXISTS ix_trade_protection_events_processing_run ON trade_protection_events (processing_run_id, observed_at)",
+        "CREATE INDEX IF NOT EXISTS ix_trade_exit_events_run_time ON trade_exit_events (run_id, observed_at)",
+        "CREATE INDEX IF NOT EXISTS ix_trade_exit_events_processing_run ON trade_exit_events (processing_run_id, observed_at)",
+        "CREATE INDEX IF NOT EXISTS ix_decision_events_run_time ON decision_events (run_id, observed_at)",
+        "CREATE INDEX IF NOT EXISTS ix_rejection_events_run_time ON rejection_events (run_id, observed_at)",
+        "CREATE INDEX IF NOT EXISTS ix_operational_health_events_run_time ON operational_health_events (run_id, observed_at)",
     ]
     inspector = inspect(engine)
     if not inspector.has_table("trade_log") or not inspector.has_table("trade_expert_votes"):
@@ -155,4 +217,6 @@ def run_safe_migrations(engine) -> None:
     ensure_trade_expert_votes_table(engine)
     ensure_risk_state_table(engine)
     ensure_run_metadata_table(engine)
+    ensure_trade_exchange_evidence_tables(engine)
+    ensure_telemetry_attribution_columns(engine)
     ensure_analytics_indexes(engine)

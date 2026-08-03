@@ -130,6 +130,22 @@ class RecordExitTriggerEndToEndTest(unittest.TestCase):
         self.engine._manage_exit("ETHUSDT", dict(POSITION), signal, "short")
         self.assertIsNone(self._row().exit_trigger["expected_rr"])
 
+    def test_inherited_trade_is_not_closed_by_new_run_exit_manager(self):
+        self.cfg.run_id = "new-run"
+        self.journal.log_entry(
+            "ETHUSDT", Action.OPEN_LONG, "test", "entry",
+            100.0, 50.0, 1, 1.5, 3.0, "oid-1", run_id="old-run",
+        )
+
+        class MustNotClose:
+            def close_position(self, *args, **kwargs):
+                raise AssertionError("cross-run Exit Manager mutation")
+
+        self.engine.execution = MustNotClose()
+        signal = Signal("ETHUSDT", Action.OPEN_SHORT, "decision:test", 0.7, "разворот")
+        self.assertFalse(self.engine._manage_exit("ETHUSDT", dict(POSITION), signal, "short"))
+        self.assertIsNone(self._row().exit_trigger)
+
     def test_no_open_trade_does_not_crash_close(self):
         """Позиция есть на бирже, но в журнале почему-то нет открытой записи."""
         signal = Signal("ETHUSDT", Action.OPEN_SHORT, "decision:test", 0.7, "разворот")
