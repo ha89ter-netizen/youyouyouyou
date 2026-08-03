@@ -53,6 +53,8 @@ def _cfg(trading_enabled=True):
     cfg.time_range_tightening_enabled = True
     cfg.time_range_tightening_after_seconds = 3600
     cfg.time_range_tightening_factor = 0.5
+    cfg.time_range_second_tightening_after_seconds = 18000
+    cfg.time_range_second_tightening_factor = 0.5
     return cfg
 
 
@@ -123,6 +125,43 @@ class TimeRangeTighteningTest(unittest.TestCase):
             self.execution.protection[0],
             ("ETHUSDT", "Sell", 100.0, 102.0, 99.0),
         )
+
+    def test_second_stage_halves_remaining_distances_after_five_hours_once(self):
+        self._entry("Buy", age_seconds=18001)
+        self.engine._manage_time_range_tightening([self._position("Buy")])
+        self.engine._manage_time_range_tightening([
+            self._position("Buy", sl=99.0, tp=102.0)
+        ])
+        self.assertEqual(
+            self.execution.protection,
+            [
+                ("ETHUSDT", "Buy", 100.0, 99.0, 102.0),
+                ("ETHUSDT", "Buy", 100.0, 99.5, 101.0),
+            ],
+        )
+
+        restarted = object.__new__(StrategyEngine)
+        restarted.cfg = _cfg()
+        restarted.journal = TradeJournal(self.db)
+        restarted.execution = RecordingExecution()
+        restarted._manage_time_range_tightening([
+            self._position("Buy", sl=99.5, tp=101.0)
+        ])
+        self.assertEqual(restarted.execution.protection, [])
+        trade = restarted.journal.get_open_trades("ETHUSDT")[0]
+        self.assertIsNotNone(trade["range_second_tightened_at"])
+        self.assertEqual(trade["second_tightened_stop_loss_price"], 99.5)
+        self.assertEqual(trade["second_tightened_take_profit_price"], 101.0)
+
+    def test_second_stage_waits_until_five_hours(self):
+        self._entry("Buy", age_seconds=4 * 3600)
+        self.engine._manage_time_range_tightening([self._position("Buy")])
+        self.engine._manage_time_range_tightening([
+            self._position("Buy", sl=99.0, tp=102.0)
+        ])
+        self.assertEqual(len(self.execution.protection), 1)
+        trade = self.journal.get_open_trades("ETHUSDT")[0]
+        self.assertIsNone(trade["range_second_tightened_at"])
 
     def test_younger_position_is_untouched(self):
         self._entry("Buy", age_seconds=3599)

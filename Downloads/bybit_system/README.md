@@ -105,6 +105,18 @@ DATABASE_URL=${{Postgres.DATABASE_URL}}
 RAILWAY_DEPLOYMENT_DRAINING_SECONDS=30
 ```
 
+Текущие подтверждённые оператором лимиты и два этапа time-based сужения:
+
+```bash
+MAX_OPEN_POSITIONS=10
+MAX_DAILY_TRADES=200
+TIME_RANGE_TIGHTENING_ENABLED=true
+TIME_RANGE_TIGHTENING_AFTER_SECONDS=3600
+TIME_RANGE_TIGHTENING_FACTOR=0.5
+TIME_RANGE_SECOND_TIGHTENING_AFTER_SECONDS=18000
+TIME_RANGE_SECOND_TIGHTENING_FACTOR=0.5
+```
+
 Research telemetry uses conservative defaults and may be configured without
 changing trading behaviour:
 
@@ -270,7 +282,8 @@ export RISK_PER_TRADE_PCT="1.0"       # риск на сделку в % от б�
 export MAX_POSITION_USDT="100"        # жёсткий потолок размера позиции
 export MAX_LEVERAGE="3"               # макс. плечо
 export MAX_DAILY_LOSS_PCT="3.0"       # дневной лимит убытка в % от баланса на начало дня
-export MAX_OPEN_POSITIONS="2"         # макс. одновременно открытых позиций
+export MAX_OPEN_POSITIONS="10"        # макс. одновременно открытых позиций
+export MAX_DAILY_TRADES="200"         # макс. новых сделок за сутки UTC
 export DEFAULT_STOP_LOSS_PCT="1.5"    # SL по умолчанию, если стратегия не задала свой
 export MAX_VOLATILITY_ATR_PCT="3.0"   # выше этого ATR% -- не входить (слишком дёргано)
 export MAX_SPREAD_PCT="0.15"          # шире этого спреда -- не входить (низкая ликвидность)
@@ -278,6 +291,10 @@ export TREND_FILTER_ENABLED="true"    # блокировать сигналы п
 export TRAILING_STOP_ENABLED="true"
 export TRAILING_ACTIVATION_PCT="1.0"  # прибыль %, при которой включается trailing stop
 export TRAILING_DISTANCE_PCT="0.8"    # дистанция trailing stop от цены, %
+export TIME_RANGE_TIGHTENING_AFTER_SECONDS="3600"         # первое сужение через 1 час
+export TIME_RANGE_TIGHTENING_FACTOR="0.5"                 # оставшийся диапазон пополам
+export TIME_RANGE_SECOND_TIGHTENING_AFTER_SECONDS="18000" # второе сужение через 5 часов
+export TIME_RANGE_SECOND_TIGHTENING_FACTOR="0.5"          # ещё раз пополам
 export DECISION_INTERVAL_SEC="60"     # как часто пересматривать рынок
 ```
 

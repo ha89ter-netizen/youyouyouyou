@@ -457,15 +457,18 @@ class StrategyEngine:
 
     def _manage_time_range_tightening(self, positions: list):
         """
-        После заданного времени один раз сокращает оставшиеся расстояния от
-        текущей mark price до static SL и TP. Факт хранится в trade_log, поэтому
-        рестарт не применяет правило повторно.
+        Через один и пять часов сокращает оставшиеся расстояния от текущей mark
+        price до static SL и TP. Факт каждого этапа хранится в trade_log,
+        поэтому рестарт не применяет ни один этап повторно.
         """
         if not self.cfg.time_range_tightening_enabled:
             return
-        factor = self.cfg.time_range_tightening_factor
-        if not 0 < factor < 1:
-            logger.error("TIME_RANGE_TIGHTENING_FACTOR=%s вне диапазона (0, 1)", factor)
+        factors = (
+            self.cfg.time_range_tightening_factor,
+            self.cfg.time_range_second_tightening_factor,
+        )
+        if any(not 0 < factor < 1 for factor in factors):
+            logger.error("TIME_RANGE_TIGHTENING factors=%s вне диапазона (0, 1)", factors)
             return
 
         open_by_symbol = {t["symbol"]: t for t in self.journal.get_open_trades()}
@@ -476,7 +479,7 @@ class StrategyEngine:
                 if float(p.get("size", 0) or 0) <= 0:
                     continue
                 trade = open_by_symbol.get(symbol)
-                if not trade or trade.get("range_tightened_at") is not None:
+                if not trade or trade.get("range_second_tightened_at") is not None:
                     continue
                 if self._is_inherited_trade(trade):
                     logger.info(
@@ -488,7 +491,22 @@ class StrategyEngine:
                 if opened_at is None:
                     continue
                 age_seconds = (now - opened_at).total_seconds()
-                if age_seconds < self.cfg.time_range_tightening_after_seconds:
+
+                if trade.get("range_tightened_at") is None:
+                    stage = 1
+                    after_seconds = self.cfg.time_range_tightening_after_seconds
+                    factor = self.cfg.time_range_tightening_factor
+                    baseline_sl = trade.get("stop_loss_price")
+                    baseline_tp = trade.get("take_profit_price")
+                    mark_tightened = self.journal.mark_range_tightened
+                else:
+                    stage = 2
+                    after_seconds = self.cfg.time_range_second_tightening_after_seconds
+                    factor = self.cfg.time_range_second_tightening_factor
+                    baseline_sl = trade.get("tightened_stop_loss_price")
+                    baseline_tp = trade.get("tightened_take_profit_price")
+                    mark_tightened = self.journal.mark_range_second_tightened
+                if age_seconds < after_seconds:
                     continue
 
                 side = p.get("side")
@@ -510,16 +528,16 @@ class StrategyEngine:
                     side,
                     current_sl,
                     current_tp,
-                    trade.get("stop_loss_price"),
-                    trade.get("take_profit_price"),
+                    baseline_sl,
+                    baseline_tp,
                 ):
-                    self.journal.mark_range_tightened(
+                    mark_tightened(
                         trade["order_link_id"], current_sl, current_tp
                     )
                     logger.warning(
-                        "%s: обнаружена уже суженная защита; durable-флаг восстановлен "
-                        "без повторного изменения ордеров",
-                        symbol,
+                        "%s: обнаружен уже выполненный этап %s сужения; durable-флаг "
+                        "восстановлен без повторного изменения ордеров",
+                        symbol, stage,
                     )
                     continue
 
@@ -551,7 +569,7 @@ class StrategyEngine:
                         trade, "protection_replacement_rejected",
                         {"stop_loss": current_sl, "take_profit": current_tp},
                         {"stop_loss": new_sl, "take_profit": new_tp},
-                        reason="time-range tightening", source_module="strategy.engine",
+                        reason=f"time-range tightening stage {stage}", source_module="strategy.engine",
                         success=False, raw_status=resp,
                     )
                     logger.error(
@@ -575,7 +593,7 @@ class StrategyEngine:
                         symbol, current_sl, applied_sl, current_tp, applied_tp,
                     )
                     continue
-                if not self.journal.mark_range_tightened(
+                if not mark_tightened(
                     trade["order_link_id"], applied_sl, applied_tp
                 ):
                     logger.error(
@@ -587,13 +605,13 @@ class StrategyEngine:
                     trade, "protection_tightened",
                     {"stop_loss": current_sl, "take_profit": current_tp},
                     {"stop_loss": applied_sl, "take_profit": applied_tp},
-                    reason="time-range tightening", source_module="strategy.engine",
+                    reason=f"time-range tightening stage {stage}", source_module="strategy.engine",
                     success=True, raw_status=resp,
                 )
                 logger.info(
-                    "%s: time-based диапазон сужен один раз после %.1f мин: "
+                    "%s: time-based диапазон сужен, этап %s после %.1f мин: "
                     "SL %s -> %s, TP %s -> %s, factor=%s",
-                    symbol, age_seconds / 60, current_sl, applied_sl,
+                    symbol, stage, age_seconds / 60, current_sl, applied_sl,
                     current_tp, applied_tp, factor,
                 )
             except Exception:

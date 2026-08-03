@@ -60,7 +60,9 @@ CONFIG_ENV_NAMES = (
     "MAX_OPEN_INTEREST_AGE_MINUTES", "MAX_TRADE_FLOW_AGE_SECONDS",
     "MAX_SAME_DIRECTION_PER_GROUP", "TRAILING_STOP_ENABLED", "TRAILING_ACTIVATION_PCT",
     "TRAILING_DISTANCE_PCT", "TIME_RANGE_TIGHTENING_ENABLED",
-    "TIME_RANGE_TIGHTENING_AFTER_SECONDS", "TIME_RANGE_TIGHTENING_FACTOR", "LOG_LEVEL",
+    "TIME_RANGE_TIGHTENING_AFTER_SECONDS", "TIME_RANGE_TIGHTENING_FACTOR",
+    "TIME_RANGE_SECOND_TIGHTENING_AFTER_SECONDS", "TIME_RANGE_SECOND_TIGHTENING_FACTOR",
+    "LOG_LEVEL",
     "TELEMETRY_ACCOUNT_INTERVAL_SEC", "TELEMETRY_POSITION_INTERVAL_SEC",
     "STRATEGY_VERSION", "RAILWAY_ENVIRONMENT_NAME", "RAILWAY_SERVICE_NAME",
     "RAILWAY_DEPLOYMENT_ID", "RAILWAY_REPLICA_ID",
@@ -80,6 +82,7 @@ EXIT_KEYS = {
     "default_stop_loss_pct", "default_take_profit_rr", "trailing_stop_enabled",
     "trailing_activation_pct", "trailing_distance_pct", "time_range_tightening_enabled",
     "time_range_tightening_after_seconds", "time_range_tightening_factor",
+    "time_range_second_tightening_after_seconds", "time_range_second_tightening_factor",
 }
 FILTER_KEYS = {
     "max_volatility_atr_pct", "max_spread_pct", "max_long_funding_rate",

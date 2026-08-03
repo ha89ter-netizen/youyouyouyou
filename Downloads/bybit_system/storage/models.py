@@ -63,6 +63,9 @@ class TradeLog(Base):
     range_tightened_at = Column(DateTime(timezone=True), nullable=True)
     tightened_stop_loss_price = Column(Numeric, nullable=True)
     tightened_take_profit_price = Column(Numeric, nullable=True)
+    range_second_tightened_at = Column(DateTime(timezone=True), nullable=True)
+    second_tightened_stop_loss_price = Column(Numeric, nullable=True)
+    second_tightened_take_profit_price = Column(Numeric, nullable=True)
     entry_fee_usdt = Column(Numeric, nullable=True)
 
     exit_price = Column(Numeric, nullable=True)

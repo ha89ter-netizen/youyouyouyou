@@ -16,6 +16,7 @@ def _symbols_from_env() -> List[str]:
     if raw:
         return [s.strip().upper() for s in raw.split(",") if s.strip()]
     return [
+        "BTCUSDT",
         "ETHUSDT",
         "SOLUSDT",
         "BNBUSDT",
@@ -35,6 +36,16 @@ def _symbols_from_env() -> List[str]:
         "ATOMUSDT",
         "APTUSDT",
         "1000PEPEUSDT",
+        "HYPEUSDT",
+        "XMRUSDT",
+        "XLMUSDT",
+        "SHIB1000USDT",
+        "CROUSDT",
+        "NEARUSDT",
+        "TAOUSDT",
+        "ONDOUSDT",
+        "AAVEUSDT",
+        "MNTUSDT",
     ]
 
 
@@ -153,11 +164,11 @@ class BybitConfig:
     )
 
     max_open_positions: int = int(
-        os.getenv("MAX_OPEN_POSITIONS", "5")
+        os.getenv("MAX_OPEN_POSITIONS", "10")
     )
 
     max_daily_trades: int = int(
-        os.getenv("MAX_DAILY_TRADES", "50")
+        os.getenv("MAX_DAILY_TRADES", "200")
     )
 
     max_trades_per_symbol: int = int(
@@ -260,9 +271,8 @@ class BybitConfig:
         os.getenv("TRAILING_DISTANCE_PCT", "0.8")
     )
 
-    # Однократное сужение оставшегося диапазона защиты для затянувшейся
-    # позиции. Значения зафиксированы явно по подтверждённому оператором
-    # правилу; это не адаптивная настройка стратегии.
+    # Два последовательных сужения оставшегося диапазона защиты для
+    # затянувшейся позиции. Каждый этап хранится в БД и применяется ровно раз.
     time_range_tightening_enabled: bool = (
         os.getenv("TIME_RANGE_TIGHTENING_ENABLED", "true").lower() == "true"
     )
@@ -273,6 +283,14 @@ class BybitConfig:
 
     time_range_tightening_factor: float = float(
         os.getenv("TIME_RANGE_TIGHTENING_FACTOR", "0.5")
+    )
+
+    time_range_second_tightening_after_seconds: int = int(
+        os.getenv("TIME_RANGE_SECOND_TIGHTENING_AFTER_SECONDS", "18000")
+    )
+
+    time_range_second_tightening_factor: float = float(
+        os.getenv("TIME_RANGE_SECOND_TIGHTENING_FACTOR", "0.5")
     )
 
     # ==========================================================

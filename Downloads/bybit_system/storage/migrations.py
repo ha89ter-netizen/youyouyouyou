@@ -9,8 +9,8 @@ from storage.models import (
 
 logger = logging.getLogger(__name__)
 
-DATABASE_SCHEMA_VERSION = "telemetry-v2"
-MIGRATION_VERSION = "2026-08-01-cross-run-attribution-v2"
+DATABASE_SCHEMA_VERSION = "telemetry-v3"
+MIGRATION_VERSION = "2026-08-03-second-time-tightening-v1"
 
 
 TELEMETRY_ATTRIBUTION_COLUMNS: Dict[str, Dict[str, str]] = {
@@ -77,6 +77,9 @@ TRADE_LOG_ANALYTICS_COLUMNS: Dict[str, str] = {
     "range_tightened_at": "TIMESTAMP WITH TIME ZONE",
     "tightened_stop_loss_price": "NUMERIC",
     "tightened_take_profit_price": "NUMERIC",
+    "range_second_tightened_at": "TIMESTAMP WITH TIME ZONE",
+    "second_tightened_stop_loss_price": "NUMERIC",
+    "second_tightened_take_profit_price": "NUMERIC",
     "entry_fee_usdt": "NUMERIC",
     "exit_fee_usdt": "NUMERIC",
     "total_fee_usdt": "NUMERIC",

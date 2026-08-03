@@ -415,6 +415,15 @@ class TradeJournal:
                 float(r.tightened_take_profit_price)
                 if r.tightened_take_profit_price is not None else None
             ),
+            "range_second_tightened_at": ensure_aware_utc(r.range_second_tightened_at),
+            "second_tightened_stop_loss_price": (
+                float(r.second_tightened_stop_loss_price)
+                if r.second_tightened_stop_loss_price is not None else None
+            ),
+            "second_tightened_take_profit_price": (
+                float(r.second_tightened_take_profit_price)
+                if r.second_tightened_take_profit_price is not None else None
+            ),
             "source": r.source,
             "status": r.status,
             "opened_at": ensure_aware_utc(r.opened_at),
@@ -541,6 +550,47 @@ class TradeJournal:
             return True
         except Exception:
             logger.exception("Не удалось сохранить сужение защиты для %s", order_link_id)
+            session.rollback()
+            return False
+        finally:
+            session.close()
+
+    def mark_range_second_tightened(
+        self,
+        order_link_id: str,
+        stop_loss_price: float,
+        take_profit_price: float,
+    ) -> bool:
+        """Идемпотентно фиксирует второй этап сужения защиты."""
+        session = self.db.get_session()
+        try:
+            row = session.query(TradeLog).filter(
+                TradeLog.order_link_id == order_link_id,
+                TradeLog.status == "open",
+            ).first()
+            if row is None:
+                logger.warning(
+                    "Журнал: открытая сделка %s не найдена для второго сужения",
+                    order_link_id,
+                )
+                return False
+            if row.range_tightened_at is None or row.range_second_tightened_at is not None:
+                return False
+            row.range_second_tightened_at = utcnow()
+            row.second_tightened_stop_loss_price = safe_float(
+                stop_loss_price, "second_tightened_stop_loss_price"
+            )
+            row.second_tightened_take_profit_price = safe_float(
+                take_profit_price, "second_tightened_take_profit_price"
+            )
+            session.commit()
+            logger.info(
+                "Журнал: второй этап сужения защиты %s сохранён (SL=%s TP=%s)",
+                order_link_id, stop_loss_price, take_profit_price,
+            )
+            return True
+        except Exception:
+            logger.exception("Не удалось сохранить второй этап сужения для %s", order_link_id)
             session.rollback()
             return False
         finally:
