@@ -102,6 +102,7 @@ BYBIT_TESTNET=true
 BYBIT_API_KEY=<отдельный Testnet key>
 BYBIT_API_SECRET=<отдельный Testnet secret>
 DATABASE_URL=${{Postgres.DATABASE_URL}}
+STORAGE_MAX_DATABASE_BYTES=<PostgreSQL volume quota in bytes>
 RAILWAY_DEPLOYMENT_DRAINING_SECONDS=30
 ```
 
@@ -124,14 +125,60 @@ changing trading behaviour:
 TELEMETRY_ACCOUNT_INTERVAL_SEC=60
 TELEMETRY_POSITION_INTERVAL_SEC=30
 STRATEGY_VERSION=frozen-current
+STORAGE_ENTRY_BLOCK_RATIO=0.85
+TELEMETRY_OUTBOX_DELIVERED_RETENTION_HOURS=24
+TELEMETRY_OUTBOX_CLEANUP_BATCH_SIZE=1000
+TELEMETRY_OUTBOX_CLEANUP_MAX_BATCHES=10
+HEALTH_EVENT_DEDUP_WINDOW_SECONDS=60
+HEALTH_CONDITION_REMINDER_SECONDS=900
+POSITION_CLOSE_VISIBILITY_GRACE_SECONDS=120
+RAW_TRADES_RETENTION_HOURS=168
+ORDERBOOK_RETENTION_HOURS=168
+LIQUIDATIONS_RETENTION_HOURS=720
+WS_RECONNECT_INITIAL_SECONDS=5
+WS_RECONNECT_MAX_SECONDS=60
+WS_RECONNECT_JITTER_RATIO=0.20
+WS_RECONNECT_STABLE_RESET_SECONDS=120
+WS_RECONNECT_RESTART_AFTER_SECONDS=900
+COLLECTOR_RESTART_INITIAL_SECONDS=5
+COLLECTOR_RESTART_MAX_SECONDS=60
+COLLECTOR_RESTART_STABLE_RESET_SECONDS=300
+PROTECTIVE_TRIGGER_BY=LastPrice
+SLIPPAGE_ELEVATED_PCT=0.25
+SLIPPAGE_ANOMALOUS_PCT=1.0
+SLIPPAGE_ELEVATED_R=0.25
+SLIPPAGE_ANOMALOUS_R=0.75
+MAX_REALIZED_LOSS_R=1.5
 ```
+
+`PROTECTIVE_TRIGGER_BY` supports only `LastPrice` and `MarkPrice`. The default
+remains `LastPrice` to preserve the frozen run behaviour; changing it affects
+real exchange triggering and therefore requires a separately approved smoke
+test. An anomalous protective trigger-to-fill result creates a durable sticky
+circuit-breaker cause: new entries stop, while existing positions and their
+exchange-native protection continue to be managed.
+
+`MAX_REALIZED_LOSS_R` is an execution safety envelope, not an SL distance. An
+exchange-confirmed result at or below the configured negative R limit creates
+a durable sticky breaker for future entries regardless of exit mechanism.
+It does not change, cancel, or recreate protection on existing positions. A
+market protective order still cannot guarantee its eventual fill price.
+
+Local `python -u live_run.py start` and Railway `python -u live_run.py run` now
+use the same restart-capable supervisor. If the collector exhausts its internal
+WebSocket recovery budget, it is recreated with bounded process-level backoff;
+the trader keeps managing existing positions and remains fail-closed for new
+entries while market data is stale.
 
 These values affect observation cadence/identification only. The resolved
 values are included in immutable run metadata and any later change creates a
 new policy epoch.
 
 `DATABASE_URL` обязан указывать на внешний PostgreSQL: Railway-режим отвергает
-отсутствующее значение, SQLite и localhost. `RAILWAY_GIT_COMMIT_SHA`
+отсутствующее значение, SQLite и localhost. `STORAGE_MAX_DATABASE_BYTES`
+обязан соответствовать реальной квоте Railway volume; при недоступной БД или
+достижении 85% этой квоты новые входы блокируются, но открытые позиции продолжают
+управляться. `RAILWAY_GIT_COMMIT_SHA`
 предоставляется Railway автоматически; при другом способе сборки задайте
 `COMMIT_SHA` явно. `OPENAI_API_KEY` нужен только если текущая конфигурация
 использует OpenAI-анализ. 30-секундный draining window даёт collector время

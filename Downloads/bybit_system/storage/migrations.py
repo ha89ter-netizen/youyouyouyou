@@ -4,13 +4,14 @@ from typing import Dict
 from sqlalchemy import inspect, text
 
 from storage.models import (
-    Base, RiskState, RunMetadata, TradeClosure, TradeExchangeOrder, TradeExpertVote,
+    Base, EntryIntent, NormalizedExecution, ReconciliationAnomaly, RiskState,
+    RunMetadata, TelemetryOutbox, TradeClosure, TradeExchangeOrder, TradeExpertVote,
 )
 
 logger = logging.getLogger(__name__)
 
-DATABASE_SCHEMA_VERSION = "telemetry-v3"
-MIGRATION_VERSION = "2026-08-03-second-time-tightening-v1"
+DATABASE_SCHEMA_VERSION = "telemetry-v5-protective-execution"
+MIGRATION_VERSION = "2026-08-19-reconnect-slippage-breakeven-v1"
 
 
 TELEMETRY_ATTRIBUTION_COLUMNS: Dict[str, Dict[str, str]] = {
@@ -22,6 +23,35 @@ TELEMETRY_ATTRIBUTION_COLUMNS: Dict[str, Dict[str, str]] = {
     "trade_protection_events": {"processing_run_id": "VARCHAR(100)"},
     "trade_exit_events": {"processing_run_id": "VARCHAR(100)"},
 }
+
+TRADE_EXIT_SLIPPAGE_COLUMNS: Dict[str, str] = {
+    "intended_trigger_price": "NUMERIC",
+    "trigger_source": "VARCHAR(20)",
+    "price_near_trigger": "NUMERIC",
+    "mark_price_near_trigger": "NUMERIC",
+    "last_price_near_trigger": "NUMERIC",
+    "actual_fill_price": "NUMERIC",
+    "slippage_absolute": "NUMERIC",
+    "slippage_pct": "NUMERIC",
+    "slippage_r": "NUMERIC",
+    "slippage_classification": "VARCHAR(20)",
+    "trigger_at": "TIMESTAMP WITH TIME ZONE",
+    "fill_at": "TIMESTAMP WITH TIME ZONE",
+    "protective_execution_id": "VARCHAR(100)",
+}
+
+
+def ensure_trade_exit_slippage_columns(engine) -> None:
+    inspector = inspect(engine)
+    if not inspector.has_table("trade_exit_events"):
+        return
+    existing = {column["name"] for column in inspector.get_columns("trade_exit_events")}
+    with engine.begin() as conn:
+        for name, sql_type in TRADE_EXIT_SLIPPAGE_COLUMNS.items():
+            if name in existing:
+                continue
+            clause = " ADD COLUMN IF NOT EXISTS " if engine.dialect.name == "postgresql" else " ADD COLUMN "
+            conn.execute(text(f"ALTER TABLE trade_exit_events{clause}{name} {sql_type}"))
 
 
 def ensure_telemetry_attribution_columns(engine) -> None:
@@ -136,6 +166,33 @@ def ensure_run_metadata_table(engine) -> None:
 def ensure_trade_exchange_evidence_tables(engine) -> None:
     TradeClosure.__table__.create(bind=engine, checkfirst=True)
     TradeExchangeOrder.__table__.create(bind=engine, checkfirst=True)
+    NormalizedExecution.__table__.create(bind=engine, checkfirst=True)
+    ReconciliationAnomaly.__table__.create(bind=engine, checkfirst=True)
+
+
+def ensure_durability_tables(engine) -> None:
+    TelemetryOutbox.__table__.create(bind=engine, checkfirst=True)
+    EntryIntent.__table__.create(bind=engine, checkfirst=True)
+    inspector = inspect(engine)
+    if inspector.has_table("entry_intents"):
+        existing = {column["name"] for column in inspector.get_columns("entry_intents")}
+        if "rejected_at" not in existing:
+            clause = " ADD COLUMN IF NOT EXISTS " if engine.dialect.name == "postgresql" else " ADD COLUMN "
+            with engine.begin() as conn:
+                conn.execute(text(
+                    f"ALTER TABLE entry_intents{clause}rejected_at TIMESTAMP WITH TIME ZONE"
+                ))
+
+
+def widen_exit_reason(engine) -> None:
+    """Preserve complete sanitized reasons; SQLite already treats VARCHAR as TEXT."""
+    inspector = inspect(engine)
+    if engine.dialect.name != "postgresql" or not inspector.has_table("trade_exit_events"):
+        return
+    with engine.begin() as conn:
+        conn.execute(text(
+            "ALTER TABLE trade_exit_events ALTER COLUMN requested_exit_reason TYPE TEXT"
+        ))
 
 
 RISK_STATE_COLUMNS: Dict[str, str] = {
@@ -199,9 +256,15 @@ def ensure_analytics_indexes(engine) -> None:
         "CREATE INDEX IF NOT EXISTS ix_trade_protection_events_processing_run ON trade_protection_events (processing_run_id, observed_at)",
         "CREATE INDEX IF NOT EXISTS ix_trade_exit_events_run_time ON trade_exit_events (run_id, observed_at)",
         "CREATE INDEX IF NOT EXISTS ix_trade_exit_events_processing_run ON trade_exit_events (processing_run_id, observed_at)",
+        "CREATE INDEX IF NOT EXISTS ix_trade_exit_events_slippage_class ON trade_exit_events (run_id, slippage_classification)",
         "CREATE INDEX IF NOT EXISTS ix_decision_events_run_time ON decision_events (run_id, observed_at)",
         "CREATE INDEX IF NOT EXISTS ix_rejection_events_run_time ON rejection_events (run_id, observed_at)",
         "CREATE INDEX IF NOT EXISTS ix_operational_health_events_run_time ON operational_health_events (run_id, observed_at)",
+        "CREATE INDEX IF NOT EXISTS ix_telemetry_outbox_pending ON telemetry_outbox (status, next_attempt_at)",
+        "CREATE INDEX IF NOT EXISTS ix_telemetry_outbox_delivered ON telemetry_outbox (status, delivered_at)",
+        "CREATE INDEX IF NOT EXISTS ix_entry_intents_run_state ON entry_intents (run_id, state)",
+        "CREATE INDEX IF NOT EXISTS ix_normalized_executions_trade_time ON normalized_executions (trade_log_id, execution_time)",
+        "CREATE INDEX IF NOT EXISTS ix_reconciliation_anomalies_run_time ON reconciliation_anomalies (run_id, observed_at)",
     ]
     inspector = inspect(engine)
     if not inspector.has_table("trade_log") or not inspector.has_table("trade_expert_votes"):
@@ -221,5 +284,8 @@ def run_safe_migrations(engine) -> None:
     ensure_risk_state_table(engine)
     ensure_run_metadata_table(engine)
     ensure_trade_exchange_evidence_tables(engine)
+    ensure_durability_tables(engine)
+    widen_exit_reason(engine)
+    ensure_trade_exit_slippage_columns(engine)
     ensure_telemetry_attribution_columns(engine)
     ensure_analytics_indexes(engine)

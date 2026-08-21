@@ -23,6 +23,7 @@ from logging_config import configure_app_logging
 from storage.migrations import run_safe_migrations
 from storage.db import Database
 from storage.telemetry import TelemetryStore
+from storage.durability import StorageGuard, apply_high_frequency_retention
 from strategy.engine import StrategyEngine
 from runtime_control import RuntimeService
 
@@ -53,6 +54,10 @@ def main():
         logger.error("БД недоступна. Запустите docker compose up -d и python -m storage.init_db")
         return
     run_safe_migrations(db.engine)
+    apply_high_frequency_retention(db.engine, cfg)
+    storage = StorageGuard(db, cfg).status()
+    if not storage["entry_allowed"]:
+        logger.warning("Новые входы будут заблокированы storage guard: %s", storage["reason"])
     telemetry = TelemetryStore(db, cfg)
     runtime = RuntimeService(
         db, cfg.run_id, "trader",

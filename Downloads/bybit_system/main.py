@@ -13,6 +13,7 @@ import os
 import signal
 import socket
 import time
+from typing import Optional
 
 from config.settings import BybitConfig
 from data.rest_client import BybitRestClient
@@ -21,11 +22,85 @@ from data.ws_client import BybitPublicStream
 from storage.db import Database
 from storage.repository import MarketDataStore
 from storage.migrations import run_safe_migrations
+from storage.durability import apply_high_frequency_retention
 from storage.telemetry import TelemetryStore
 from runtime_control import RuntimeService
+from runtime_resilience import ReconnectBackoff, RecoveryLoop
 
 configure_app_logging("main", "main.log")
 logger = logging.getLogger("main")
+
+
+def _interval_milliseconds(interval: str) -> Optional[int]:
+    """Return fixed candle width for minute-based Bybit intervals."""
+    try:
+        minutes = int(interval)
+    except (TypeError, ValueError):
+        return None
+    return minutes * 60_000 if minutes > 0 else None
+
+
+def _closed_klines(rows, interval: str, now_ms: Optional[int] = None):
+    """Exclude the currently forming REST candle from durable strategy data."""
+    width = _interval_milliseconds(interval)
+    if width is None:
+        return list(rows)
+    cutoff = int(now_ms if now_ms is not None else time.time() * 1000)
+    result = []
+    for row in rows:
+        try:
+            if int(row["start"]) + width <= cutoff:
+                result.append(row)
+        except (KeyError, TypeError, ValueError):
+            continue
+    return result
+
+
+def _repair_closed_klines(cfg, store, rest, telemetry, *, now_ms=None) -> int:
+    """REST backfill closed candles when individual WS topics silently stall."""
+    repaired = 0
+    cutoff_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+    width = _interval_milliseconds(cfg.primary_interval)
+    for symbol in cfg.symbols:
+        try:
+            latest = None
+            latest_reader = getattr(store, "latest_candle_start", None)
+            if callable(latest_reader):
+                candidate = latest_reader(symbol, cfg.primary_interval)
+                if isinstance(candidate, (int, float)):
+                    latest = int(candidate)
+            missing = (
+                max(1, int((cutoff_ms - latest) / width) + 2)
+                if latest is not None and width else 3
+            )
+            limit = min(1000, max(3, missing))
+            rows = rest.get_klines(
+                symbol, interval=cfg.primary_interval, limit=limit,
+                start=latest if latest is not None else None,
+                end=cutoff_ms,
+            )
+            closed = _closed_klines(rows, cfg.primary_interval, now_ms=cutoff_ms)
+            if closed:
+                store.save_historical_klines(symbol, cfg.primary_interval, closed)
+                repaired += 1
+        except Exception as exc:
+            telemetry.record_health(
+                "market_collector",
+                "dns_failure" if _is_dns_failure(exc) else "candle_rest_repair_failure",
+                "error", "degraded", symbol=symbol, error=exc,
+                details={"new_entries_use_stale_data": False},
+            )
+            if _is_dns_failure(exc):
+                break
+    if repaired:
+        telemetry.record_health(
+            "market_collector", "candle_rest_repair", "info", "recovered",
+            details={
+                "symbols_repaired": repaired, "closed_candles_only": True,
+                "rest_does_not_restore_orderbook_or_trade_flow_health": True,
+            },
+        )
+    return repaired
 
 
 class _PybitTelemetryHandler(logging.Handler):
@@ -116,6 +191,8 @@ def main():
         )
         return
     run_safe_migrations(db.engine)
+    deleted = apply_high_frequency_retention(db.engine, cfg)
+    logger.info("High-frequency retention applied: %s", deleted)
     telemetry = TelemetryStore(db, cfg)
     pybit_logger = logging.getLogger("pybit._websocket_stream")
     pybit_telemetry_handler = _PybitTelemetryHandler(telemetry)
@@ -136,7 +213,10 @@ def main():
     rest = BybitRestClient(cfg)
     try:
         for symbol in cfg.symbols:
-            klines = rest.get_klines(symbol, interval=cfg.primary_interval, limit=210)
+            klines = _closed_klines(
+                rest.get_klines(symbol, interval=cfg.primary_interval, limit=210),
+                cfg.primary_interval,
+            )
             store.save_historical_klines(symbol, cfg.primary_interval, klines)
 
             funding_history = rest.get_funding_rate_history(symbol, limit=200)
@@ -162,15 +242,74 @@ def main():
         raise
 
     # --- 2. WebSocket: живой поток пишем через store, буферизация внутри ---
-    stream = _start_public_stream(cfg, store, telemetry)
     ws_stale_timeout = max(
         30.0,
         float(os.getenv("WS_STALE_TIMEOUT_SECONDS", "120")),
     )
-    ws_reconnect_delay = max(
-        1.0,
-        float(os.getenv("WS_RECONNECT_DELAY_SECONDS", "5")),
+    rest_repair_interval = max(
+        60.0,
+        float(os.getenv("CANDLE_REST_REPAIR_INTERVAL_SECONDS", "300")),
     )
+    last_rest_repair = time.monotonic()
+    reconnect = ReconnectBackoff(
+        initial_seconds=cfg.ws_reconnect_initial_seconds,
+        maximum_seconds=cfg.ws_reconnect_max_seconds,
+        jitter_ratio=cfg.ws_reconnect_jitter_ratio,
+        stable_reset_seconds=cfg.ws_reconnect_stable_reset_seconds,
+        restart_after_seconds=cfg.ws_reconnect_restart_after_seconds,
+    )
+    recovery_wait = RecoveryLoop()
+
+    def repair_if_due(force=False):
+        nonlocal last_rest_repair
+        now = time.monotonic()
+        if force or now - last_rest_repair >= rest_repair_interval:
+            last_rest_repair = now
+            _repair_closed_klines(cfg, store, rest, telemetry)
+
+    def connect_public_stream(*, reconnecting: bool):
+        """Create one pybit transport at a time under our bounded backoff."""
+        while True:
+            try:
+                connected_stream = _start_public_stream(cfg, store, telemetry)
+                reconnect.connected()
+                if reconnecting:
+                    telemetry.record_health(
+                        "market_collector", "websocket_reconnect", "info", "recovered"
+                    )
+                    logger.info("WS watchdog: WebSocket и подписки восстановлены")
+                return connected_stream
+            except Exception as exc:
+                delay = reconnect.failure_delay()
+                telemetry.record_health(
+                    "market_collector",
+                    "websocket_reconnect_failure" if reconnecting else "websocket_connect_failure",
+                    "error", "failed", error=exc, details={
+                        "attempt": reconnect.failures,
+                        "next_delay_seconds": delay,
+                        "restart_after_seconds": reconnect.restart_after_seconds,
+                        "pybit_internal_reconnect_disabled": True,
+                    },
+                )
+                logger.exception(
+                    "WS %s не удалось; повтор через %.1fs",
+                    "переподключение" if reconnecting else "подключение", delay,
+                )
+                if reconnect.restart_required():
+                    telemetry.record_health(
+                        "market_collector", "collector_restart_required",
+                        "critical", "failed", error=exc,
+                        details={"degraded_seconds": reconnect.restart_after_seconds},
+                    )
+                    raise RuntimeError(
+                        "public WebSocket recovery budget exhausted; supervisor restart required"
+                    ) from exc
+                recovery_wait.wait(
+                    delay, repair_interval=rest_repair_interval,
+                    repair=repair_if_due,
+                )
+
+    stream = connect_public_stream(reconnecting=False)
 
     logger.info(
         "Поток запущен, данные пишутся в БД; WS watchdog=%.0fs. Ctrl+C для остановки.",
@@ -184,8 +323,18 @@ def main():
     try:
         while True:
             time.sleep(1)
+            now = time.monotonic()
+            repair_if_due()
             age = stream.seconds_since_message()
             if age <= ws_stale_timeout:
+                if stream.has_received_message():
+                    reconnect.connected()
+                    if reconnect.maybe_reset_after_stable():
+                        telemetry.record_health(
+                            "market_collector", "websocket_reconnect_backoff_reset",
+                            "info", "recovered",
+                            details={"stable_seconds": cfg.ws_reconnect_stable_reset_seconds},
+                        )
                 continue
 
             logger.error(
@@ -199,24 +348,8 @@ def main():
                 data_age_seconds=age, details={"timeout_seconds": ws_stale_timeout},
             )
             stream.close()
-            while True:
-                try:
-                    stream = _start_public_stream(cfg, store, telemetry)
-                    telemetry.record_health(
-                        "market_collector", "websocket_reconnect", "info", "recovered"
-                    )
-                    logger.info("WS watchdog: WebSocket и подписки восстановлены")
-                    break
-                except Exception as exc:
-                    telemetry.record_health(
-                        "market_collector", "websocket_reconnect_failure", "error", "failed",
-                        error=exc,
-                    )
-                    logger.exception(
-                        "WS watchdog: переподключение не удалось; повтор через %.1fs",
-                        ws_reconnect_delay,
-                    )
-                    time.sleep(ws_reconnect_delay)
+            stream = connect_public_stream(reconnecting=True)
+            repair_if_due(force=True)
     except KeyboardInterrupt:
         logger.info("Останавливаюсь, сбрасываю буферы в БД...")
     finally:

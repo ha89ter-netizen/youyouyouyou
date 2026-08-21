@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import tempfile
 import unittest
@@ -20,6 +21,25 @@ from timeutils import utc_day_str, utcnow
 
 
 class LiveRunInfrastructureTest(unittest.TestCase):
+    def test_live_run_has_module_logger_for_preflight_diagnostics(self):
+        self.assertIsInstance(live_run.logger, logging.Logger)
+
+    def test_service_info_returns_dict_for_missing_invalid_and_valid_files(self):
+        old_dir = live_run.RUNTIME_DIR
+        runtime_dir = Path(self.tmp.name) / "service-info-runtime"
+        runtime_dir.mkdir()
+        live_run.RUNTIME_DIR = runtime_dir
+        try:
+            self.assertEqual(live_run._service_info("supervisor"), {})
+            (runtime_dir / "supervisor.json").write_text("null", encoding="utf-8")
+            self.assertEqual(live_run._service_info("supervisor"), {})
+            (runtime_dir / "supervisor.json").write_text(
+                json.dumps({"pid": 123}), encoding="utf-8"
+            )
+            self.assertEqual(live_run._service_info("supervisor"), {"pid": 123})
+        finally:
+            live_run.RUNTIME_DIR = old_dir
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         db_path = Path(self.tmp.name) / "test.db"
@@ -223,7 +243,7 @@ class LiveRunInfrastructureTest(unittest.TestCase):
 
         session.close.assert_called_once()
 
-    def test_collector_wait_ignores_stale_pid_for_same_resumed_run(self):
+    def test_collector_wait_requires_new_pid_not_stale_resumed_pid(self):
         now = 1_800_000_000.0
         session = Mock()
         run_query = Mock()
@@ -243,12 +263,72 @@ class LiveRunInfrastructureTest(unittest.TestCase):
             "_service_info",
             return_value={"run_id": "resumed-run", "pid": 111},
         ), patch.object(live_run, "_process_alive", return_value=False), patch.object(
+            live_run.time, "time", side_effect=[now, now, now, now + 2]
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Market data did not become fresh"):
+                live_run._wait_for_collector(
+                    db, "resumed-run", timeout=1, expected_pid=222
+                )
+
+        session.close.assert_called_once()
+
+    def test_collector_restart_policy_is_bounded_and_resets_after_stability(self):
+        clock = [0.0]
+        policy = live_run.CollectorRestartPolicy(
+            initial_seconds=2, maximum_seconds=10, stable_reset_seconds=30,
+            monotonic_fn=lambda: clock[0],
+        )
+        policy.started()
+        self.assertEqual(policy.failure_delay(), 2)
+        policy.started(); self.assertEqual(policy.failure_delay(), 4)
+        policy.started(); self.assertEqual(policy.failure_delay(), 8)
+        policy.started(); self.assertEqual(policy.failure_delay(), 10)
+        clock[0] = 31
+        policy.started_at = 0
+        self.assertEqual(policy.failure_delay(), 2)
+
+    def test_collector_process_is_recreated_until_fresh(self):
+        first = Mock(pid=101); first.poll.return_value = 75
+        second = Mock(pid=202); second.poll.return_value = None
+        cfg = Mock(max_candle_age_minutes=45)
+        telemetry = Mock()
+        policy = live_run.CollectorRestartPolicy(
+            initial_seconds=1, maximum_seconds=4, stable_reset_seconds=30,
+        )
+        with patch.object(
+            live_run, "_spawn_process", side_effect=[first, second]
+        ) as spawn, patch.object(
+            live_run, "_wait_for_collector",
+            side_effect=[RuntimeError("collector exited"), None],
+        ), patch.object(live_run.time, "sleep") as sleep:
+            result = live_run._start_collector_with_recovery(
+                Mock(), cfg, "run", "sha", telemetry, policy,
+            )
+        self.assertIs(result, second)
+        self.assertEqual(spawn.call_count, 2)
+        sleep.assert_called_once_with(1)
+        event_types = [call.args[1] for call in telemetry.record_health.call_args_list]
+        self.assertEqual(event_types, [
+            "collector_process_restart_failed", "collector_process_recovered",
+        ])
+
+    def test_collector_readiness_accepts_closed_15m_candle_by_configured_age(self):
+        now = 1_800_000_000.0
+        session = Mock()
+        run_query = Mock()
+        run_query.filter_by.return_value.first.return_value = Mock(
+            collector_heartbeat_at=utcnow()
+        )
+        candle_query = Mock(); candle_query.scalar.return_value = int((now - 30 * 60) * 1000)
+        book_query = Mock(); book_query.scalar.return_value = int(now * 1000)
+        session.query.side_effect = [run_query, candle_query, book_query]
+        db = Mock(); db.get_session.return_value = session
+        with patch.object(live_run, "_service_info", return_value={}), patch.object(
             live_run.time, "time", return_value=now
         ):
             live_run._wait_for_collector(
-                db, "resumed-run", timeout=1, expected_pid=222
+                db, "current-run", timeout=1, max_candle_age_minutes=45
             )
-
         session.close.assert_called_once()
 
     def test_collector_wait_rejects_expected_new_pid_when_it_exits(self):
@@ -292,6 +372,20 @@ class LiveRunInfrastructureTest(unittest.TestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "localhost"):
                 live_run._validate_runtime_config(localhost)
+
+    def test_railway_requires_explicit_database_capacity_guard(self):
+        cfg = BybitConfig(
+            runtime_mode="railway",
+            db_url="postgresql://user:pass@postgres.internal:5432/bybit",
+        )
+        with patch.dict(os.environ, {"DATABASE_URL": cfg.db_url}, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "STORAGE_MAX_DATABASE_BYTES is required"):
+                live_run._validate_runtime_config(cfg)
+        with patch.dict(os.environ, {
+            "DATABASE_URL": cfg.db_url,
+            "STORAGE_MAX_DATABASE_BYTES": "5000000000",
+        }, clear=True):
+            live_run._validate_runtime_config(cfg)
 
     def test_restart_recovers_run_identity_and_risk_state_from_database(self):
         session = self.db.get_session()

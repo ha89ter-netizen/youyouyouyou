@@ -57,23 +57,27 @@ def non_negative_int(value: Any, field_name: str = "") -> Optional[int]:
     return number
 
 
-def safe_json(data: Any) -> Any:
-    sanitized = _sanitize(data)
+def safe_json(data: Any, string_limit: Optional[int] = 2000) -> Any:
+    limit = None if string_limit is None else max(1, int(string_limit))
+    sanitized = _sanitize(data, string_limit=limit)
     json.dumps(sanitized, ensure_ascii=False, sort_keys=True, allow_nan=False)
     return sanitized
 
 
 def stable_json_dumps(data: Any) -> str:
-    return json.dumps(safe_json(data), ensure_ascii=False, sort_keys=True, allow_nan=False)
+    return json.dumps(
+        safe_json(data, string_limit=None),
+        ensure_ascii=False, sort_keys=True, allow_nan=False,
+    )
 
 
-def sanitize_text(value: Any, limit: int = 2000) -> Optional[str]:
+def sanitize_text(value: Any, limit: Optional[int] = 2000) -> Optional[str]:
     if value is None:
         return None
     text = str(value)
     for secret in _secrets():
         text = text.replace(secret, "***")
-    return text[:limit]
+    return text if limit is None else text[:limit]
 
 
 def pnl_pct_from_notional(pnl_usdt: Any, size_usdt: Any) -> Optional[float]:
@@ -118,7 +122,7 @@ def validate_time_order(opened_at: Optional[datetime], closed_at: Optional[datet
     return seconds
 
 
-def _sanitize(value: Any) -> Any:
+def _sanitize(value: Any, string_limit: Optional[int] = 2000) -> Any:
     if value is None or isinstance(value, (bool, int)):
         return value
     if isinstance(value, float):
@@ -130,7 +134,7 @@ def _sanitize(value: Any) -> Any:
     if isinstance(value, datetime):
         return value.isoformat()
     if isinstance(value, str):
-        return sanitize_text(value)
+        return sanitize_text(value, string_limit)
     if isinstance(value, dict):
         clean = {}
         for key, item in value.items():
@@ -138,11 +142,11 @@ def _sanitize(value: Any) -> Any:
             if _looks_sensitive_key(key_text):
                 clean[key_text] = "***"
             else:
-                clean[key_text] = _sanitize(item)
+                clean[key_text] = _sanitize(item, string_limit)
         return clean
     if isinstance(value, Iterable) and not isinstance(value, (bytes, bytearray)):
-        return [_sanitize(item) for item in value]
-    return sanitize_text(value)
+        return [_sanitize(item, string_limit) for item in value]
+    return sanitize_text(value, string_limit)
 
 
 def _looks_sensitive_key(key: str) -> bool:

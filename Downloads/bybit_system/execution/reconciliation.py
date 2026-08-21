@@ -113,6 +113,39 @@ def _strong_owner(trade: dict, record: dict, order_by_id: dict) -> bool:
     )
 
 
+def _validation_anomalies(trade: dict, record: dict, tolerance_pct: Decimal) -> list[dict]:
+    """Non-owning validation checks retained when a stable ID proves linkage."""
+    anomalies = []
+    if record.get("symbol") and record.get("symbol") != trade.get("symbol"):
+        anomalies.append({"type": "symbol_mismatch", "expected": trade.get("symbol"),
+                          "actual": record.get("symbol")})
+    expected_side = _expected_close_side(trade.get("action"))
+    if expected_side and record.get("side") and record.get("side") != expected_side:
+        anomalies.append({"type": "side_mismatch", "expected": expected_side,
+                          "actual": record.get("side")})
+    entry = _decimal(trade.get("entry_price"))
+    actual = _decimal(record.get("avgEntryPrice"))
+    if not entry or not actual or entry <= 0:
+        anomalies.append({"type": "entry_price_unavailable", "expected": str(entry),
+                          "actual": str(actual)})
+    else:
+        difference = abs(actual - entry) / entry * 100
+        if difference > tolerance_pct:
+            anomalies.append({"type": "entry_price_mismatch",
+                              "difference_pct": str(difference),
+                              "expected": str(entry), "actual": str(actual)})
+    try:
+        closed_ms = int(record.get("updatedTime") or record.get("createdTime"))
+    except (TypeError, ValueError):
+        closed_ms = None
+        anomalies.append({"type": "close_timestamp_unavailable"})
+    opened_ms = trade.get("opened_at_ms")
+    if closed_ms is not None and opened_ms is not None and closed_ms < int(opened_ms):
+        anomalies.append({"type": "close_before_internal_open",
+                          "opened_ms": int(opened_ms), "closed_ms": closed_ms})
+    return anomalies
+
+
 def _aggregate(records: list[dict]) -> dict:
     qty_total = sum((closed_qty(r) or Decimal("0")) for r in records)
     weighted_exit = sum(
@@ -156,14 +189,17 @@ def plan_closed_pnl_reconciliation(
     candidates = defaultdict(list)
     owners = defaultdict(list)
     strong_owners = defaultdict(list)
+    strong_pairs = set()
     for ti, trade in enumerate(trades):
         for ri, record in enumerate(unique_records):
-            if not _record_matches_trade(trade, record, price_tolerance):
+            strong = _strong_owner(trade, record, order_by_id)
+            if not strong and not _record_matches_trade(trade, record, price_tolerance):
                 continue
             candidates[ti].append(ri)
             owners[ri].append(ti)
-            if _strong_owner(trade, record, order_by_id):
+            if strong:
                 strong_owners[ri].append(ti)
+                strong_pairs.add((ti, ri))
 
     plan = []
     for ti, trade in enumerate(trades):
@@ -190,7 +226,8 @@ def plan_closed_pnl_reconciliation(
         if not selected:
             status = AMBIGUOUS if eligible else NOT_FOUND
             plan.append({"trade": trade, "status": status, "record": None,
-                         "note": "no uniquely owned closed-PnL record"})
+                         "note": "no uniquely owned closed-PnL record",
+                         "validation_anomalies": []})
             continue
 
         expected = _expected_qty(trade)
@@ -198,24 +235,31 @@ def plan_closed_pnl_reconciliation(
         if any(q is None for q in selected_quantities):
             if len(selected) != 1 or contested:
                 plan.append({"trade": trade, "status": AMBIGUOUS, "record": None,
-                             "note": "closed quantity unavailable for multi-record match"})
+                             "note": "closed quantity unavailable for multi-record match",
+                             "validation_anomalies": []})
                 continue
             selected_records = [unique_records[selected[0]]]
+            anomalies = sum((_validation_anomalies(trade, r, price_tolerance)
+                             for r in selected_records), [])
             plan.append({"trade": trade, "status": MATCHED,
-                         "record": _aggregate(selected_records), "note": "quantity unavailable"})
+                         "record": _aggregate(selected_records), "note": "quantity unavailable",
+                         "validation_anomalies": anomalies})
             continue
         selected_qty = sum(selected_quantities, Decimal("0"))
         if expected and expected > 0:
             qty_diff_pct = abs(selected_qty - expected) / expected * 100
-            if qty_diff_pct > qty_tolerance:
+            all_strong = all((ti, ri) in strong_pairs for ri in selected)
+            if qty_diff_pct > qty_tolerance and not all_strong:
                 plan.append({
                     "trade": trade, "status": AMBIGUOUS, "record": None,
                     "note": f"unique closed quantity {selected_qty} != filled quantity {expected}",
+                    "validation_anomalies": [],
                 })
                 continue
         elif len(selected) != 1:
             plan.append({"trade": trade, "status": AMBIGUOUS, "record": None,
-                         "note": "multiple records but filled entry quantity is unavailable"})
+                         "note": "multiple records but filled entry quantity is unavailable",
+                         "validation_anomalies": []})
             continue
 
         if contested:
@@ -223,12 +267,22 @@ def plan_closed_pnl_reconciliation(
             # belong to this trade without exceeding its exchange fill.
             if not expected or abs(selected_qty - expected) / expected * 100 > qty_tolerance:
                 plan.append({"trade": trade, "status": AMBIGUOUS, "record": None,
-                             "note": "additional contested closed-PnL records"})
+                             "note": "additional contested closed-PnL records",
+                             "validation_anomalies": []})
                 continue
         selected_records = sorted(
             (unique_records[i] for i in selected),
             key=lambda r: int(r.get("updatedTime") or r.get("createdTime") or 0),
         )
+        anomalies = sum((_validation_anomalies(trade, r, price_tolerance)
+                         for r in selected_records), [])
+        if expected and expected > 0:
+            qty_diff_pct = abs(selected_qty - expected) / expected * 100
+            if qty_diff_pct > qty_tolerance:
+                anomalies.append({"type": "quantity_mismatch",
+                                  "difference_pct": str(qty_diff_pct),
+                                  "expected": str(expected), "actual": str(selected_qty)})
         plan.append({"trade": trade, "status": MATCHED,
-                     "record": _aggregate(selected_records), "note": ""})
+                     "record": _aggregate(selected_records), "note": "",
+                     "validation_anomalies": anomalies})
     return plan

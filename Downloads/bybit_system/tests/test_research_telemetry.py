@@ -350,11 +350,11 @@ class ResearchTelemetryTest(unittest.TestCase):
         attempts = {"count": 0}
         def failing():
             attempts["count"] += 1
-            if attempts["count"] <= 3:
-                raise RuntimeError("database offline")
-            return original()
+            raise RuntimeError("database offline")
         self.db.get_session = failing
         self.assertFalse(self.store.record_health("db", "probe", "error", "failed"))
+        self.assertLessEqual(len(self.store._pending_health), 100)
+        self.db.get_session = original
         self.assertTrue(self.store.record_health("db", "recovered", "info", "ok"))
         session = original()
         kinds = {row.event_type for row in session.query(OperationalHealthEvent).all()}

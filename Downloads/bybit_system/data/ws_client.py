@@ -45,14 +45,25 @@ class BybitPublicStream:
         self.cfg = cfg
         self._on_health_event = on_health_event
         self._last_message_monotonic = time.monotonic()
+        self._message_count = 0
         self.ws = WebSocket(
             testnet=cfg.testnet,
             channel_type=cfg.ws_channel_type,
+            # pybit decrements its counter before checking whether the socket
+            # connected, so ``retries=1`` raises even after a successful first
+            # connection.  Two is the smallest usable bounded value; after at
+            # most two transport attempts our collector owns the backoff.
+            retries=2,
+            restart_on_error=False,
         )
         logger.info("Публичный WS-поток инициализирован (testnet=%s)", cfg.testnet)
 
     def _mark_activity(self):
+        self._message_count += 1
         self._last_message_monotonic = time.monotonic()
+
+    def has_received_message(self) -> bool:
+        return self._message_count > 0
 
     def seconds_since_message(self) -> float:
         """Возраст последнего полезного сообщения, включая время ожидания первого."""

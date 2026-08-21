@@ -33,7 +33,18 @@ def _upsert(session, model, rows: List[Dict[str, Any]]):
         return
     stmt = pg_insert(model).values(rows)
     pk_cols = [c.name for c in model.__table__.primary_key.columns]
-    stmt = stmt.on_conflict_do_nothing(index_elements=pk_cols)
+    if model is Candle:
+        # REST may observe the still-open candle during startup.  The final WS
+        # candle (or a later REST repair) must replace that partial OHLCV row;
+        # DO NOTHING would freeze the incomplete first observation forever.
+        stmt = stmt.on_conflict_do_update(
+            index_elements=pk_cols,
+            set_={name: getattr(stmt.excluded, name) for name in (
+                "open", "high", "low", "close", "volume", "turnover",
+            )},
+        )
+    else:
+        stmt = stmt.on_conflict_do_nothing(index_elements=pk_cols)
     session.execute(stmt)
     session.commit()
 
@@ -102,6 +113,17 @@ class MarketDataStore:
         self.liquidations = BufferedWriter(db, Liquidation, flush_interval=1.0, max_buffer=50)
         self.orderbook = BufferedWriter(db, OrderbookSnapshot, flush_interval=1.0, max_buffer=200)
         self._orderbook_registry = OrderBookRegistry()
+
+    def latest_candle_start(self, symbol: str, interval: str):
+        """Latest durable candle boundary used to size a REST gap repair."""
+        session = self.db.get_session()
+        try:
+            row = session.query(Candle.start_time).filter_by(
+                symbol=symbol, interval=str(interval)
+            ).order_by(Candle.start_time.desc()).first()
+            return int(row[0]) if row else None
+        finally:
+            session.close()
 
     # --- методы для колбэков WS (сырые сообщения Bybit) ---
 

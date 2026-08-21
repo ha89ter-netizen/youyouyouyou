@@ -101,10 +101,26 @@ class ExecutionEngine:
                 "Set ALLOW_PRODUCTION_ORDERS=true only after a manual production readiness review."
             )
         self.cfg = cfg
+        trigger_by = getattr(cfg, "protective_trigger_by", "LastPrice")
+        if trigger_by not in ("LastPrice", "MarkPrice"):
+            raise ValueError(
+                "PROTECTIVE_TRIGGER_BY must be LastPrice or MarkPrice"
+            )
+        self.protective_trigger_by = trigger_by
         self.session = HTTP(
             testnet=cfg.testnet, api_key=cfg.api_key, api_secret=cfg.api_secret
         )
         self._lot_size_cache: Dict[str, Dict[str, float]] = {}  # symbol -> {qtyStep, minOrderQty}
+
+    def _protective_trigger_source(self) -> str:
+        """Return the validated source, including legacy/test instances built via __new__."""
+        value = getattr(
+            self, "protective_trigger_by",
+            getattr(self.cfg, "protective_trigger_by", "LastPrice"),
+        )
+        if value not in ("LastPrice", "MarkPrice"):
+            raise ValueError("PROTECTIVE_TRIGGER_BY must be LastPrice or MarkPrice")
+        return value
 
     def get_account_balance_usdt(self) -> float:
         return float(self.get_account_state().get("wallet_balance") or 0)
@@ -313,6 +329,7 @@ class ExecutionEngine:
         stop_loss_pct: Optional[float] = None,
         take_profit_pct: Optional[float] = None,
         source: str = "unknown",
+        order_link_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         size_usdt — номинальный размер позиции в USDT (с учётом плеча).
@@ -330,8 +347,11 @@ class ExecutionEngine:
 
         self.set_leverage(symbol, leverage)
 
-        safe_source = re.sub(r"[^A-Za-z0-9_-]", "_", source)[:10] or "unknown"
-        order_link_id = f"{safe_source}-{uuid.uuid4().hex[:16]}"
+        if order_link_id is None:
+            safe_source = re.sub(r"[^A-Za-z0-9_-]", "_", source)[:10] or "unknown"
+            order_link_id = f"{safe_source}-{uuid.uuid4().hex[:16]}"
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,36}", order_link_id):
+            raise ValueError("order_link_id must be 1..36 safe Bybit characters")
 
         params: Dict[str, Any] = {
             "category": self.cfg.category,
@@ -345,9 +365,11 @@ class ExecutionEngine:
         if stop_loss_pct:
             sl_price = self._price_with_offset(symbol, order_price, stop_loss_pct, side, is_stop_loss=True)
             params["stopLoss"] = str(sl_price)
+            params["slTriggerBy"] = self._protective_trigger_source()
         if take_profit_pct:
             tp_price = self._price_with_offset(symbol, order_price, take_profit_pct, side, is_stop_loss=False)
             params["takeProfit"] = str(tp_price)
+            params["tpTriggerBy"] = self._protective_trigger_source()
 
         logger.info("Отправляю ордер: %s", params)
         try:
@@ -365,6 +387,7 @@ class ExecutionEngine:
         resp["local_requested_qty"] = qty
         resp["local_stop_loss_price"] = params.get("stopLoss")
         resp["local_take_profit_price"] = params.get("takeProfit")
+        resp["local_protective_trigger_by"] = self._protective_trigger_source()
         logger.info("Ответ биржи: retCode=%s retMsg=%s orderId=%s orderLinkId=%s",
                      resp.get("retCode"), resp.get("retMsg"),
                      resp.get("result", {}).get("orderId"), order_link_id)
@@ -475,10 +498,13 @@ class ExecutionEngine:
             symbol=symbol,
             stopLoss=str(stop_loss),
             takeProfit=str(take_profit),
+            slTriggerBy=self._protective_trigger_source(),
+            tpTriggerBy=self._protective_trigger_source(),
             positionIdx=0,
         )
         resp["local_stop_loss_price"] = stop_loss
         resp["local_take_profit_price"] = take_profit
+        resp["local_protective_trigger_by"] = self._protective_trigger_source()
         logger.info(
             "%s: защита обновлена SL=%s TP=%s retCode=%s retMsg=%s",
             symbol, stop_loss, take_profit, resp.get("retCode"), resp.get("retMsg"),

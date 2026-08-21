@@ -103,6 +103,25 @@ class BybitConfig:
     ws_channel_type: str = "linear"
     ping_interval: int = 20
 
+    # Collector transport recovery. These values affect process supervision
+    # and market-data availability only; they never relax entry freshness
+    # checks or alter a trading decision.
+    ws_reconnect_initial_seconds: float = float(
+        os.getenv("WS_RECONNECT_INITIAL_SECONDS", "5")
+    )
+    ws_reconnect_max_seconds: float = float(
+        os.getenv("WS_RECONNECT_MAX_SECONDS", "60")
+    )
+    ws_reconnect_jitter_ratio: float = float(
+        os.getenv("WS_RECONNECT_JITTER_RATIO", "0.20")
+    )
+    ws_reconnect_stable_reset_seconds: float = float(
+        os.getenv("WS_RECONNECT_STABLE_RESET_SECONDS", "120")
+    )
+    ws_reconnect_restart_after_seconds: float = float(
+        os.getenv("WS_RECONNECT_RESTART_AFTER_SECONDS", "900")
+    )
+
     # ==========================================================
     # ТАЙМФРЕЙМЫ
     # ==========================================================
@@ -306,4 +325,96 @@ class BybitConfig:
     )
     telemetry_position_interval_sec: int = int(
         os.getenv("TELEMETRY_POSITION_INTERVAL_SEC", "30")
+    )
+
+    # Infrastructure-only durability/capacity controls.  These never alter
+    # signal calculations, position sizing, SL/TP, or exit policy.
+    telemetry_retry_attempts: int = int(os.getenv("TELEMETRY_RETRY_ATTEMPTS", "3"))
+    telemetry_retry_base_seconds: float = float(
+        os.getenv("TELEMETRY_RETRY_BASE_SECONDS", "0.25")
+    )
+    telemetry_outbox_max_attempts: int = int(
+        os.getenv("TELEMETRY_OUTBOX_MAX_ATTEMPTS", "8")
+    )
+    telemetry_outbox_delivered_retention_hours: int = int(
+        os.getenv("TELEMETRY_OUTBOX_DELIVERED_RETENTION_HOURS", "24")
+    )
+    telemetry_outbox_cleanup_batch_size: int = int(
+        os.getenv("TELEMETRY_OUTBOX_CLEANUP_BATCH_SIZE", "1000")
+    )
+    telemetry_outbox_cleanup_max_batches: int = int(
+        os.getenv("TELEMETRY_OUTBOX_CLEANUP_MAX_BATCHES", "10")
+    )
+    health_event_dedup_window_seconds: int = int(
+        os.getenv("HEALTH_EVENT_DEDUP_WINDOW_SECONDS", "60")
+    )
+    health_condition_reminder_seconds: int = int(
+        os.getenv("HEALTH_CONDITION_REMINDER_SECONDS", "900")
+    )
+    position_close_visibility_grace_seconds: int = int(
+        os.getenv("POSITION_CLOSE_VISIBILITY_GRACE_SECONDS", "120")
+    )
+    storage_max_database_bytes: int = int(
+        os.getenv("STORAGE_MAX_DATABASE_BYTES", "0")
+    )
+    storage_entry_block_ratio: float = float(
+        os.getenv("STORAGE_ENTRY_BLOCK_RATIO", "0.85")
+    )
+    storage_monitor_interval_sec: int = int(
+        os.getenv("STORAGE_MONITOR_INTERVAL_SEC", "300")
+    )
+    raw_trades_retention_hours: int = int(
+        os.getenv("RAW_TRADES_RETENTION_HOURS", "168")
+    )
+    orderbook_retention_hours: int = int(
+        os.getenv("ORDERBOOK_RETENTION_HOURS", "168")
+    )
+    liquidations_retention_hours: int = int(
+        os.getenv("LIQUIDATIONS_RETENTION_HOURS", "720")
+    )
+    retention_delete_batch_size: int = int(
+        os.getenv("RETENTION_DELETE_BATCH_SIZE", "10000")
+    )
+    retention_max_rows_per_run: int = int(
+        os.getenv("RETENTION_MAX_ROWS_PER_RUN", "100000")
+    )
+
+    # Protective orders keep LastPrice by default for backward-compatible
+    # production/Testnet behaviour. MarkPrice is opt-in for a separately
+    # approved smoke test.
+    protective_trigger_by: str = os.getenv(
+        "PROTECTIVE_TRIGGER_BY", "LastPrice"
+    ).strip()
+    slippage_elevated_pct: float = float(
+        os.getenv("SLIPPAGE_ELEVATED_PCT", "0.25")
+    )
+    slippage_anomalous_pct: float = float(
+        os.getenv("SLIPPAGE_ANOMALOUS_PCT", "1.0")
+    )
+    slippage_elevated_r: float = float(
+        os.getenv("SLIPPAGE_ELEVATED_R", "0.25")
+    )
+    slippage_anomalous_r: float = float(
+        os.getenv("SLIPPAGE_ANOMALOUS_R", "0.75")
+    )
+    # Independent of the exchange trigger/fill classification, a single
+    # realized loss outside this envelope is evidence that actual execution
+    # no longer matches the risk model.  It blocks only future entries; open
+    # positions continue to be managed and retain their native protection.
+    max_realized_loss_r: float = float(
+        os.getenv("MAX_REALIZED_LOSS_R", "1.5")
+    )
+
+    # Process-supervisor policy.  This is deliberately separate from the
+    # WebSocket reconnect backoff inside the collector: once that recovery
+    # budget is exhausted, the collector exits and the supervisor recreates
+    # the whole process with fresh sockets and resolver state.
+    collector_restart_initial_seconds: float = float(
+        os.getenv("COLLECTOR_RESTART_INITIAL_SECONDS", "5")
+    )
+    collector_restart_max_seconds: float = float(
+        os.getenv("COLLECTOR_RESTART_MAX_SECONDS", "60")
+    )
+    collector_restart_stable_reset_seconds: float = float(
+        os.getenv("COLLECTOR_RESTART_STABLE_RESET_SECONDS", "300")
     )

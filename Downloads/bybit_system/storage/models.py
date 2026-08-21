@@ -11,7 +11,7 @@
 
 from sqlalchemy import (
     Column, BigInteger, Numeric, String, Boolean, Integer, DateTime,
-    ForeignKey, JSON, PrimaryKeyConstraint, UniqueConstraint, func
+    ForeignKey, JSON, PrimaryKeyConstraint, Text, UniqueConstraint, func
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import declarative_base
@@ -440,7 +440,10 @@ class TradeExitEvent(Base):
     observed_at = Column(DateTime(timezone=True), nullable=False)
     symbol = Column(String(20), nullable=False)
     actual_exit_reason = Column(String(100), nullable=False)
-    requested_exit_reason = Column(String(100), nullable=True)
+    # Human/structured Exit Manager explanations routinely exceed 100 chars.
+    # TEXT preserves the complete sanitized reason; the full structured object
+    # remains in exit_manager_signal/raw_payload.
+    requested_exit_reason = Column(Text, nullable=True)
     exchange_exit_mechanism = Column(String(100), nullable=True)
     exit_manager_signal = Column(JSONB_COMPAT, nullable=True)
     protection_trigger = Column(JSONB_COMPAT, nullable=True)
@@ -453,6 +456,19 @@ class TradeExitEvent(Base):
     realized_r = Column(Numeric, nullable=True)
     mfe = Column(JSONB_COMPAT, nullable=True)
     mae = Column(JSONB_COMPAT, nullable=True)
+    intended_trigger_price = Column(Numeric, nullable=True)
+    trigger_source = Column(String(20), nullable=True)
+    price_near_trigger = Column(Numeric, nullable=True)
+    mark_price_near_trigger = Column(Numeric, nullable=True)
+    last_price_near_trigger = Column(Numeric, nullable=True)
+    actual_fill_price = Column(Numeric, nullable=True)
+    slippage_absolute = Column(Numeric, nullable=True)
+    slippage_pct = Column(Numeric, nullable=True)
+    slippage_r = Column(Numeric, nullable=True)
+    slippage_classification = Column(String(20), nullable=True, index=True)
+    trigger_at = Column(DateTime(timezone=True), nullable=True)
+    fill_at = Column(DateTime(timezone=True), nullable=True)
+    protective_execution_id = Column(String(100), nullable=True)
     policy_epoch = Column(Integer, nullable=False)
     raw_payload = Column(JSONB_COMPAT, nullable=True)
 
@@ -529,6 +545,103 @@ class OperationalHealthEvent(Base):
     error_message = Column(String(2000), nullable=True)
     details = Column(JSONB_COMPAT, nullable=False)
     policy_epoch = Column(Integer, nullable=False)
+
+
+class TelemetryOutbox(Base):
+    """Durable, idempotent queue for research-critical telemetry delivery."""
+    __tablename__ = "telemetry_outbox"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    event_key = Column(String(64), nullable=False, unique=True)
+    run_id = Column(String(100), nullable=False, index=True)
+    event_type = Column(String(50), nullable=False, index=True)
+    payload = Column(JSONB_COMPAT, nullable=False)
+    status = Column(String(20), nullable=False, default="pending", index=True)
+    attempts = Column(Integer, nullable=False, default=0)
+    next_attempt_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+    last_error = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+    delivered_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class EntryIntent(Base):
+    """Pre-exchange durable ownership record and append-safe execution state."""
+    __tablename__ = "entry_intents"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    intent_id = Column(String(64), nullable=False, unique=True)
+    run_id = Column(String(100), nullable=False, index=True)
+    evaluation_id = Column(String(64), nullable=False)
+    symbol = Column(String(20), nullable=False, index=True)
+    side = Column(String(20), nullable=False)
+    order_link_id = Column(String(100), nullable=False, unique=True)
+    state = Column(String(30), nullable=False, default="prepared", index=True)
+    requested_quantity = Column(Numeric, nullable=True)
+    requested_notional = Column(Numeric, nullable=True)
+    proposed_entry = Column(Numeric, nullable=True)
+    proposed_stop_loss = Column(Numeric, nullable=True)
+    proposed_take_profit = Column(Numeric, nullable=True)
+    policy_epoch = Column(Integer, nullable=False)
+    config_hash = Column(String(64), nullable=False)
+    exchange_order_id = Column(String(100), nullable=True, index=True)
+    filled_quantity = Column(Numeric, nullable=True)
+    weighted_entry = Column(Numeric, nullable=True)
+    trade_log_id = Column(Integer, ForeignKey("trade_log.id"), nullable=True)
+    last_error = Column(Text, nullable=True)
+    prepared_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+    submitted_at = Column(DateTime(timezone=True), nullable=True)
+    accepted_at = Column(DateTime(timezone=True), nullable=True)
+    filled_at = Column(DateTime(timezone=True), nullable=True)
+    journaled_at = Column(DateTime(timezone=True), nullable=True)
+    closed_at = Column(DateTime(timezone=True), nullable=True)
+    reconciled_at = Column(DateTime(timezone=True), nullable=True)
+    rejected_at = Column(DateTime(timezone=True), nullable=True)
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
+    structured_payload = Column(JSONB_COMPAT, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("run_id", "evaluation_id", name="uq_entry_intent_run_evaluation"),
+    )
+
+
+class NormalizedExecution(Base):
+    """Immutable exchange fill evidence used for duration and forensic linkage."""
+    __tablename__ = "normalized_executions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    execution_id = Column(String(100), nullable=False, unique=True)
+    run_id = Column(String(100), nullable=True, index=True)
+    trade_log_id = Column(Integer, ForeignKey("trade_log.id"), nullable=True, index=True)
+    order_link_id = Column(String(100), nullable=True, index=True)
+    exchange_order_id = Column(String(100), nullable=False, index=True)
+    role = Column(String(20), nullable=False)
+    symbol = Column(String(20), nullable=False, index=True)
+    side = Column(String(10), nullable=True)
+    execution_time = Column(DateTime(timezone=True), nullable=False, index=True)
+    execution_price = Column(Numeric, nullable=False)
+    execution_quantity = Column(Numeric, nullable=False)
+    execution_fee = Column(Numeric, nullable=True)
+    fee_currency = Column(String(20), nullable=True)
+    maker_taker = Column(String(20), nullable=True)
+    closed_size = Column(Numeric, nullable=True)
+    raw_payload = Column(JSONB_COMPAT, nullable=False)
+    first_observed_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+
+class ReconciliationAnomaly(Base):
+    """Validation mismatch retained even when a stable exchange ID proves ownership."""
+    __tablename__ = "reconciliation_anomalies"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    anomaly_key = Column(String(64), nullable=False, unique=True)
+    run_id = Column(String(100), nullable=True, index=True)
+    trade_log_id = Column(Integer, ForeignKey("trade_log.id"), nullable=True, index=True)
+    order_link_id = Column(String(100), nullable=True, index=True)
+    exchange_order_id = Column(String(100), nullable=True, index=True)
+    anomaly_type = Column(String(50), nullable=False)
+    severity = Column(String(20), nullable=False)
+    observed_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+    details = Column(JSONB_COMPAT, nullable=False)
 
 
 class Candle(Base):

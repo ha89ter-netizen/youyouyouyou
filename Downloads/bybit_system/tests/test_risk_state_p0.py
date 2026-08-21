@@ -25,6 +25,7 @@ from storage.journal import ExitResult, TradeJournal
 from timeutils import utcnow
 from storage.models import Base, TradeLog
 from storage.risk_state import RiskStateStore
+from storage.durability import EntryIntentStore
 from strategy.engine import _ORPHAN_MAX_ATTEMPTS, StrategyEngine
 from strategy.signal import Action, Signal
 from timeutils import utc_today
@@ -177,6 +178,15 @@ def _bare_engine(cfg, execution, journal, risk_manager) -> StrategyEngine:
     engine.execution = execution
     engine.journal = journal
     engine.risk_manager = risk_manager
+    intent_db = SessionBackedDb()
+    cfg.run_id = cfg.run_id or "unit-entry-intent"
+    engine.entry_intents = EntryIntentStore(intent_db, cfg)
+    engine.telemetry = type("Telemetry", (), {
+        "current_policy": lambda self: (0, "unit-config"),
+        "record_protection_event": lambda self, *args, **kwargs: True,
+        "finalize_trade": lambda self, *args, **kwargs: True,
+    })()
+    engine._protection_entry_halt = None
     engine._orphan_attempts = {}
     engine._last_entry_ts = None
     return engine

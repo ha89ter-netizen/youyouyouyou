@@ -5,13 +5,17 @@ TradeJournal: пишет причину каждого входа и резул�
 (rule/ai/rule+ai) реально приносят прибыль, а какие только шумят.
 """
 
+import hashlib
 import logging
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import List, Optional, Tuple
 
 from storage.db import Database
-from storage.models import TradeClosure, TradeExchangeOrder, TradeExpertVote, TradeLog
+from storage.models import (
+    NormalizedExecution, ReconciliationAnomaly, TradeClosure, TradeExchangeOrder,
+    TradeExpertVote, TradeLog,
+)
 from storage.trade_memory import (
     clamp_confidence,
     non_negative_int,
@@ -20,6 +24,7 @@ from storage.trade_memory import (
     safe_float,
     safe_json,
     sanitize_text,
+    stable_json_dumps,
     validate_time_order,
 )
 from timeutils import ensure_aware_utc, from_epoch_ms, to_epoch_ms, utc_today, utcnow
@@ -160,6 +165,8 @@ class TradeJournal:
         total_fee_usdt: Optional[float] = None,
         closure_records: Optional[list[dict]] = None,
         closure_executions: Optional[dict[str, list[dict]]] = None,
+        entry_execution_at: Optional[datetime] = None,
+        final_exit_execution_at: Optional[datetime] = None,
     ) -> ExitResult:
         """
         Фиксирует выход. Работает и для status="open" (обычное закрытие), и для
@@ -259,9 +266,15 @@ class TradeJournal:
             row.exit_fee_usdt = safe_float(exit_fee_usdt, "exit_fee_usdt")
             row.total_fee_usdt = safe_float(total_fee_usdt, "total_fee_usdt")
             row.status = "closed"
-            real_closed_at = ensure_aware_utc(closed_at) or utcnow()
+            real_closed_at = (
+                ensure_aware_utc(final_exit_execution_at)
+                or ensure_aware_utc(closed_at) or utcnow()
+            )
             row.closed_at = real_closed_at
-            row.holding_seconds = validate_time_order(row.opened_at, real_closed_at)
+            row.holding_seconds = validate_time_order(
+                ensure_aware_utc(entry_execution_at) or row.opened_at,
+                real_closed_at,
+            )
             session.commit()
 
             if recovered_from_orphan:
@@ -286,6 +299,109 @@ class TradeJournal:
             logger.exception("Не удалось записать выход в журнал сделок")
             session.rollback()
             return ExitResult(recorded=False, reason="ошибка записи")
+        finally:
+            session.close()
+
+    def persist_normalized_executions(
+        self, order_link_id: str, executions: list[dict], *, role: str,
+    ) -> list[datetime]:
+        """Idempotently persist exchange fills and return their UTC timestamps."""
+        session = self.db.get_session()
+        timestamps = []
+        try:
+            trade = session.query(TradeLog).filter_by(order_link_id=order_link_id).first()
+            if trade is None:
+                return []
+            for execution in executions:
+                execution_id = execution.get("execId")
+                order_id = execution.get("orderId")
+                observed_at = from_epoch_ms(execution.get("execTime"))
+                price = safe_float(execution.get("execPrice"))
+                quantity = safe_float(execution.get("execQty") or execution.get("closedSize"))
+                if not execution_id or not order_id or observed_at is None or price is None or quantity is None:
+                    continue
+                existing = session.query(NormalizedExecution).filter_by(
+                    execution_id=execution_id
+                ).first()
+                if existing is not None:
+                    if existing.trade_log_id != trade.id or existing.order_link_id != order_link_id:
+                        details = {
+                            "type": "execution_owner_conflict",
+                            "execution_id": execution_id,
+                            "existing_trade_log_id": existing.trade_log_id,
+                            "existing_order_link_id": existing.order_link_id,
+                            "attempted_trade_log_id": trade.id,
+                            "attempted_order_link_id": order_link_id,
+                            "exchange_order_id": order_id,
+                        }
+                        key = hashlib.sha256(stable_json_dumps(details).encode("utf-8")).hexdigest()
+                        if session.query(ReconciliationAnomaly).filter_by(
+                            anomaly_key=key
+                        ).first() is None:
+                            session.add(ReconciliationAnomaly(
+                                anomaly_key=key, run_id=trade.run_id,
+                                trade_log_id=trade.id, order_link_id=order_link_id,
+                                exchange_order_id=order_id,
+                                anomaly_type="execution_owner_conflict", severity="critical",
+                                details=safe_json(details),
+                            ))
+                    else:
+                        timestamps.append(ensure_aware_utc(existing.execution_time))
+                    continue
+                timestamps.append(observed_at)
+                maker = execution.get("isMaker")
+                session.add(NormalizedExecution(
+                    execution_id=execution_id, run_id=trade.run_id,
+                    trade_log_id=trade.id, order_link_id=order_link_id,
+                    exchange_order_id=order_id, role=role, symbol=trade.symbol,
+                    side=execution.get("side"), execution_time=observed_at,
+                    execution_price=price, execution_quantity=quantity,
+                    execution_fee=safe_float(execution.get("execFee")),
+                    fee_currency=execution.get("feeCurrency"),
+                    maker_taker=("maker" if maker is True or str(maker).lower() == "true" else
+                                 "taker" if maker is not None else None),
+                    closed_size=safe_float(execution.get("closedSize")),
+                    raw_payload=safe_json(execution),
+                ))
+            session.commit()
+            return sorted(timestamps)
+        except Exception:
+            session.rollback()
+            logger.exception("Failed to persist normalized executions for %s", order_link_id)
+            return []
+        finally:
+            session.close()
+
+    def record_reconciliation_anomalies(
+        self, order_link_id: str, exchange_order_id: Optional[str], anomalies: list[dict]
+    ) -> int:
+        session = self.db.get_session()
+        inserted = 0
+        try:
+            trade = session.query(TradeLog).filter_by(order_link_id=order_link_id).first()
+            if trade is None:
+                return 0
+            import hashlib
+            from storage.trade_memory import stable_json_dumps
+            for anomaly in anomalies:
+                key = hashlib.sha256(stable_json_dumps({
+                    "trade": order_link_id, "order": exchange_order_id, "anomaly": anomaly,
+                }).encode("utf-8")).hexdigest()
+                if session.query(ReconciliationAnomaly).filter_by(anomaly_key=key).first():
+                    continue
+                session.add(ReconciliationAnomaly(
+                    anomaly_key=key, run_id=trade.run_id, trade_log_id=trade.id,
+                    order_link_id=order_link_id, exchange_order_id=exchange_order_id,
+                    anomaly_type=anomaly.get("type", "unknown"), severity="warning",
+                    details=safe_json(anomaly),
+                ))
+                inserted += 1
+            session.commit()
+            return inserted
+        except Exception:
+            session.rollback()
+            logger.exception("Failed to persist reconciliation anomalies for %s", order_link_id)
+            return 0
         finally:
             session.close()
 
@@ -623,7 +739,7 @@ class TradeJournal:
                     order_link_id,
                 )
                 return False
-            row.exit_trigger = safe_json(trigger)
+            row.exit_trigger = safe_json(trigger, string_limit=100_000)
             session.commit()
             return True
         except Exception:

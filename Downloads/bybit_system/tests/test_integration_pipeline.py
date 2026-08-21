@@ -19,6 +19,7 @@ from meta_strategy import MetaStrategyDecision, MetaStrategyManager
 from portfolio_risk import PortfolioRiskEngine
 from risk.risk_manager import RiskManager
 from storage.journal import ExitResult, TradeJournal
+from storage.durability import EntryIntentStore
 from timeutils import utcnow
 from storage.models import Base, TradeLog
 from strategy.engine import StrategyEngine
@@ -62,12 +63,22 @@ class FakeExecution:
             "side": side,
             "avgPrice": str(kwargs["last_price"]),
             "markPrice": str(kwargs["last_price"]),
+            "stopLoss": str(kwargs["last_price"] * 0.985),
+            "takeProfit": str(kwargs["last_price"] * 1.03),
         })
         return {
             "retCode": 0,
             "retMsg": "OK",
             "local_order_link_id": f"local-{kwargs['symbol']}",
         }
+
+    def get_active_protective_orders(self, symbol):
+        return [
+            {"orderId": f"sl-{symbol}", "stopOrderType": "StopLoss",
+             "orderStatus": "Untriggered", "triggerBy": "LastPrice"},
+            {"orderId": f"tp-{symbol}", "stopOrderType": "TakeProfit",
+             "orderStatus": "Untriggered", "triggerBy": "LastPrice"},
+        ]
 
     def close_position(self, symbol, side_to_close, qty, source="unknown"):
         self.closed_orders.append((symbol, side_to_close, qty, source))
@@ -477,6 +488,19 @@ class IntegrationPipelineTest(unittest.TestCase):
         engine.risk_manager = RiskManager(cfg)
         engine.execution = FakeExecution()
         engine.journal = FakeJournal()
+        cfg.run_id = "integration-run"
+        engine.entry_intents = EntryIntentStore(SessionBackedDb(), cfg)
+        engine.telemetry = type("Telemetry", (), {
+            "current_policy": lambda self: (0, "integration-config"),
+            "record_decision": lambda self, *args, **kwargs: "event",
+            "record_protection_event": lambda self, *args, **kwargs: True,
+            "record_health": lambda self, *args, **kwargs: True,
+            "finalize_trade": lambda self, *args, **kwargs: True,
+            "replay_outbox": lambda self, *args, **kwargs: {},
+            "account_snapshot_due": lambda self: False,
+            "position_snapshot_due": lambda self: False,
+        })()
+        engine._protection_entry_halt = None
         engine._trailing_activated = set()
         engine._orphan_attempts = {}
         engine._last_entry_ts = None

@@ -11,9 +11,11 @@ import platform
 import socket
 import subprocess
 import sys
+import threading
 import time
+from collections import deque
 from dataclasses import fields
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Optional
@@ -23,9 +25,11 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.exc import IntegrityError
 
 from storage.migrations import DATABASE_SCHEMA_VERSION, MIGRATION_VERSION
+from storage.durability import DurableOutbox
 from storage.models import (
     AccountSnapshot,
     DecisionEvent,
+    NormalizedExecution,
     OperationalHealthEvent,
     PositionSnapshot,
     RejectionEvent,
@@ -33,6 +37,7 @@ from storage.models import (
     Trade,
     TradeExcursion,
     TradeExitEvent,
+    TradeExchangeOrder,
     TradeLog,
     TradeProtectionEvent,
     TradingRun,
@@ -64,6 +69,22 @@ CONFIG_ENV_NAMES = (
     "TIME_RANGE_SECOND_TIGHTENING_AFTER_SECONDS", "TIME_RANGE_SECOND_TIGHTENING_FACTOR",
     "LOG_LEVEL",
     "TELEMETRY_ACCOUNT_INTERVAL_SEC", "TELEMETRY_POSITION_INTERVAL_SEC",
+    "TELEMETRY_RETRY_ATTEMPTS", "TELEMETRY_RETRY_BASE_SECONDS",
+    "TELEMETRY_OUTBOX_MAX_ATTEMPTS", "TELEMETRY_OUTBOX_DELIVERED_RETENTION_HOURS",
+    "TELEMETRY_OUTBOX_CLEANUP_BATCH_SIZE", "TELEMETRY_OUTBOX_CLEANUP_MAX_BATCHES",
+    "HEALTH_EVENT_DEDUP_WINDOW_SECONDS", "HEALTH_CONDITION_REMINDER_SECONDS",
+    "POSITION_CLOSE_VISIBILITY_GRACE_SECONDS",
+    "STORAGE_MAX_DATABASE_BYTES",
+    "STORAGE_ENTRY_BLOCK_RATIO", "STORAGE_MONITOR_INTERVAL_SEC", "RAW_TRADES_RETENTION_HOURS",
+    "ORDERBOOK_RETENTION_HOURS", "LIQUIDATIONS_RETENTION_HOURS",
+    "RETENTION_DELETE_BATCH_SIZE", "RETENTION_MAX_ROWS_PER_RUN",
+    "PROTECTIVE_TRIGGER_BY", "SLIPPAGE_ELEVATED_PCT", "SLIPPAGE_ANOMALOUS_PCT",
+    "SLIPPAGE_ELEVATED_R", "SLIPPAGE_ANOMALOUS_R", "MAX_REALIZED_LOSS_R",
+    "COLLECTOR_RESTART_INITIAL_SECONDS", "COLLECTOR_RESTART_MAX_SECONDS",
+    "COLLECTOR_RESTART_STABLE_RESET_SECONDS",
+    "WS_RECONNECT_INITIAL_SECONDS", "WS_RECONNECT_MAX_SECONDS",
+    "WS_RECONNECT_JITTER_RATIO", "WS_RECONNECT_STABLE_RESET_SECONDS",
+    "WS_RECONNECT_RESTART_AFTER_SECONDS",
     "STRATEGY_VERSION", "RAILWAY_ENVIRONMENT_NAME", "RAILWAY_SERVICE_NAME",
     "RAILWAY_DEPLOYMENT_ID", "RAILWAY_REPLICA_ID",
 )
@@ -199,9 +220,22 @@ class TelemetryStore:
         self.run_id = owner_run_id or cfg.run_id
         self.processing_run_id = processing_run_id or cfg.run_id
         self._owner_stores: dict[str, "TelemetryStore"] = {}
-        self._pending_health: list[dict] = []
+        self.outbox = DurableOutbox(
+            db, self.run_id,
+            max_attempts=getattr(cfg, "telemetry_outbox_max_attempts", 8),
+            base_backoff_seconds=getattr(cfg, "telemetry_retry_base_seconds", 0.25),
+        )
+        # Bounded emergency breadcrumbs only. Critical payloads themselves use
+        # PostgreSQL outbox; this deque can never grow without limit.
+        self._pending_health = deque(maxlen=100)
         self._last_account_snapshot_monotonic = 0.0
         self._last_position_snapshot_monotonic = 0.0
+        self._health_lock = threading.Lock()
+        self._health_state: dict[tuple, dict] = {}
+        self._health_conditions: dict[tuple, dict] = {}
+        self._monotonic = time.monotonic
+        self._outbox_maintenance_lock = threading.Lock()
+        self._outbox_maintenance_thread: Optional[threading.Thread] = None
 
     @property
     def enabled(self) -> bool:
@@ -235,20 +269,22 @@ class TelemetryStore:
         finally:
             session.close()
 
-    def _write(self, operation, *, retries: int = 2, raise_on_failure: bool = False):
+    def _write(self, operation, *, retries: Optional[int] = None, raise_on_failure: bool = False):
         if not self.enabled:
             return False
+        retries = max(1, min(
+            int(retries or getattr(self.cfg, "telemetry_retry_attempts", 3)), 8
+        ))
+        base_delay = max(0.05, min(
+            float(getattr(self.cfg, "telemetry_retry_base_seconds", 0.25)), 5.0
+        ))
         last_error = None
         for attempt in range(retries):
             session = None
             try:
                 session = self.db.get_session()
-                pending_count = len(self._pending_health)
-                self._stage_pending_health(session)
                 value = operation(session)
                 session.commit()
-                if pending_count:
-                    del self._pending_health[:pending_count]
                 return value
             except IntegrityError:
                 if session is not None:
@@ -259,7 +295,7 @@ class TelemetryStore:
                     session.rollback()
                 last_error = exc
                 if attempt + 1 < retries:
-                    time.sleep(0.05)
+                    time.sleep(min(5.0, base_delay * (2 ** attempt)))
             finally:
                 if session is not None:
                     session.close()
@@ -267,41 +303,136 @@ class TelemetryStore:
             "Telemetry database write failed after %d attempts: %s",
             retries, last_error,
         )
-        self._pending_health.append({
-            "component": "telemetry_store", "event_type": "database_write_failure",
-            "severity": "critical", "status": "failed", "error": last_error,
-            "details": {"retry_count": retries}, "observed_at": utcnow(),
-        })
         if raise_on_failure:
             raise RuntimeError(str(last_error) or "required telemetry database write failed") from last_error
         return False
 
-    def _stage_pending_health(self, session) -> None:
-        """Persist failures buffered while PostgreSQL was unavailable."""
-        if not self._pending_health:
-            return
-        latest = (
-            session.query(RunPolicyEpoch)
-            .filter_by(run_id=self.run_id)
-            .order_by(RunPolicyEpoch.epoch.desc())
-            .first()
-        )
-        epoch = latest.epoch if latest else 0
-        pending = list(self._pending_health)
-        for index, item in enumerate(pending):
-            observed = item.get("observed_at") or utcnow()
-            key = _sha({
-                "run": self.run_id, "type": "database_write_failure",
-                "observed": observed.isoformat(), "index": index,
-            })
-            session.add(OperationalHealthEvent(
-                event_key=key, run_id=self.run_id, observed_at=observed,
-                component=item["component"], event_type=item["event_type"],
-                severity=item["severity"], status=item["status"],
-                error_type=(type(item.get("error")).__name__ if item.get("error") else None),
-                error_message=sanitize_text(str(item.get("error")), 2000),
-                details=safe_json(item.get("details") or {}), policy_epoch=epoch,
-            ))
+    @staticmethod
+    def _payload_time(value: Any) -> Optional[datetime]:
+        if isinstance(value, datetime):
+            return ensure_aware_utc(value)
+        if isinstance(value, str):
+            try:
+                return ensure_aware_utc(datetime.fromisoformat(value))
+            except ValueError:
+                return None
+        return None
+
+    def _enqueue_and_deliver(self, event_type: str, event_key: str, payload: dict) -> bool:
+        """Write-ahead enqueue, then atomic target insert + delivered transition."""
+        retries = max(1, min(int(getattr(self.cfg, "telemetry_retry_attempts", 3)), 8))
+        delay = max(0.05, float(getattr(self.cfg, "telemetry_retry_base_seconds", 0.25)))
+        last_error = None
+        for attempt in range(retries):
+            try:
+                if self.outbox.status(event_key) == "delivered":
+                    return False
+                self._flush_failure_breadcrumbs()
+                self.outbox.enqueue(event_type, payload, event_key=event_key)
+                rows = [row for row in self.outbox.pending(limit=1000) if row.event_key == event_key]
+                if not rows:
+                    return True  # already queued under bounded backoff
+                return self.outbox.deliver(rows[0].id, self._deliver_outbox_event)
+            except Exception as exc:
+                last_error = exc
+                if attempt + 1 < retries:
+                    time.sleep(min(5.0, delay * (2 ** attempt)))
+        logger.error("Critical telemetry enqueue failed: type=%s key=%s error=%s",
+                     event_type, event_key, last_error)
+        self._pending_health.append({"observed_at": utcnow(), "error": str(last_error)})
+        return False
+
+    def _flush_failure_breadcrumbs(self) -> None:
+        while self._pending_health:
+            item = self._pending_health[0]
+            observed = item["observed_at"]
+            key = _sha({"run": self.run_id, "db_failure": observed.isoformat()})
+            command = {
+                "run_id": self.run_id, "observed_at": observed,
+                "component": "telemetry_store", "event_type": "database_write_failure",
+                "severity": "critical", "status": "failed", "symbol": None,
+                "data_timestamp": None, "data_age_seconds": None,
+                "error_type": "DatabaseUnavailable",
+                "error_message": item.get("error"),
+                "details": {"bounded_memory_breadcrumb": True}, "policy_epoch": 0,
+            }
+            self.outbox.enqueue("health", command, event_key=key)
+            rows = [row for row in self.outbox.pending(limit=1000) if row.event_key == key]
+            if rows:
+                self.outbox.deliver(rows[0].id, self._deliver_outbox_event)
+            self._pending_health.popleft()
+
+    def replay_outbox(self, limit: int = 100) -> dict:
+        delivered = failed = 0
+        for row in self.outbox.pending(limit=limit):
+            if self.outbox.deliver(row.id, self._deliver_outbox_event):
+                delivered += 1
+            else:
+                failed += 1
+        return {"delivered": delivered, "failed": failed}
+
+    def maintain_outbox(self) -> dict:
+        """Bounded maintenance invoked outside exchange-position mutations."""
+        before = self.outbox.metrics()
+        batch_size = max(1, min(int(getattr(
+            self.cfg, "telemetry_outbox_cleanup_batch_size", 1000
+        )), 10_000))
+        max_batches = max(1, min(int(getattr(
+            self.cfg, "telemetry_outbox_cleanup_max_batches", 10
+        )), 100))
+        cleanup = {"deleted": 0, "batches": 0, "cutoff": None}
+        for _ in range(max_batches):
+            result = self.outbox.cleanup_delivered(
+                retention_hours=getattr(
+                    self.cfg, "telemetry_outbox_delivered_retention_hours", 24
+                ),
+                batch_size=batch_size,
+            )
+            cleanup["deleted"] += int(result["deleted"])
+            cleanup["batches"] += 1
+            cleanup["cutoff"] = result["cutoff"]
+            if int(result["deleted"]) < batch_size:
+                break
+        after = self.outbox.metrics()
+        return {"before": before, "cleanup": cleanup, "after": after}
+
+    def schedule_outbox_maintenance(self) -> bool:
+        """Run one bounded cleanup batch off the trading-cycle thread."""
+        with self._outbox_maintenance_lock:
+            worker = self._outbox_maintenance_thread
+            if worker is not None and worker.is_alive():
+                return False
+            worker = threading.Thread(
+                target=self._outbox_maintenance_worker,
+                name="telemetry-outbox-maintenance", daemon=True,
+            )
+            self._outbox_maintenance_thread = worker
+            worker.start()
+            return True
+
+    def _outbox_maintenance_worker(self) -> None:
+        try:
+            result = self.maintain_outbox()
+            self.record_health(
+                "telemetry_outbox", "outbox_maintenance", "info", "ok",
+                details=result,
+            )
+        except Exception as exc:
+            self.record_health(
+                "telemetry_outbox", "outbox_maintenance_failure",
+                "error", "degraded", error=exc,
+            )
+
+    def _deliver_outbox_event(self, session, event_type: str, payload: dict, event_key: str):
+        if event_type == "decision":
+            return self._deliver_decision(session, payload, event_key)
+        if event_type == "protection":
+            return self._deliver_protection(session, payload, event_key)
+        if event_type == "health":
+            return self._deliver_health(session, payload, event_key)
+        if event_type == "exit":
+            return self._deliver_exit(session, payload, event_key)
+        raise RuntimeError(f"unsupported telemetry outbox event type: {event_type}")
 
     def ensure_run(
         self,
@@ -525,18 +656,31 @@ class TelemetryStore:
         interval = max(1, self.cfg.telemetry_position_interval_sec)
         bucket = self._bucket(observed, interval)
         protective_orders = protective_orders or {}
+        close_visibility_grace = max(0, int(getattr(
+            self.cfg, "position_close_visibility_grace_seconds", 120
+        )))
         session = self.db.get_session()
         try:
             open_trades = session.query(TradeLog).filter(
                 TradeLog.status == "open",
             ).all()
+            recent_closed_trades = session.query(TradeLog).filter(
+                TradeLog.status == "closed",
+                TradeLog.closed_at.isnot(None),
+                TradeLog.closed_at >= observed - timedelta(seconds=close_visibility_grace),
+            ).all() if close_visibility_grace else []
             for trade in open_trades:
+                session.expunge(trade)
+            for trade in recent_closed_trades:
                 session.expunge(trade)
         finally:
             session.close()
         by_symbol: dict[str, list[TradeLog]] = {}
         for trade in open_trades:
             by_symbol.setdefault(trade.symbol, []).append(trade)
+        recently_closed_by_symbol: dict[str, list[TradeLog]] = {}
+        for trade in recent_closed_trades:
+            recently_closed_by_symbol.setdefault(trade.symbol, []).append(trade)
         inserted = 0
         for position in positions:
             qty = safe_float(position.get("size")) or 0.0
@@ -546,6 +690,39 @@ class TelemetryStore:
             side_action = "open_long" if position.get("side") == "Buy" else "open_short"
             candidates = [trade for trade in candidates if trade.action == side_action]
             if len(candidates) != 1:
+                lag_candidates = []
+                if not candidates:
+                    position_entry = safe_float(position.get("avgPrice"))
+                    position_qty = safe_float(position.get("size"))
+                    for closed in recently_closed_by_symbol.get(position.get("symbol"), []):
+                        if closed.action != side_action:
+                            continue
+                        trade_entry = safe_float(closed.entry_price)
+                        trade_qty = safe_float(closed.entry_filled_qty)
+                        entry_matches = bool(
+                            position_entry and trade_entry
+                            and abs(position_entry - trade_entry) / trade_entry <= 0.001
+                        )
+                        qty_matches = bool(
+                            position_qty is not None and trade_qty
+                            and abs(position_qty - trade_qty) / trade_qty <= 0.001
+                        )
+                        if entry_matches and qty_matches:
+                            lag_candidates.append(closed)
+                if len(lag_candidates) == 1:
+                    closed = lag_candidates[0]
+                    self.record_health(
+                        "position_telemetry", "position_close_visibility_lag",
+                        "warning", "exchange_lag", symbol=position.get("symbol"),
+                        details={
+                            "trade_log_id": closed.id,
+                            "closed_at": ensure_aware_utc(closed.closed_at),
+                            "reported_size": position.get("size"),
+                            "reported_average_entry": position.get("avgPrice"),
+                            "classification": "recent_closed_trade_identity_match",
+                        },
+                    )
+                    continue
                 self.record_health(
                     "position_telemetry", "position_without_internal_trade", "error", "unresolved",
                     symbol=position.get("symbol"), details={
@@ -681,9 +858,10 @@ class TelemetryStore:
         original_sl = safe_float(trade.stop_loss_price)
         initial_qty = safe_float(trade.entry_filled_qty) or (float(trade.size_usdt) / entry if entry else None)
         initial_risk = initial_qty * abs(entry - original_sl) if initial_qty and original_sl else None
+        entry_time = self._actual_entry_time(session, trade)
         since = (
             to_epoch_ms(excursion.last_market_timestamp)
-            if excursion and excursion.last_market_timestamp else to_epoch_ms(trade.opened_at)
+            if excursion and excursion.last_market_timestamp else to_epoch_ms(entry_time)
         )
         rows = session.query(Trade).filter(
             Trade.symbol == trade.symbol,
@@ -725,7 +903,7 @@ class TelemetryStore:
             excursion.mfe_quantity = qty
             excursion.mfe_market_snapshot_id = snapshot.id
             excursion.time_to_mfe_seconds = max(
-                0, int((favorable[1] - ensure_aware_utc(trade.opened_at)).total_seconds())
+                0, int((favorable[1] - entry_time).total_seconds())
             )
         if excursion.mae_price_distance is None or adverse_distance > float(excursion.mae_price_distance):
             excursion.mae_price_distance = adverse_distance
@@ -737,7 +915,7 @@ class TelemetryStore:
             excursion.mae_quantity = qty
             excursion.mae_market_snapshot_id = snapshot.id
             excursion.time_to_mae_seconds = max(
-                0, int((adverse[1] - ensure_aware_utc(trade.opened_at)).total_seconds())
+                0, int((adverse[1] - entry_time).total_seconds())
             )
         upl = safe_float(snapshot.unrealized_pnl)
         if upl is not None:
@@ -762,6 +940,14 @@ class TelemetryStore:
         session.query(TradeLog).filter_by(id=trade.id).update({
             "mfe_pct": excursion.mfe_pct, "mae_pct": excursion.mae_pct,
         })
+
+    @staticmethod
+    def _actual_entry_time(session, trade) -> datetime:
+        value = session.query(func.min(NormalizedExecution.execution_time)).filter(
+            NormalizedExecution.trade_log_id == trade.id,
+            NormalizedExecution.role == "entry",
+        ).scalar()
+        return ensure_aware_utc(value) or ensure_aware_utc(trade.opened_at) or utcnow()
 
     def record_protection_event(
         self, trade, event_type: str, old_value: Any, new_value: Any, *, reason: str,
@@ -792,30 +978,44 @@ class TelemetryStore:
             payload["observed_at_ms"] = int(observed.timestamp() * 1000)
         key = _sha(payload)
 
-        def operation(session):
-            if session.query(TradeProtectionEvent).filter_by(event_key=key).first():
-                return False
-            order_link_id = self._trade_value(trade, "order_link_id")
-            trade_log_id = self._trade_value(trade, "id")
-            if trade_log_id is None and order_link_id:
-                linked = session.query(TradeLog.id).filter_by(
-                    order_link_id=order_link_id
-                ).first()
-                trade_log_id = linked[0] if linked else None
-            session.add(TradeProtectionEvent(
-                event_key=key, run_id=self.run_id,
-                processing_run_id=self.processing_run_id,
-                trade_log_id=trade_log_id,
-                order_link_id=order_link_id,
-                observed_at=observed, symbol=self._trade_value(trade, "symbol") or "unknown",
-                event_type=event_type, old_value=safe_json(old_value), new_value=safe_json(new_value),
-                exchange_order_id=sanitize_text(exchange_order_id, 100),
-                exchange_order_link_id=sanitize_text(exchange_order_link_id, 100),
-                reason=sanitize_text(reason, 1000), source_module=source_module,
-                success=success, raw_exchange_status=safe_json(raw_status), policy_epoch=epoch,
-            ))
-            return True
-        return bool(self._write(operation))
+        command = {
+            "run_id": self.run_id, "processing_run_id": self.processing_run_id,
+            "trade_log_id": self._trade_value(trade, "id"),
+            "order_link_id": self._trade_value(trade, "order_link_id"),
+            "observed_at": observed, "symbol": self._trade_value(trade, "symbol") or "unknown",
+            "event_type": event_type, "old_value": old_value, "new_value": new_value,
+            "exchange_order_id": exchange_order_id,
+            "exchange_order_link_id": exchange_order_link_id,
+            "reason": reason, "source_module": source_module, "success": success,
+            "raw_status": raw_status, "policy_epoch": epoch,
+        }
+        return self._enqueue_and_deliver("protection", key, command)
+
+    def _deliver_protection(self, session, payload: dict, event_key: str):
+        if session.query(TradeProtectionEvent).filter_by(event_key=event_key).first():
+            return False
+        order_link_id = payload.get("order_link_id")
+        trade_log_id = payload.get("trade_log_id")
+        if trade_log_id is None and order_link_id:
+            linked = session.query(TradeLog.id).filter_by(order_link_id=order_link_id).first()
+            trade_log_id = linked[0] if linked else None
+        session.add(TradeProtectionEvent(
+            event_key=event_key, run_id=payload["run_id"],
+            processing_run_id=payload.get("processing_run_id"), trade_log_id=trade_log_id,
+            order_link_id=order_link_id,
+            observed_at=self._payload_time(payload.get("observed_at")) or utcnow(),
+            symbol=payload.get("symbol") or "unknown", event_type=payload["event_type"],
+            old_value=safe_json(payload.get("old_value")),
+            new_value=safe_json(payload.get("new_value")),
+            exchange_order_id=sanitize_text(payload.get("exchange_order_id"), 100),
+            exchange_order_link_id=sanitize_text(payload.get("exchange_order_link_id"), 100),
+            reason=sanitize_text(payload.get("reason"), 1000),
+            source_module=payload.get("source_module") or "unknown",
+            success=bool(payload.get("success")),
+            raw_exchange_status=safe_json(payload.get("raw_status")),
+            policy_epoch=int(payload.get("policy_epoch") or 0),
+        ))
+        return True
 
     @staticmethod
     def _trade_value(trade: Any, name: str) -> Any:
@@ -830,52 +1030,58 @@ class TelemetryStore:
             "phase": payload.get("phase", "evaluation"),
         })
         key = _sha({"evaluation_id": evaluation_id, "phase": payload.get("phase", "evaluation")})
-        accepted = bool(payload.get("accepted"))
-
-        def operation(session):
-            if session.query(DecisionEvent).filter_by(event_key=key).first():
-                return False
-            row = DecisionEvent(
-                event_key=key, run_id=self.run_id, observed_at=observed,
-                evaluation_id=evaluation_id, phase=payload.get("phase", "evaluation"),
-                symbol=payload["symbol"], side=payload.get("side"),
-                market_data_timestamp=ensure_aware_utc(payload.get("market_data_timestamp")),
-                market_data_age_seconds=safe_float(payload.get("market_data_age_seconds")),
-                signal_outputs=safe_json(payload.get("signal_outputs") or []),
-                confirmation_families=safe_json(payload.get("confirmation_families") or []),
-                decision_score=safe_float(payload.get("decision_score")),
-                market_regime=payload.get("market_regime"),
-                volatility_regime=payload.get("volatility_regime"),
-                trend_state=payload.get("trend_state"), spread=safe_float(payload.get("spread")),
-                funding=safe_float(payload.get("funding")), risk_score=safe_float(payload.get("risk_score")),
-                proposed_entry=safe_float(payload.get("proposed_entry")),
-                proposed_stop_loss=safe_float(payload.get("proposed_stop_loss")),
-                proposed_take_profit=safe_float(payload.get("proposed_take_profit")),
-                proposed_quantity=safe_float(payload.get("proposed_quantity")),
-                estimated_risk=safe_float(payload.get("estimated_risk")),
-                filter_results=safe_json(payload.get("filter_results") or {}),
-                final_decision=payload.get("final_decision", "unknown"),
-                decision_reason=sanitize_text(payload.get("decision_reason") or "unspecified", 2000),
-                accepted=accepted, policy_epoch=epoch,
-                commit_sha=self.cfg.commit_sha or "unknown", config_hash=digest,
-                structured_payload=safe_json(payload),
-            )
-            session.add(row)
-            for index, rejection in enumerate(payload.get("rejections") or []):
-                rejection_key = _sha({"decision": key, "index": index, "value": rejection})
-                session.add(RejectionEvent(
-                    event_key=rejection_key, run_id=self.run_id, decision_event_key=key,
-                    observed_at=observed, symbol=payload["symbol"],
-                    requested_side=rejection.get("side"),
-                    rejection_stage=rejection.get("stage", payload.get("phase", "evaluation")),
-                    rejection_code=rejection.get("code", "rejected"),
-                    rejection_reason=sanitize_text(rejection.get("reason") or "unspecified", 2000),
-                    structured_context=safe_json(rejection.get("context") or {}), policy_epoch=epoch,
-                ))
-            return True
-
-        self._write(operation)
+        command = {
+            "run_id": self.run_id, "observed_at": observed,
+            "evaluation_id": evaluation_id, "policy_epoch": epoch,
+            "commit_sha": self.cfg.commit_sha or "unknown", "config_hash": digest,
+            "payload": payload,
+        }
+        self._enqueue_and_deliver("decision", key, command)
         return key
+
+    def _deliver_decision(self, session, command: dict, event_key: str):
+        if session.query(DecisionEvent).filter_by(event_key=event_key).first():
+            return False
+        payload = command["payload"]
+        observed = self._payload_time(command.get("observed_at")) or utcnow()
+        epoch = int(command.get("policy_epoch") or 0)
+        row = DecisionEvent(
+            event_key=event_key, run_id=command["run_id"], observed_at=observed,
+            evaluation_id=command["evaluation_id"], phase=payload.get("phase", "evaluation"),
+            symbol=payload["symbol"], side=payload.get("side"),
+            market_data_timestamp=self._payload_time(payload.get("market_data_timestamp")),
+            market_data_age_seconds=safe_float(payload.get("market_data_age_seconds")),
+            signal_outputs=safe_json(payload.get("signal_outputs") or []),
+            confirmation_families=safe_json(payload.get("confirmation_families") or []),
+            decision_score=safe_float(payload.get("decision_score")),
+            market_regime=payload.get("market_regime"), volatility_regime=payload.get("volatility_regime"),
+            trend_state=payload.get("trend_state"), spread=safe_float(payload.get("spread")),
+            funding=safe_float(payload.get("funding")), risk_score=safe_float(payload.get("risk_score")),
+            proposed_entry=safe_float(payload.get("proposed_entry")),
+            proposed_stop_loss=safe_float(payload.get("proposed_stop_loss")),
+            proposed_take_profit=safe_float(payload.get("proposed_take_profit")),
+            proposed_quantity=safe_float(payload.get("proposed_quantity")),
+            estimated_risk=safe_float(payload.get("estimated_risk")),
+            filter_results=safe_json(payload.get("filter_results") or {}),
+            final_decision=payload.get("final_decision", "unknown"),
+            decision_reason=sanitize_text(payload.get("decision_reason") or "unspecified", 2000),
+            accepted=bool(payload.get("accepted")), policy_epoch=epoch,
+            commit_sha=command.get("commit_sha") or "unknown",
+            config_hash=command.get("config_hash") or "unknown",
+            structured_payload=safe_json(payload),
+        )
+        session.add(row)
+        for index, rejection in enumerate(payload.get("rejections") or []):
+            rejection_key = _sha({"decision": event_key, "index": index, "value": rejection})
+            session.add(RejectionEvent(
+                event_key=rejection_key, run_id=command["run_id"], decision_event_key=event_key,
+                observed_at=observed, symbol=payload["symbol"], requested_side=rejection.get("side"),
+                rejection_stage=rejection.get("stage", payload.get("phase", "evaluation")),
+                rejection_code=rejection.get("code", "rejected"),
+                rejection_reason=sanitize_text(rejection.get("reason") or "unspecified", 2000),
+                structured_context=safe_json(rejection.get("context") or {}), policy_epoch=epoch,
+            ))
+        return True
 
     def record_health(
         self, component: str, event_type: str, severity: str, status: str, *,
@@ -884,28 +1090,150 @@ class TelemetryStore:
         details: Optional[dict] = None, observed_at: Optional[datetime] = None,
     ) -> bool:
         observed = ensure_aware_utc(observed_at) or utcnow()
+        details = dict(details or {})
+        dedup_window = max(
+            0, int(getattr(self.cfg, "health_event_dedup_window_seconds", 60))
+        )
+        identity = (
+            component, event_type, severity, status, symbol,
+            type(error).__name__ if error else None,
+            sanitize_text(error, 500) if error else None,
+        )
+        now_mono = self._monotonic()
+        with self._health_lock:
+            state = self._health_state.get(identity)
+            if (
+                dedup_window > 0 and state is not None
+                and now_mono - state["emitted_at"] < dedup_window
+            ):
+                state["suppressed"] += 1
+                state["last_seen_at"] = observed
+                return False
+            if state and state["suppressed"]:
+                details["suppressed_identical_events"] = state["suppressed"]
+                details["suppressed_window_started_at"] = state["first_seen_at"].isoformat()
+                details["suppressed_last_seen_at"] = state["last_seen_at"].isoformat()
+            self._health_state[identity] = {
+                "emitted_at": now_mono, "suppressed": 0,
+                "first_seen_at": observed, "last_seen_at": observed,
+            }
+            if status in ("recovered", "ok"):
+                recovered_suppressed = 0
+                for key in list(self._health_state):
+                    if key[:2] == (component, event_type) and key[4] == symbol and key != identity:
+                        recovered_suppressed += self._health_state[key].get("suppressed", 0)
+                        self._health_state.pop(key, None)
+                if recovered_suppressed:
+                    details["suppressed_before_recovery"] = recovered_suppressed
         epoch, _ = self.current_policy()
         payload = {
             "run": self.run_id, "component": component, "type": event_type,
             "status": status, "symbol": symbol,
-            "observed_bucket": int(observed.timestamp()), "details": details or {},
+            "observed_bucket": int(observed.timestamp()), "details": details,
         }
         key = _sha(payload)
 
-        def operation(session):
-            if session.query(OperationalHealthEvent).filter_by(event_key=key).first():
-                return False
-            session.add(OperationalHealthEvent(
-                event_key=key, run_id=self.run_id, observed_at=observed,
-                component=component, event_type=event_type, severity=severity,
-                status=status, symbol=symbol, data_timestamp=ensure_aware_utc(data_timestamp),
-                data_age_seconds=safe_float(data_age_seconds),
-                error_type=type(error).__name__ if error else None,
-                error_message=sanitize_text(str(error), 2000) if error else None,
-                details=safe_json(details or {}), policy_epoch=epoch,
-            ))
-            return True
-        return bool(self._write(operation))
+        command = {
+            "run_id": self.run_id, "observed_at": observed, "component": component,
+            "event_type": event_type, "severity": severity, "status": status,
+            "symbol": symbol, "data_timestamp": data_timestamp,
+            "data_age_seconds": data_age_seconds,
+            "error_type": type(error).__name__ if error else None,
+            "error_message": str(error) if error else None,
+            "details": details, "policy_epoch": epoch,
+        }
+        return self._enqueue_and_deliver("health", key, command)
+
+    def record_health_condition(
+        self, component: str, event_type: str, *, active: bool,
+        symbol: Optional[str] = None, severity: str = "warning",
+        status: str = "degraded", details: Optional[dict] = None,
+        observed_at: Optional[datetime] = None,
+    ) -> bool:
+        """Persist condition transitions plus bounded reminders, not every cycle.
+
+        High-cardinality conditions such as stale order books are evaluated on
+        every symbol/cycle.  The durable audit trail needs the beginning,
+        periodic reminders with a suppression counter, and recovery -- not one
+        nearly identical PostgreSQL row per minute.
+        """
+        observed = ensure_aware_utc(observed_at) or utcnow()
+        now_mono = self._monotonic()
+        reminder = max(1, int(getattr(
+            self.cfg, "health_condition_reminder_seconds", 900
+        )))
+        identity = (component, event_type, symbol)
+        emit_type = event_type
+        emit_severity = severity
+        emit_status = status
+        emit_details = dict(details or {})
+        with self._health_lock:
+            state = self._health_conditions.get(identity)
+            if active:
+                if state is None:
+                    self._health_conditions[identity] = {
+                        "active_since": observed,
+                        "last_seen_at": observed,
+                        "last_emitted_monotonic": now_mono,
+                        "suppressed": 0,
+                    }
+                    emit_details["condition_transition"] = "entered"
+                elif now_mono - state["last_emitted_monotonic"] < reminder:
+                    state["last_seen_at"] = observed
+                    state["suppressed"] += 1
+                    return False
+                else:
+                    emit_details.update({
+                        "condition_transition": "reminder",
+                        "active_since": state["active_since"].isoformat(),
+                        "suppressed_identical_events": state["suppressed"],
+                        "suppressed_last_seen_at": state["last_seen_at"].isoformat(),
+                    })
+                    state["last_seen_at"] = observed
+                    state["last_emitted_monotonic"] = now_mono
+                    state["suppressed"] = 0
+            else:
+                if state is None:
+                    return False
+                self._health_conditions.pop(identity, None)
+                # A quick stale -> recovered -> stale transition must emit the
+                # second onset even inside the generic dedup window.
+                for key in list(self._health_state):
+                    if key[:2] == (component, event_type) and key[4] == symbol:
+                        self._health_state.pop(key, None)
+                emit_type = f"{event_type}_recovered"
+                emit_severity = "info"
+                emit_status = "recovered"
+                emit_details.update({
+                    "condition_transition": "recovered",
+                    "active_since": state["active_since"].isoformat(),
+                    "last_seen_at": state["last_seen_at"].isoformat(),
+                    "suppressed_identical_events": state["suppressed"],
+                    "duration_seconds": max(
+                        0.0, (observed - state["active_since"]).total_seconds()
+                    ),
+                })
+        return self.record_health(
+            component, emit_type, emit_severity, emit_status,
+            symbol=symbol, details=emit_details, observed_at=observed,
+        )
+
+    def _deliver_health(self, session, payload: dict, event_key: str):
+        if session.query(OperationalHealthEvent).filter_by(event_key=event_key).first():
+            return False
+        session.add(OperationalHealthEvent(
+            event_key=event_key, run_id=payload["run_id"],
+            observed_at=self._payload_time(payload.get("observed_at")) or utcnow(),
+            component=payload["component"], event_type=payload["event_type"],
+            severity=payload["severity"], status=payload["status"], symbol=payload.get("symbol"),
+            data_timestamp=self._payload_time(payload.get("data_timestamp")),
+            data_age_seconds=safe_float(payload.get("data_age_seconds")),
+            error_type=sanitize_text(payload.get("error_type"), 200),
+            error_message=sanitize_text(payload.get("error_message"), 2000),
+            details=safe_json(payload.get("details") or {}),
+            policy_epoch=int(payload.get("policy_epoch") or 0),
+        ))
+        return True
 
     def finalize_trade(
         self, order_link_id: str, *, actual_exit_reason: str, records: list[dict],
@@ -930,66 +1258,255 @@ class TelemetryStore:
             )
         observed = utcnow()
         epoch, _ = self.current_policy()
+        key = _sha({"run": self.run_id, "type": "exit", "order_link_id": order_link_id})
+        command = {
+            "run_id": self.run_id, "processing_run_id": self.processing_run_id,
+            "order_link_id": order_link_id, "observed_at": observed,
+            "actual_exit_reason": actual_exit_reason, "records": records,
+            "executions_by_order": executions_by_order, "realized_pnl": realized_pnl,
+            "fees": fees, "funding": funding,
+            "reconciliation_status": reconciliation_status, "policy_epoch": epoch,
+        }
+        return self._enqueue_and_deliver("exit", key, command)
 
-        def operation(session):
-            trade = session.query(TradeLog).filter_by(order_link_id=order_link_id).first()
-            if trade is None:
-                return False
-            if session.query(TradeExitEvent).filter_by(trade_log_id=trade.id).first():
-                return False
-            excursion = session.query(TradeExcursion).filter_by(trade_log_id=trade.id).first()
-            excursion = self._finalize_excursion_samples(
-                session, trade, excursion, records, executions_by_order, observed
+    def _deliver_exit(self, session, payload: dict, _event_key: str):
+        order_link_id = payload["order_link_id"]
+        trade = session.query(TradeLog).filter_by(order_link_id=order_link_id).first()
+        if trade is None:
+            raise RuntimeError(f"exit telemetry trade missing: {order_link_id}")
+        if session.query(TradeExitEvent).filter_by(trade_log_id=trade.id).first():
+            return False
+        observed = self._payload_time(payload.get("observed_at")) or utcnow()
+        records = payload.get("records") or []
+        executions_by_order = payload.get("executions_by_order") or {}
+        realized_pnl = float(payload["realized_pnl"])
+        excursion = session.query(TradeExcursion).filter_by(trade_log_id=trade.id).first()
+        excursion = self._finalize_excursion_samples(
+            session, trade, excursion, records, executions_by_order, observed
+        )
+        initial_risk = safe_float(excursion.initial_risk_usdt) if excursion else None
+        realized_r = realized_pnl / initial_risk if initial_risk else None
+        closing_ids = [record.get("orderId") for record in records if record.get("orderId")]
+        execution_ids = [
+            execution.get("execId") for oid in closing_ids
+            for execution in executions_by_order.get(oid, []) if execution.get("execId")
+        ]
+        slippage = self._protective_slippage_evidence(
+            session, trade, closing_ids, executions_by_order, initial_risk, observed
+        )
+        if excursion:
+            excursion.finalized_at = observed
+            excursion.finalized_by_run_id = payload.get("processing_run_id")
+            excursion.last_processing_run_id = payload.get("processing_run_id")
+            excursion.profitable_before_closing_loss = bool(
+                realized_pnl < 0 and (safe_float(excursion.mfe_usdt) or 0) > 0
             )
-            initial_risk = safe_float(excursion.initial_risk_usdt) if excursion else None
-            realized_r = realized_pnl / initial_risk if initial_risk else None
-            closing_ids = [record.get("orderId") for record in records if record.get("orderId")]
-            execution_ids = [
-                execution.get("execId") for oid in closing_ids
-                for execution in executions_by_order.get(oid, []) if execution.get("execId")
-            ]
-            if excursion:
-                excursion.finalized_at = observed
-                excursion.finalized_by_run_id = self.processing_run_id
-                excursion.last_processing_run_id = self.processing_run_id
-                excursion.profitable_before_closing_loss = bool(
-                    realized_pnl < 0 and (safe_float(excursion.mfe_usdt) or 0) > 0
-                )
-                excursion.losing_before_closing_profit = bool(
-                    realized_pnl > 0 and (safe_float(excursion.mae_usdt) or 0) > 0
-                )
-                trade.mfe_pct = excursion.mfe_pct
-                trade.mae_pct = excursion.mae_pct
-            mechanisms = sorted({
-                execution.get("stopOrderType") or "direct_order"
-                for oid in closing_ids for execution in executions_by_order.get(oid, [])
+            excursion.losing_before_closing_profit = bool(
+                realized_pnl > 0 and (safe_float(excursion.mae_usdt) or 0) > 0
+            )
+            trade.mfe_pct, trade.mae_pct = excursion.mfe_pct, excursion.mae_pct
+        mechanisms = sorted({
+            execution.get("stopOrderType") or "direct_order"
+            for oid in closing_ids for execution in executions_by_order.get(oid, [])
+        })
+        requested_reason = (trade.exit_trigger or {}).get("reason") if trade.exit_trigger else None
+        latest_stop = (
+            trade.second_tightened_stop_loss_price
+            or trade.tightened_stop_loss_price or trade.stop_loss_price
+        )
+        latest_take = (
+            trade.second_tightened_take_profit_price
+            or trade.tightened_take_profit_price or trade.take_profit_price
+        )
+        session.add(TradeExitEvent(
+            run_id=payload["run_id"], processing_run_id=payload.get("processing_run_id"),
+            trade_log_id=trade.id, order_link_id=order_link_id, observed_at=observed,
+            symbol=trade.symbol, actual_exit_reason=payload["actual_exit_reason"],
+            requested_exit_reason=sanitize_text(requested_reason, None),
+            exchange_exit_mechanism=",".join(mechanisms) if mechanisms else None,
+            exit_manager_signal=safe_json(trade.exit_trigger, string_limit=None),
+            protection_trigger={
+                "stop_loss": safe_float(latest_stop),
+                "take_profit": safe_float(latest_take),
+                "trigger_source": slippage.get("trigger_source"),
+            }, reconciliation_status=payload.get("reconciliation_status") or "matched",
+            closing_order_ids=closing_ids, closing_execution_ids=execution_ids,
+            realized_pnl=realized_pnl, fees=safe_float(payload.get("fees")),
+            funding=safe_float(payload.get("funding")), realized_r=realized_r,
+            mfe=(self._excursion_payload(excursion, "mfe") if excursion else None),
+            mae=(self._excursion_payload(excursion, "mae") if excursion else None),
+            intended_trigger_price=slippage.get("intended_trigger_price"),
+            trigger_source=slippage.get("trigger_source"),
+            price_near_trigger=slippage.get("price_near_trigger"),
+            mark_price_near_trigger=slippage.get("mark_price_near_trigger"),
+            last_price_near_trigger=slippage.get("last_price_near_trigger"),
+            actual_fill_price=slippage.get("actual_fill_price"),
+            slippage_absolute=slippage.get("slippage_absolute"),
+            slippage_pct=slippage.get("slippage_pct"),
+            slippage_r=slippage.get("slippage_r"),
+            slippage_classification=slippage.get("classification"),
+            trigger_at=slippage.get("trigger_at"), fill_at=slippage.get("fill_at"),
+            protective_execution_id=slippage.get("execution_id"),
+            policy_epoch=int(payload.get("policy_epoch") or 0),
+            raw_payload=safe_json({"records": records, "executions": executions_by_order,
+                                   "requested_exit_reason": requested_reason,
+                                   "protective_slippage": slippage},
+                                  string_limit=None),
+        ))
+        self._finalize_protection_lifecycle(
+            session, trade, closing_ids, slippage, observed,
+            payload.get("processing_run_id"), int(payload.get("policy_epoch") or 0),
+        )
+        return True
+
+    def _protective_slippage_evidence(
+        self, session, trade, closing_ids, executions_by_order, initial_risk, observed
+    ) -> dict:
+        """Build exchange-ID-first protective fill evidence without inventing gaps."""
+        order = session.query(TradeExchangeOrder).filter(
+            TradeExchangeOrder.trade_log_id == trade.id,
+            TradeExchangeOrder.exchange_order_id.in_(closing_ids or [""]),
+        ).order_by(TradeExchangeOrder.last_observed_at.desc()).first()
+        raw_order = (order.raw_payload or {}) if order else {}
+        trigger = safe_float(order.trigger_price) if order else None
+        trigger_source = (
+            raw_order.get("triggerBy") or raw_order.get("slTriggerBy")
+            or raw_order.get("tpTriggerBy")
+        )
+        executions = [
+            item for oid in closing_ids for item in executions_by_order.get(oid, [])
+        ]
+        qty_total = sum(safe_float(item.get("execQty")) or 0.0 for item in executions)
+        fill = (
+            sum(
+                (safe_float(item.get("execPrice")) or 0.0)
+                * (safe_float(item.get("execQty")) or 0.0)
+                for item in executions
+            ) / qty_total
+            if qty_total > 0 else safe_float(trade.exit_price)
+        )
+        fill_times = [
+            from_epoch_ms(item.get("execTime")) for item in executions
+            if from_epoch_ms(item.get("execTime")) is not None
+        ]
+        fill_at = max(fill_times) if fill_times else observed
+        snapshots = session.query(PositionSnapshot).filter(
+            PositionSnapshot.trade_log_id == trade.id,
+            PositionSnapshot.observed_at >= fill_at - timedelta(minutes=2),
+            PositionSnapshot.observed_at <= fill_at + timedelta(minutes=2),
+        ).all()
+        nearest = min(
+            snapshots,
+            key=lambda row: abs((ensure_aware_utc(row.observed_at) - fill_at).total_seconds()),
+            default=None,
+        )
+        mark = safe_float(nearest.mark_price) if nearest else None
+        last = safe_float(nearest.last_price) if nearest else None
+        near = mark if trigger_source == "MarkPrice" else last if trigger_source == "LastPrice" else None
+        adverse = pct = slippage_r = None
+        if trigger is not None and fill is not None:
+            is_long = trade.action == "open_long"
+            # Positive means execution was worse than the intended protective
+            # trigger; negative means price improvement.
+            adverse = trigger - fill if is_long else fill - trigger
+            pct = adverse / trigger * 100 if trigger else None
+            qty = safe_float(trade.entry_filled_qty) or qty_total
+            slippage_r = adverse * qty / initial_risk if initial_risk and qty else None
+        elevated_pct = float(getattr(self.cfg, "slippage_elevated_pct", 0.25))
+        anomalous_pct = float(getattr(self.cfg, "slippage_anomalous_pct", 1.0))
+        elevated_r = float(getattr(self.cfg, "slippage_elevated_r", 0.25))
+        anomalous_r = float(getattr(self.cfg, "slippage_anomalous_r", 0.75))
+        adverse_pct = max(0.0, pct or 0.0)
+        adverse_r = max(0.0, slippage_r or 0.0)
+        if trigger is None or fill is None:
+            classification = "unavailable"
+        elif adverse_pct >= anomalous_pct or adverse_r >= anomalous_r:
+            classification = "anomalous"
+        elif adverse_pct >= elevated_pct or adverse_r >= elevated_r:
+            classification = "elevated"
+        else:
+            classification = "normal"
+        return {
+            "intended_trigger_price": trigger, "trigger_source": trigger_source,
+            "price_near_trigger": near, "mark_price_near_trigger": mark,
+            "last_price_near_trigger": last, "actual_fill_price": fill,
+            "slippage_absolute": adverse, "slippage_pct": pct,
+            "slippage_r": slippage_r, "classification": classification,
+            # Bybit closed-PnL/order history has no certified trigger timestamp.
+            "trigger_at": None, "fill_at": fill_at,
+            "execution_id": executions[-1].get("execId") if executions else None,
+            "exchange_order_id": order.exchange_order_id if order else None,
+            "is_protective": bool(order and order.stop_order_type),
+        }
+
+    def _finalize_protection_lifecycle(
+        self, session, trade, closing_ids, slippage, observed, processing_run_id, policy_epoch
+    ) -> None:
+        """Make protective order evidence terminal and append deterministic lifecycle events."""
+        orders = session.query(TradeExchangeOrder).filter_by(trade_log_id=trade.id).all()
+        closing = set(closing_ids)
+        for order in orders:
+            if order.exchange_order_id in closing:
+                order.order_status = "Filled"
+                if order.stop_order_type:
+                    order.role = "protective_exit"
+            elif order.role == "protective" and order.order_status not in (
+                "Filled", "Cancelled", "Deactivated", "Rejected"
+            ):
+                order.order_status = "Deactivated"
+        terminal = []
+        if slippage.get("exchange_order_id") and slippage.get("is_protective"):
+            terminal.extend(("triggered", "filled"))
+        terminal.extend(("position_closed", "reconciled"))
+        for event_type in terminal:
+            key = _sha({
+                "trade": trade.id, "terminal": event_type,
+                "closing_order_ids": sorted(closing),
             })
-            session.add(TradeExitEvent(
-                run_id=self.run_id, processing_run_id=self.processing_run_id,
-                trade_log_id=trade.id, order_link_id=order_link_id,
-                observed_at=observed, symbol=trade.symbol,
-                actual_exit_reason=actual_exit_reason,
-                requested_exit_reason=(trade.exit_trigger or {}).get("reason") if trade.exit_trigger else None,
-                exchange_exit_mechanism=",".join(mechanisms) if mechanisms else None,
-                exit_manager_signal=safe_json(trade.exit_trigger),
-                protection_trigger={
-                    "stop_loss": safe_float(trade.tightened_stop_loss_price or trade.stop_loss_price),
-                    "take_profit": safe_float(trade.tightened_take_profit_price or trade.take_profit_price),
-                }, reconciliation_status=reconciliation_status,
-                closing_order_ids=closing_ids, closing_execution_ids=execution_ids,
-                realized_pnl=realized_pnl, fees=fees, funding=funding, realized_r=realized_r,
-                mfe=(self._excursion_payload(excursion, "mfe") if excursion else None),
-                mae=(self._excursion_payload(excursion, "mae") if excursion else None),
-                policy_epoch=epoch, raw_payload=safe_json({"records": records}),
+            if session.query(TradeProtectionEvent).filter_by(event_key=key).first():
+                continue
+            session.add(TradeProtectionEvent(
+                event_key=key, run_id=trade.run_id,
+                processing_run_id=processing_run_id, trade_log_id=trade.id,
+                order_link_id=trade.order_link_id, observed_at=observed,
+                symbol=trade.symbol, event_type=event_type,
+                old_value=None, new_value=safe_json({
+                    "closing_order_ids": sorted(closing),
+                    "slippage_classification": slippage.get("classification"),
+                }), exchange_order_id=slippage.get("exchange_order_id"),
+                exchange_order_link_id=None,
+                reason="exchange-confirmed terminal protection lifecycle",
+                source_module="storage.telemetry", success=True,
+                raw_exchange_status=None, policy_epoch=policy_epoch,
             ))
-            return True
-        return bool(self._write(operation))
+
+    def get_exit_slippage(self, order_link_id: str) -> Optional[dict]:
+        session = self.db.get_session()
+        try:
+            row = session.query(TradeExitEvent).filter_by(order_link_id=order_link_id).first()
+            if row is None:
+                return None
+            return {
+                "classification": row.slippage_classification,
+                "slippage_pct": safe_float(row.slippage_pct),
+                "slippage_r": safe_float(row.slippage_r),
+                "realized_r": safe_float(row.realized_r),
+                "realized_pnl": safe_float(row.realized_pnl),
+                "actual_exit_reason": row.actual_exit_reason,
+                "exchange_order_id": (
+                    (row.closing_order_ids or [None])[0]
+                    if row.closing_order_ids else None
+                ),
+            }
+        finally:
+            session.close()
 
     def _finalize_excursion_samples(
         self, session, trade, excursion, records, executions_by_order, observed
     ):
         """Include only market/fill observations at or before confirmed closure."""
         entry = float(trade.entry_price)
+        entry_time = self._actual_entry_time(session, trade)
         qty = safe_float(trade.entry_filled_qty) or (
             float(trade.size_usdt) / entry if entry else 0.0
         )
@@ -1016,7 +1533,7 @@ class TelemetryStore:
         close_ms = max(close_ms_values) if close_ms_values else to_epoch_ms(observed)
         market_rows = session.query(Trade).filter(
             Trade.symbol == trade.symbol,
-            Trade.ts >= (to_epoch_ms(trade.opened_at) or 0),
+            Trade.ts >= (to_epoch_ms(entry_time) or 0),
             Trade.ts <= close_ms,
         ).order_by(Trade.ts.asc()).all()
         samples.extend((float(row.price), from_epoch_ms(row.ts)) for row in market_rows)
@@ -1052,7 +1569,7 @@ class TelemetryStore:
             excursion.mfe_r = favorable_distance * qty / initial_risk if initial_risk else None
             excursion.mfe_price, excursion.mfe_at, excursion.mfe_quantity = favorable[0], favorable[1], qty
             excursion.time_to_mfe_seconds = max(
-                0, int((favorable[1] - ensure_aware_utc(trade.opened_at)).total_seconds())
+                0, int((favorable[1] - entry_time).total_seconds())
             )
         if excursion.mae_price_distance is None or adverse_distance > float(excursion.mae_price_distance):
             excursion.mae_price_distance = adverse_distance
@@ -1061,7 +1578,7 @@ class TelemetryStore:
             excursion.mae_r = adverse_distance * qty / initial_risk if initial_risk else None
             excursion.mae_price, excursion.mae_at, excursion.mae_quantity = adverse[0], adverse[1], qty
             excursion.time_to_mae_seconds = max(
-                0, int((adverse[1] - ensure_aware_utc(trade.opened_at)).total_seconds())
+                0, int((adverse[1] - entry_time).total_seconds())
             )
         current_sl = safe_float(trade.tightened_stop_loss_price or trade.stop_loss_price)
         current_tp = safe_float(trade.tightened_take_profit_price or trade.take_profit_price)

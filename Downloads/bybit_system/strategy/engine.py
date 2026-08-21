@@ -29,6 +29,7 @@ from storage.models import Candle, FundingRate, OpenInterest, Liquidation, Trade
 from storage.journal import TradeJournal
 from storage.risk_state import RiskStateStore
 from storage.telemetry import TelemetryStore
+from storage.durability import EntryIntentStore, StorageGuard
 from strategy.signal import Signal, Action
 from timeutils import from_epoch_ms, utc_today, utcnow
 from strategy.experts import ExpertSignalCollector
@@ -170,8 +171,12 @@ class StrategyEngine:
         self.execution = ExecutionEngine(cfg)
         self.journal = TradeJournal(db)
         self.telemetry = TelemetryStore(db, cfg)
+        self.entry_intents = EntryIntentStore(db, cfg)
+        self.storage_guard = StorageGuard(db, cfg)
         self._trailing_activated: set = set()  # order_link_id, для которых уже включили trailing
         self._last_entry_ts: Optional[float] = None
+        self._protection_entry_halt: Optional[str] = None
+        self._last_storage_monitor_monotonic = 0.0
         # order_link_id -> сколько циклов подряд не можем найти закрытие
         self._orphan_attempts: dict[str, int] = {}
         self._reconcile_daily_pnl_with_journal()
@@ -251,6 +256,13 @@ class StrategyEngine:
             time.sleep(self.cfg.decision_interval_sec)
 
     def run_once(self):
+        try:
+            self.telemetry.replay_outbox(limit=100)
+        except Exception:
+            # Existing positions must still be managed. New entries have a
+            # separate fail-closed durability gate.
+            logger.exception("Durable telemetry outbox replay unavailable")
+        self._monitor_storage_capacity()
         # Position state is fetched and managed independently from account
         # balance. A wallet endpoint failure must never suppress protection,
         # reconciliation, or Exit Manager work for existing exposure.
@@ -261,11 +273,50 @@ class StrategyEngine:
                 "strategy_engine", "position_fetch_failure", "critical", "failed", error=exc,
             )
             raise
-        self._resolve_pending_entries(positions)
+        try:
+            self._recover_unjournaled_entry_intents()
+        except Exception as exc:
+            self.telemetry.record_health(
+                "entry_recovery", "entry_intent_recovery_failure",
+                "critical", "deferred", error=exc,
+                details={"position_management_continued": True,
+                         "new_entries_allowed": False},
+            )
+            logger.exception("Durable entry-intent recovery deferred; position management continues")
+        try:
+            protection = self._watch_protection(positions)
+        except Exception as exc:
+            protection = {}
+            self._protection_entry_halt = "protection watchdog failed"
+            self.telemetry.record_health(
+                "protection_watchdog", "protection_watchdog_failure",
+                "critical", "unknown", error=exc,
+                details={"position_management_continued": True,
+                         "new_entries_allowed": False},
+            )
+            logger.exception("Protection watchdog failed; position management continues")
+        try:
+            self._resolve_pending_entries(positions)
+        except Exception as exc:
+            self.telemetry.record_health(
+                "risk_state", "pending_entry_recovery_failure",
+                "critical", "deferred", error=exc,
+                details={"position_management_continued": True,
+                         "new_entries_allowed": False},
+            )
+            logger.exception("Pending-entry recovery deferred; position management continues")
         self._manage_time_range_tightening(positions)
         self._manage_trailing_stops(positions)
         reconciliation_started = time.monotonic()
-        self._sync_closed_trades(positions)
+        try:
+            self._sync_closed_trades(positions)
+        except Exception as exc:
+            self.telemetry.record_health(
+                "reconciliation", "reconciliation_database_failure",
+                "critical", "deferred", error=exc,
+                details={"position_management_continued": True},
+            )
+            logger.exception("Reconciliation deferred; position loop continues")
         reconciliation_seconds = time.monotonic() - reconciliation_started
         if reconciliation_seconds > self.cfg.decision_interval_sec:
             self.telemetry.record_health(
@@ -274,19 +325,14 @@ class StrategyEngine:
             )
 
         if self.telemetry.position_snapshot_due():
-            protection = {}
-            for position in positions:
-                symbol = position.get("symbol")
-                if not symbol or float(position.get("size") or 0) <= 0:
-                    continue
-                try:
-                    protection[symbol] = self.execution.get_active_protective_orders(symbol)
-                except Exception as exc:
-                    self.telemetry.record_health(
-                        "position_telemetry", "protective_order_fetch_failure", "error", "failed",
-                        symbol=symbol, error=exc,
-                    )
-            self.telemetry.persist_position_snapshots(positions, protective_orders=protection)
+            try:
+                self.telemetry.persist_position_snapshots(positions, protective_orders=protection)
+            except Exception as exc:
+                self.telemetry.record_health(
+                    "position_telemetry", "position_snapshot_database_failure",
+                    "critical", "deferred", error=exc,
+                )
+                logger.exception("Position snapshot deferred; position loop continues")
 
         balance = None
         try:
@@ -338,6 +384,34 @@ class StrategyEngine:
         if balance is not None:
             self._execute_ranked_candidates(candidates, balance, positions)
 
+    def _monitor_storage_capacity(self) -> None:
+        guard = getattr(self, "storage_guard", None)
+        if guard is None:
+            return
+        interval = max(10, int(getattr(self.cfg, "storage_monitor_interval_sec", 300)))
+        now = time.monotonic()
+        if now - getattr(self, "_last_storage_monitor_monotonic", 0.0) < interval:
+            return
+        self._last_storage_monitor_monotonic = now
+        try:
+            scheduled = self.telemetry.schedule_outbox_maintenance()
+            if not scheduled:
+                logger.debug("Telemetry outbox maintenance batch is already running")
+        except Exception as exc:
+            # Entry durability is checked independently below. Existing
+            # positions continue to use exchange-native protection.
+            self.telemetry.record_health(
+                "telemetry_outbox", "outbox_maintenance_failure",
+                "error", "degraded", error=exc,
+            )
+        status = guard.status()
+        self.telemetry.record_health(
+            "postgresql_storage", "storage_capacity_check",
+            "info" if status.get("entry_allowed") else "critical",
+            "ok" if status.get("entry_allowed") else "blocked",
+            details=status,
+        )
+
     def _resolve_pending_entries(self, positions: list):
         """
         Разбирает ордера, принятые биржей, но не подтверждённые как исполненные.
@@ -379,6 +453,239 @@ class StrategyEngine:
                     symbol, age,
                 )
 
+    def _recover_unjournaled_entry_intents(self) -> int:
+        """Rebuild a missing trade journal from durable intent plus Bybit fills.
+
+        This recovery is strictly read-only at the exchange.  UNKNOWN/ambiguous
+        outcomes remain unresolved and continue blocking another entry.
+        """
+        intents = getattr(self, "entry_intents", None)
+        if intents is None:
+            return 0
+        recovered = 0
+        for intent in intents.unresolved():
+            if intent.get("trade_log_id") or intent.get("state") in (
+                "prepared", "journaled", "closed",
+            ):
+                continue
+            symbol = intent["symbol"]
+            order_link_id = intent["order_link_id"]
+            confirmation = self.execution.confirm_order(symbol, order_link_id)
+            state = intent["state"]
+            if confirmation.status == FillStatus.REJECTED:
+                if state in ("submitted", "accepted"):
+                    intents.transition(
+                        intent["intent_id"], "rejected", last_error=confirmation.detail,
+                    )
+                continue
+            if confirmation.status == FillStatus.UNKNOWN:
+                self.telemetry.record_health(
+                    "entry_recovery", "entry_intent_exchange_state_unknown",
+                    "critical", "unresolved", symbol=symbol,
+                    details={"intent_id": intent["intent_id"],
+                             "order_link_id": order_link_id},
+                )
+                continue
+            if state == "submitted":
+                intents.transition(
+                    intent["intent_id"], "accepted",
+                    exchange_order_id=confirmation.raw.get("orderId"),
+                )
+                state = "accepted"
+            if not confirmation.has_exposure:
+                continue
+            if not confirmation.avg_price or confirmation.filled_qty <= 0:
+                self.telemetry.record_health(
+                    "entry_recovery", "entry_fill_evidence_incomplete",
+                    "critical", "unresolved", symbol=symbol,
+                    details={"intent_id": intent["intent_id"],
+                             "order_link_id": order_link_id,
+                             "fill_status": confirmation.status.value},
+                )
+                continue
+            fill_state = (
+                "partially_filled" if confirmation.status == FillStatus.PARTIALLY_FILLED
+                else "filled"
+            )
+            if state in ("accepted", "partially_filled"):
+                intents.transition(
+                    intent["intent_id"], fill_state,
+                    filled_quantity=confirmation.filled_qty,
+                    weighted_entry=confirmation.avg_price,
+                )
+
+            payload = intent.get("structured_payload") or {}
+            risk = payload.get("risk_check") or {}
+            entry = float(confirmation.avg_price)
+            quantity = float(confirmation.filled_qty)
+            actual_notional = entry * quantity
+            stop = _optional_float(intent.get("proposed_stop_loss"))
+            take_profit = _optional_float(intent.get("proposed_take_profit"))
+            stop_pct = abs(entry - stop) / entry * 100 if stop and entry else None
+            tp_pct = abs(take_profit - entry) / entry * 100 if take_profit and entry else None
+            action = intent.get("side")
+            entry_snapshot = payload.get("entry_snapshot") or {}
+            executions = self.execution.get_executions(
+                symbol, order_link_id=order_link_id
+            )
+            fee_reader = getattr(self.execution, "get_order_fee_usdt", None)
+            entry_fee = fee_reader(symbol, order_link_id) if fee_reader else None
+            saved = self.journal.log_entry(
+                symbol=symbol, action=action, source="restart_recovery",
+                reason="recovered from durable pre-order intent and exchange fill",
+                entry_price=entry, size_usdt=actual_notional,
+                leverage=int(risk.get("approved_leverage") or 1),
+                stop_loss_pct=stop_pct, take_profit_pct=tp_pct,
+                order_link_id=order_link_id,
+                entry_reason="restart recovery: durable intent + confirmed Bybit fill",
+                entry_snapshot=entry_snapshot, run_id=intent.get("run_id"),
+                exchange_entry_order_id=(confirmation.raw.get("orderId")
+                                         or intent.get("exchange_order_id")),
+                entry_requested_qty=intent.get("requested_quantity"),
+                entry_filled_qty=quantity, stop_loss_price=stop,
+                take_profit_price=take_profit, entry_fee_usdt=entry_fee,
+            )
+            if not saved:
+                # log_entry is idempotent by orderLinkId. Confirm whether a
+                # previous recovery already created it before changing state.
+                existing = self.journal.get_open_trades(symbol)
+                if not any(t.get("order_link_id") == order_link_id for t in existing):
+                    raise RuntimeError(f"failed to journal recovered intent {order_link_id}")
+            self.journal.persist_normalized_executions(
+                order_link_id, executions, role="entry"
+            )
+            intents.transition(intent["intent_id"], "journaled")
+            self._record_initial_protection_readback(
+                symbol, order_link_id, stop, take_profit,
+                owner_run_id=intent.get("run_id"),
+            )
+            self.telemetry.record_health(
+                "entry_recovery", "entry_intent_recovered",
+                "warning", "recovered", symbol=symbol,
+                details={"intent_id": intent["intent_id"],
+                         "order_link_id": order_link_id,
+                         "owner_run_id": intent.get("run_id")},
+            )
+            recovered += 1
+        return recovered
+
+    def _watch_protection(self, positions: list) -> dict[str, list[dict]]:
+        """Read-only SL/TP watchdog. It never creates, cancels or replaces orders."""
+        protective: dict[str, list[dict]] = {}
+        unsafe = []
+        for position in positions:
+            symbol = position.get("symbol")
+            if not symbol or float(position.get("size") or 0) <= 0:
+                continue
+            try:
+                orders = self.execution.get_active_protective_orders(symbol)
+                protective[symbol] = orders
+            except Exception as exc:
+                unsafe.append(f"{symbol}: protection read-back unavailable")
+                self.telemetry.record_health(
+                    "protection_watchdog", "protective_order_fetch_failure",
+                    "critical", "unknown", symbol=symbol, error=exc,
+                    details={"exchange_mutation_attempted": False},
+                )
+                continue
+            current_sl = _optional_float(position.get("stopLoss"))
+            current_tp = _optional_float(position.get("takeProfit"))
+            active_types = {
+                order.get("stopOrderType") for order in orders
+                if order.get("orderStatus") not in ("Cancelled", "Rejected", "Deactivated")
+            }
+            expected_source = getattr(
+                getattr(self, "cfg", None), "protective_trigger_by", None
+            )
+            active_sources = {
+                order.get("stopOrderType"): order.get("triggerBy")
+                for order in orders
+                if order.get("orderStatus") not in ("Cancelled", "Rejected", "Deactivated")
+                and order.get("stopOrderType")
+            }
+            sources_match = bool(
+                expected_source is None
+                or all(
+                    active_sources.get(kind) == expected_source
+                    for kind in ("StopLoss", "TakeProfit")
+                )
+            )
+            has_child_ids = any(order.get("orderId") for order in orders)
+            required_types = {"StopLoss", "TakeProfit"}
+            verified = bool(
+                current_sl and current_tp and has_child_ids
+                and required_types.issubset(active_types)
+                and sources_match
+            )
+            open_trades = []
+            try:
+                open_trades = self.journal.get_open_trades(symbol)
+            except Exception as exc:
+                unsafe.append(f"{symbol}: journal unavailable during protection verification")
+                self.telemetry.record_health(
+                    "protection_watchdog", "protection_owner_lookup_failure",
+                    "critical", "unknown", symbol=symbol, error=exc,
+                )
+            trade = open_trades[0] if len(open_trades) == 1 else {"symbol": symbol}
+            if verified:
+                self.telemetry.record_protection_event(
+                    trade, "verified_active", None,
+                    {"stop_loss": current_sl, "take_profit": current_tp,
+                     "child_order_ids": [o.get("orderId") for o in orders if o.get("orderId")],
+                     "active_types": sorted(t for t in active_types if t),
+                     "expected_trigger_source": expected_source,
+                     "observed_trigger_sources": active_sources},
+                    reason="read-only watchdog verified exchange-native protection",
+                    source_module="strategy.engine", success=True,
+                    raw_status={"position": position, "orders": orders},
+                    state_deduplicated=True,
+                )
+            else:
+                # A natural exchange-side close can race with the position
+                # snapshot captured at the top of this cycle.  Re-read before
+                # declaring missing protection; this request never mutates an
+                # order.  A confirmed zero-size position is terminal, not
+                # unprotected exposure.
+                try:
+                    fresh_position = self._find_open_position(
+                        symbol, self.execution.get_open_positions()
+                    )
+                except Exception as exc:
+                    fresh_position = position
+                    self.telemetry.record_health(
+                        "protection_watchdog", "position_recheck_failure",
+                        "error", "unknown", symbol=symbol, error=exc,
+                        details={"missing_protection_alarm_retained": True},
+                    )
+                if fresh_position is None:
+                    self.telemetry.record_protection_event(
+                        trade, "position_closed", None,
+                        {"child_order_ids": [
+                            o.get("orderId") for o in orders if o.get("orderId")
+                        ]},
+                        reason="position disappeared before missing-protection alarm",
+                        source_module="strategy.engine", success=True,
+                        raw_status={"stale_position": position, "orders": orders},
+                        state_deduplicated=True,
+                    )
+                    continue
+                unsafe.append(f"{symbol}: missing or partial exchange protection")
+                self.telemetry.record_protection_event(
+                    trade, "missing_protection_detected", None,
+                    {"stop_loss": current_sl, "take_profit": current_tp,
+                     "child_order_ids": [o.get("orderId") for o in orders if o.get("orderId")],
+                     "active_types": sorted(t for t in active_types if t)},
+                    reason="watchdog could not verify complete exchange-native SL/TP",
+                    source_module="strategy.engine", success=False,
+                    raw_status={"position": position, "orders": orders},
+                    state_deduplicated=True,
+                )
+        self._protection_entry_halt = (
+            "protection watchdog blocks new entries: " + "; ".join(unsafe)
+            if unsafe else None
+        )
+        return protective
+
     def _manage_trailing_stops(self, positions: list):
         """
         Проверяет открытые позиции: если нереализованная прибыль достигла
@@ -386,10 +693,18 @@ class StrategyEngine:
         """
         if not self.cfg.trailing_stop_enabled:
             return
-        open_by_symbol = (
-            {t["symbol"]: t for t in self.journal.get_open_trades()}
-            if self.cfg.trading_enabled else {}
-        )
+        try:
+            open_by_symbol = (
+                {t["symbol"]: t for t in self.journal.get_open_trades()}
+                if self.cfg.trading_enabled else {}
+            )
+        except Exception as exc:
+            self.telemetry.record_health(
+                "position_management", "trailing_state_unavailable",
+                "critical", "deferred", error=exc,
+                details={"exchange_mutation_attempted": False},
+            )
+            return
         for p in positions:
             try:
                 size = float(p.get("size", 0))
@@ -471,7 +786,15 @@ class StrategyEngine:
             logger.error("TIME_RANGE_TIGHTENING factors=%s вне диапазона (0, 1)", factors)
             return
 
-        open_by_symbol = {t["symbol"]: t for t in self.journal.get_open_trades()}
+        try:
+            open_by_symbol = {t["symbol"]: t for t in self.journal.get_open_trades()}
+        except Exception as exc:
+            self.telemetry.record_health(
+                "position_management", "tightening_state_unavailable",
+                "critical", "deferred", error=exc,
+                details={"exchange_mutation_attempted": False},
+            )
+            return
         now = utcnow()
         for p in positions:
             symbol = p.get("symbol", "")
@@ -593,6 +916,14 @@ class StrategyEngine:
                         symbol, current_sl, applied_sl, current_tp, applied_tp,
                     )
                     continue
+                if not self._verify_protection_amendment_readback(
+                    trade, symbol, applied_sl, applied_tp
+                ):
+                    # Do not retry the exchange mutation in this cycle. The
+                    # next fresh position snapshot either recovers the durable
+                    # flag from observed tighter prices or keeps entries
+                    # fail-closed while the state is uncertain.
+                    continue
                 if not mark_tightened(
                     trade["order_link_id"], applied_sl, applied_tp
                 ):
@@ -616,6 +947,69 @@ class StrategyEngine:
                 )
             except Exception:
                 logger.exception("Ошибка time-based сужения защиты для %s", symbol)
+
+    def _verify_protection_amendment_readback(
+        self, trade: dict, symbol: str, expected_sl: float, expected_tp: float
+    ) -> bool:
+        """Read back an amendment without ever creating/replacing an order."""
+        if not all(hasattr(self.execution, name) for name in (
+            "get_open_positions", "get_active_protective_orders"
+        )):
+            # Compatibility for isolated non-exchange adapters. The real
+            # ExecutionEngine always supports both read-only endpoints.
+            return True
+        try:
+            positions = self.execution.get_open_positions()
+            position = self._find_open_position(symbol, positions)
+            orders = self.execution.get_active_protective_orders(symbol)
+        except Exception as exc:
+            self._protection_entry_halt = f"protection amendment read-back failed for {symbol}"
+            self.telemetry.record_protection_event(
+                trade, "protection_readback_failed", None,
+                {"expected_stop_loss": expected_sl, "expected_take_profit": expected_tp},
+                reason="post-amendment read-back API failure",
+                source_module="strategy.engine", success=False,
+                raw_status={"error": str(exc)},
+            )
+            return False
+        current_sl = _optional_float((position or {}).get("stopLoss"))
+        current_tp = _optional_float((position or {}).get("takeProfit"))
+        expected_source = getattr(self.cfg, "protective_trigger_by", "LastPrice")
+        active = [
+            order for order in orders
+            if order.get("orderStatus") not in ("Cancelled", "Rejected", "Deactivated")
+        ]
+        source_by_type = {
+            order.get("stopOrderType"): order.get("triggerBy")
+            for order in active if order.get("stopOrderType")
+        }
+        tolerance = max(abs(expected_sl), abs(expected_tp), 1.0) * 1e-8
+        prices_match = bool(
+            current_sl is not None and current_tp is not None
+            and abs(current_sl - expected_sl) <= tolerance
+            and abs(current_tp - expected_tp) <= tolerance
+        )
+        types_match = {"StopLoss", "TakeProfit"}.issubset(source_by_type)
+        # Some older Bybit/fake payloads omit triggerBy. That is explicitly
+        # unverified rather than silently assumed to match configuration.
+        sources_match = types_match and all(
+            source_by_type[kind] == expected_source
+            for kind in ("StopLoss", "TakeProfit")
+        )
+        verified = bool(position and prices_match and sources_match)
+        self.telemetry.record_protection_event(
+            trade, "exchange_acknowledged", None,
+            {"stop_loss": current_sl, "take_profit": current_tp,
+             "trigger_source": expected_source,
+             "child_order_ids": [o.get("orderId") for o in active if o.get("orderId")]},
+            reason="post-amendment exchange read-back",
+            source_module="strategy.engine", success=verified,
+            raw_status={"position": position, "orders": orders},
+            state_deduplicated=True,
+        )
+        if not verified:
+            self._protection_entry_halt = f"protection amendment unverified for {symbol}"
+        return verified
 
     def _sync_closed_trades(self, positions: Optional[list] = None):
         """
@@ -721,9 +1115,39 @@ class StrategyEngine:
                     )
                     continue
                 self._persist_exchange_order_evidence(trade, order_history, match)
-                self._apply_closed_pnl(
-                    symbol, trade, match, exec_by_order_id, executions_by_order_id
+                anomaly_writer = getattr(self.journal, "record_reconciliation_anomalies", None)
+                if anomaly_writer and item.get("validation_anomalies"):
+                    anomaly_writer(
+                        trade["order_link_id"], match.get("orderId"),
+                        item["validation_anomalies"],
+                    )
+                entry_execution_at, final_exit_execution_at = (
+                    self._persist_normalized_execution_evidence(trade, match, executions)
                 )
+                self._apply_closed_pnl(
+                    symbol, trade, match, exec_by_order_id, executions_by_order_id,
+                    entry_execution_at=entry_execution_at,
+                    final_exit_execution_at=final_exit_execution_at,
+                )
+
+    def _persist_normalized_execution_evidence(
+        self, trade: dict, match: dict, executions: list[dict]
+    ):
+        writer = getattr(self.journal, "persist_normalized_executions", None)
+        if writer is None:
+            return None, None
+        closing_ids = set(match.get("orderIds") or [match.get("orderId")])
+        entry_order_id = trade.get("exchange_entry_order_id")
+        entry_rows = [
+            row for row in executions
+            if (entry_order_id and row.get("orderId") == entry_order_id)
+            or row.get("orderLinkId") == trade.get("order_link_id")
+        ]
+        exit_rows = [row for row in executions if row.get("orderId") in closing_ids]
+        entry_times = writer(trade["order_link_id"], entry_rows, role="entry")
+        exit_times = writer(trade["order_link_id"], exit_rows, role="exit")
+        return (min(entry_times) if entry_times else None,
+                max(exit_times) if exit_times else None)
 
     def _backfill_exchange_order_evidence(self, symbol: str) -> None:
         """Retry durable order linkage after transient order-history gaps.
@@ -819,6 +1243,8 @@ class StrategyEngine:
         match: dict,
         exec_by_order_id: Optional[dict] = None,
         executions_by_order_id: Optional[dict] = None,
+        entry_execution_at=None,
+        final_exit_execution_at=None,
     ):
         """
         Записывает найденный результат сделки. Единственная точка, где дневной
@@ -880,6 +1306,8 @@ class StrategyEngine:
                 oid: list((executions_by_order_id or {}).get(oid, []))
                 for oid in execution_records
             },
+            entry_execution_at=entry_execution_at,
+            final_exit_execution_at=final_exit_execution_at,
         )
         if not result.recorded:
             if result.already_closed:
@@ -917,6 +1345,17 @@ class StrategyEngine:
             funding=None,
             reconciliation_status=RECONCILIATION_MATCHED,
         )
+        self._apply_protective_slippage_breaker(order_link_id, symbol)
+        intents = getattr(self, "entry_intents", None)
+        if intents is not None:
+            try:
+                intents.transition_by_order_link(order_link_id, "closed")
+                intents.transition_by_order_link(order_link_id, "reconciled")
+            except Exception:
+                logger.exception(
+                    "%s: trade closed but durable entry intent transition failed",
+                    order_link_id,
+                )
         self.telemetry.record_protection_event(
             trade, "final_trigger", None,
             {"exit_reason": exit_reason, "closing_order_ids": [r.get("orderId") for r in records]},
@@ -1138,6 +1577,12 @@ class StrategyEngine:
         trade_flow = self._load_trade_flow(symbol, minutes=15)
         liquidations = self._load_recent_liquidations(symbol, minutes=60)
         freshness = self._check_data_freshness(symbol, candles_df, funding_info, oi_trend, orderbook, trade_flow)
+        health_warnings = {
+            "stale_orderbook": [],
+            "stale_trade_flow": [],
+            "stale_candle": [],
+            "market_data_quality_warning": [],
+        }
         for warning in freshness["warnings"]:
             event_type = "market_data_quality_warning"
             if warning.startswith("orderbook stale") or warning.startswith("orderbook missing"):
@@ -1146,10 +1591,24 @@ class StrategyEngine:
                 event_type = "stale_trade_flow"
             elif warning.startswith("candles stale"):
                 event_type = "stale_candle"
-            self.telemetry.record_health(
-                "market_data", event_type, "warning", "stale", symbol=symbol,
-                details={"warning": warning},
+            health_warnings[event_type].append(warning)
+        for event_type, warnings in health_warnings.items():
+            condition_recorder = getattr(
+                self.telemetry, "record_health_condition", None
             )
+            if callable(condition_recorder):
+                condition_recorder(
+                    "market_data", event_type, active=bool(warnings),
+                    severity="warning", status="stale", symbol=symbol,
+                    details={"warnings": warnings},
+                )
+            elif warnings:
+                # Compatibility for deliberately minimal telemetry adapters;
+                # the production TelemetryStore always uses condition state.
+                self.telemetry.record_health(
+                    "market_data", event_type, "warning", "stale", symbol=symbol,
+                    details={"warnings": warnings},
+                )
         if freshness["critical"]:
             logger.warning("%s: пропускаю символ из-за устаревших критичных данных: %s", symbol, "; ".join(freshness["warnings"]))
             candle_ts = from_epoch_ms(int(candles_df["start_time"].iloc[-1]))
@@ -1482,6 +1941,60 @@ class StrategyEngine:
             logger.info("%s: сигнал %s не исполнен: TRADING_ENABLED=false", symbol, final_signal.action.value)
             return False
 
+        epoch, digest = self.telemetry.current_policy()
+        proposed_sl_pct = final_signal.stop_loss_pct or self.cfg.default_stop_loss_pct
+        proposed_sl = self._price_from_pct(
+            last_price, final_signal.action, proposed_sl_pct, is_stop=True
+        )
+        proposed_tp = self._price_from_pct(
+            last_price, final_signal.action, final_signal.take_profit_pct, is_stop=False
+        )
+        proposed_qty = (
+            check.approved_size_usdt / last_price
+            if check.approved_size_usdt and last_price else None
+        )
+        evaluation_id = candidate.evaluation_id or hashlib.sha256(
+            f"{self.cfg.run_id}|{symbol}|{final_signal.action.value}|{last_price}|{final_signal.reason}".encode()
+        ).hexdigest()
+        try:
+            intent = self.entry_intents.prepare(
+                evaluation_id=evaluation_id, symbol=symbol,
+                side=final_signal.action.value, requested_quantity=proposed_qty,
+                requested_notional=check.approved_size_usdt, proposed_entry=last_price,
+                proposed_stop_loss=proposed_sl, proposed_take_profit=proposed_tp,
+                policy_epoch=epoch, config_hash=digest,
+                structured_payload={
+                    "evaluation_id": evaluation_id,
+                    "entry_snapshot": candidate.entry_snapshot,
+                    "risk_check": {
+                        "approved_size_usdt": check.approved_size_usdt,
+                        "approved_leverage": check.approved_leverage,
+                    },
+                },
+            )
+        except Exception:
+            logger.exception("%s: durable entry intent unavailable — exchange order blocked", symbol)
+            return False
+        if not intent.created:
+            logger.critical(
+                "%s: duplicate/recovered entry intent %s state=%s — automatic resubmission blocked",
+                symbol, intent.intent_id, intent.state,
+            )
+            return False
+        self.entry_intents.transition(intent.intent_id, "submitted")
+        protection_identity = {"symbol": symbol, "order_link_id": intent.order_link_id}
+        if not self.telemetry.record_protection_event(
+            protection_identity, "protection_requested", None,
+            {"stop_loss": proposed_sl, "take_profit": proposed_tp},
+            reason="attached protection included in prepared entry order",
+            source_module="strategy.engine", success=True,
+            exchange_order_link_id=intent.order_link_id,
+        ):
+            logger.critical(
+                "%s: durable protection request event unavailable — exchange order blocked", symbol
+            )
+            return False
+
         resp = self.execution.open_position(
             symbol=symbol,
             action=final_signal.action,
@@ -1491,6 +2004,7 @@ class StrategyEngine:
             stop_loss_pct=final_signal.stop_loss_pct or self.cfg.default_stop_loss_pct,
             take_profit_pct=final_signal.take_profit_pct,
             source=final_signal.source,
+	    order_link_id=intent.order_link_id,
 	)
         if resp.get("retCode") == 0:
             order_link_id = (
@@ -1498,6 +2012,19 @@ class StrategyEngine:
                 or resp.get("result", {}).get("orderLinkId")
                 or resp.get("retExtInfo", {}).get("orderLinkId")
                 or ""
+            )
+            self.entry_intents.transition(
+                intent.intent_id, "accepted",
+                exchange_order_id=resp.get("result", {}).get("orderId"),
+            )
+            self.telemetry.record_protection_event(
+                protection_identity, "exchange_acknowledged", None,
+                {"stop_loss": resp.get("local_stop_loss_price"),
+                 "take_profit": resp.get("local_take_profit_price")},
+                reason="Bybit accepted entry request containing attached protection",
+                source_module="execution.execution_engine", success=True, raw_status=resp,
+                exchange_order_id=resp.get("result", {}).get("orderId"),
+                exchange_order_link_id=intent.order_link_id,
             )
 
             # Биржа приняла запрос — с этой секунды возможна реальная экспозиция.
@@ -1521,6 +2048,18 @@ class StrategyEngine:
                 return True
 
             confirmation = self._confirm_entry_fill(symbol, order_link_id)
+            if confirmation.status == FillStatus.PARTIALLY_FILLED:
+                self.entry_intents.transition(
+                    intent.intent_id, "partially_filled",
+                    filled_quantity=confirmation.filled_qty,
+                    weighted_entry=confirmation.avg_price,
+                )
+            elif confirmation.status == FillStatus.FILLED:
+                self.entry_intents.transition(
+                    intent.intent_id, "filled",
+                    filled_quantity=confirmation.filled_qty,
+                    weighted_entry=confirmation.avg_price,
+                )
 
             # Реальные цифры исполнения важнее наших предположений.
             # last_price — это закрытие свечи из БД, а не цена сделки; именно
@@ -1539,6 +2078,9 @@ class StrategyEngine:
                     )
 
             if confirmation.status == FillStatus.REJECTED:
+                self.entry_intents.transition(
+                    intent.intent_id, "rejected", last_error=confirmation.detail,
+                )
                 # Экспозиции нет. Cooldown и счётчик оставляем взведёнными
                 # намеренно: отклонённый ордер — сигнал, что по символу что-то
                 # не так, и долбиться в него в том же цикле не нужно.
@@ -1629,20 +2171,32 @@ class StrategyEngine:
                     symbol, order_link_id,
                 )
             else:
-                self.telemetry.record_protection_event(
-                    {"symbol": symbol, "order_link_id": order_link_id},
-                    "initial_protection_created", None,
-                    {"stop_loss": stop_loss_price, "take_profit": take_profit_price},
-                    reason="position entry", source_module="execution.execution_engine",
-                    success=True, raw_status=resp,
-                    exchange_order_id=exchange_entry_order_id,
-                    exchange_order_link_id=order_link_id,
+                self.entry_intents.transition(intent.intent_id, "journaled")
+                try:
+                    entry_executions = self.execution.get_executions(
+                        symbol, order_link_id=order_link_id
+                    )
+                    self.journal.persist_normalized_executions(
+                        order_link_id, entry_executions, role="entry"
+                    )
+                except Exception as exc:
+                    self.telemetry.record_health(
+                        "execution_evidence", "entry_execution_readback_failure",
+                        "error", "degraded", symbol=symbol, error=exc,
+                        details={"order_link_id": order_link_id},
+                    )
+                self._record_initial_protection_readback(
+                    symbol, order_link_id, stop_loss_price, take_profit_price
                 )
             return True
 
         logger.warning(
             "%s: ордер отклонён биржей retCode=%s retMsg=%s",
             symbol, resp.get("retCode"), resp.get("retMsg"),
+        )
+        self.entry_intents.transition(
+            intent.intent_id, "rejected",
+            last_error=f"retCode={resp.get('retCode')} retMsg={resp.get('retMsg')}",
         )
         return False
 
@@ -1693,6 +2247,146 @@ class StrategyEngine:
             )
         return confirmation
 
+    def _apply_protective_slippage_breaker(self, order_link_id: str, symbol: str) -> bool:
+        """Block future entries after execution leaves the proven risk envelope.
+
+        Two independent defects are covered:
+
+        * anomalous trigger-to-fill slippage on an exchange protective order;
+        * any final realized loss beyond the configured R envelope, including
+          direct/Exit Manager closes where protective-slippage classification
+          is unavailable.
+
+        This method never changes or cancels an existing position/order.
+        """
+        reader = getattr(self.telemetry, "get_exit_slippage", None)
+        if not callable(reader):
+            return False
+        try:
+            evidence = reader(order_link_id)
+        except Exception as exc:
+            health = getattr(self.telemetry, "record_health", None)
+            if callable(health):
+                health(
+                    "protective_execution", "slippage_evidence_unavailable",
+                    "critical", "unknown", symbol=symbol, error=exc,
+                    details={"order_link_id": order_link_id},
+                )
+            return False
+        if not evidence:
+            return False
+        realized_r = evidence.get("realized_r")
+        cfg = getattr(self, "cfg", None)
+        max_loss_r = max(0.0, float(getattr(cfg, "max_realized_loss_r", 1.5)))
+        envelope_breached = bool(
+            max_loss_r > 0
+            and realized_r is not None
+            and float(realized_r) <= -max_loss_r
+        )
+        anomalous_slippage = evidence.get("classification") == "anomalous"
+        if not envelope_breached and not anomalous_slippage:
+            return False
+
+        if envelope_breached:
+            cause = f"exit_risk_envelope:{order_link_id}"
+            event_type = "realized_loss_risk_envelope_breach"
+            reason = (
+                f"realized loss outside risk envelope for {symbol} {order_link_id}: "
+                f"realized_r={realized_r}, limit=-{max_loss_r}R, "
+                f"exit_reason={evidence.get('actual_exit_reason')}"
+            )
+        else:
+            cause = f"protective_slippage:{order_link_id}"
+            event_type = "anomalous_trigger_to_fill_slippage"
+            reason = (
+                f"anomalous protective execution for {symbol} {order_link_id}: "
+                f"slippage_pct={evidence.get('slippage_pct')} "
+                f"slippage_r={evidence.get('slippage_r')}"
+            )
+        self.risk_manager.trip_circuit_breaker(reason, sticky=True, cause=cause)
+        self.telemetry.record_health(
+            "protective_execution", event_type,
+            "critical", "entries_blocked", symbol=symbol,
+            details={
+                "order_link_id": order_link_id,
+                "breaker_cause": cause,
+                "max_realized_loss_r": max_loss_r,
+                "existing_position_management_continues": True,
+                **evidence,
+            },
+        )
+        return True
+
+    def _record_initial_protection_readback(
+        self, symbol: str, order_link_id: str,
+        expected_sl: Optional[float], expected_tp: Optional[float],
+        owner_run_id: Optional[str] = None,
+    ) -> bool:
+        """Observe attached protection once after fill; never repairs exchange state."""
+        trade = {"symbol": symbol, "order_link_id": order_link_id,
+                 "run_id": owner_run_id or self.cfg.run_id}
+        try:
+            positions = self.execution.get_open_positions()
+            position = self._find_open_position(symbol, positions)
+            orders = self.execution.get_active_protective_orders(symbol)
+        except Exception as exc:
+            self._protection_entry_halt = f"protection read-back failed for {symbol}"
+            self.telemetry.record_protection_event(
+                trade, "protection_readback_failed", None,
+                {"expected_stop_loss": expected_sl, "expected_take_profit": expected_tp},
+                reason="post-entry read-back API failure", source_module="strategy.engine",
+                success=False, raw_status={"error": str(exc)},
+            )
+            return False
+        child_ids = [order.get("orderId") for order in orders if order.get("orderId")]
+        self.telemetry.record_protection_event(
+            trade, "child_ids_observed", None,
+            {"child_order_ids": child_ids,
+             "orders": [{"order_id": o.get("orderId"),
+                         "order_link_id": o.get("orderLinkId"),
+                         "parent_order_link_id": o.get("parentOrderLinkId"),
+                         "type": o.get("stopOrderType"), "status": o.get("orderStatus")}
+                        for o in orders]},
+            reason="post-entry read-back", source_module="strategy.engine",
+            success=bool(child_ids), raw_status={"orders": orders},
+            state_deduplicated=True,
+        )
+        current_sl = _optional_float((position or {}).get("stopLoss"))
+        current_tp = _optional_float((position or {}).get("takeProfit"))
+        active_types = {
+            order.get("stopOrderType") for order in orders
+            if order.get("orderStatus") not in ("Cancelled", "Rejected", "Deactivated")
+        }
+        expected_source = getattr(self.cfg, "protective_trigger_by", "LastPrice")
+        active_sources = {
+            order.get("stopOrderType"): order.get("triggerBy")
+            for order in orders
+            if order.get("orderStatus") not in ("Cancelled", "Rejected", "Deactivated")
+            and order.get("stopOrderType")
+        }
+        trigger_sources_verified = all(
+            active_sources.get(kind) == expected_source
+            for kind in ("StopLoss", "TakeProfit")
+        )
+        verified = bool(
+            position and current_sl and current_tp and child_ids
+            and {"StopLoss", "TakeProfit"}.issubset(active_types)
+            and trigger_sources_verified
+        )
+        self.telemetry.record_protection_event(
+            trade, "verified_active" if verified else "missing_protection_detected",
+            None, {"stop_loss": current_sl, "take_profit": current_tp,
+                   "child_order_ids": child_ids,
+                   "expected_trigger_source": expected_source,
+                   "observed_trigger_sources": active_sources},
+            reason="post-entry exchange state verification", source_module="strategy.engine",
+            success=verified, raw_status={"position": position, "orders": orders},
+            state_deduplicated=True,
+        )
+        if not verified:
+            self._protection_entry_halt = f"protection watchdog blocks new entries: {symbol} unverified"
+        return verified
+
     @staticmethod
     def _find_open_position(symbol: str, positions: list) -> Optional[dict]:
         for p in positions:
@@ -1723,6 +2417,29 @@ class StrategyEngine:
         """
         if self._find_open_position(symbol, positions) is not None:
             return f"по {symbol} уже есть живая позиция на бирже"
+
+        protection_halt = getattr(self, "_protection_entry_halt", None)
+        if protection_halt:
+            return protection_halt
+
+        guard = getattr(self, "storage_guard", None)
+        if guard is not None:
+            storage = guard.status()
+            if not storage.get("entry_allowed"):
+                return storage.get("reason") or "durable database storage guard blocked entry"
+
+        intents = getattr(self, "entry_intents", None)
+        if intents is not None:
+            try:
+                unresolved_intent = intents.blocking_intent(symbol)
+            except Exception:
+                logger.exception("%s: entry intent state unavailable — entry blocked", symbol)
+                return "durable entry intent state unavailable"
+            if unresolved_intent:
+                return (
+                    f"durable entry intent {unresolved_intent['order_link_id']} remains "
+                    f"{unresolved_intent['state']}"
+                )
 
         try:
             open_trades = self.journal.get_open_trades(symbol)

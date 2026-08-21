@@ -135,6 +135,17 @@ Initial protection, missing protection, rejected/successful tightening, trailing
 
 `trade_exit_events` records the journal reason, requested Exit Manager reason, exchange-observed mechanism, all closing order/execution IDs, realized P&L, fees, realized R and finalized MFE/MAE. Trade-scoped funding remains `NULL` when Bybit closed-PnL cannot isolate it; `closedPnl` is retained exactly and no funding amount is invented.
 
+Static SL/TP creation and amendment support `LastPrice` and `MarkPrice` through
+`PROTECTIVE_TRIGGER_BY`; `LastPrice` remains the default. Read-back must observe
+both child IDs and the configured trigger source before protection is verified.
+Bybit trailing stop does not expose the same configurable trigger source in the
+used V5 endpoint, so this option does not silently claim to alter trailing
+semantics. Protective exits persist intended trigger, source, nearest retained
+mark/last observation, weighted fill, absolute/%/R slippage and a
+normal/elevated/anomalous classification. Bybit history does not provide a
+certified trigger timestamp, so the near-trigger market observation is a
+fill-time proxy and is labeled as such in raw evidence.
+
 ## Failure isolation and health telemetry
 
 The prior top-of-cycle control flow fetched wallet balance before positions. A wallet failure raised out of `run_once` and skipped all position management. The flow now:
@@ -150,13 +161,26 @@ The prior top-of-cycle control flow fetched wallet balance before positions. A w
 
 This changes failure isolation, not an exit rule. If the position endpoint itself fails, the cycle fails closed because there is no safe exchange position state.
 
-Durable health events cover REST refresh failures, WS callback failures, stale WS/reconnect/recovery, stale candles, account/position/protective-order fetch failures, restart recovery and heartbeat failures/recovery. Telemetry writes retry; if PostgreSQL is unavailable, the failure is buffered in memory and persisted as `database_write_failure` after connectivity returns. The buffer is necessarily ephemeral if the process and database fail simultaneously and the process dies before recovery; stderr remains the last-resort evidence for that narrow case.
+Durable health events cover REST refresh failures, WS callback failures, stale WS/reconnect/recovery, stale candles, account/position/protective-order fetch failures, restart recovery and heartbeat failures/recovery. Critical decision, protection, exit and health commands use a PostgreSQL write-ahead outbox with deterministic event keys, bounded exponential retry and dead-letter status. A bounded in-memory queue is used only for the narrow case where PostgreSQL itself cannot accept the outbox row; stderr remains the last-resort evidence if both the process and database fail before recovery. New entries fail closed while durable storage is unavailable.
+
+Collector reconnect uses bounded exponential backoff with jitter, a stable
+connection reset window and a finite degradation budget. Exhausting the budget
+exits the collector so `live_run.py run`/Railway can restart the supervised
+container. During a WS outage, closed strategy candles are backfilled from the
+last durable boundary via REST. This does not manufacture healthy order-book or
+public-trade flow state, so entry freshness checks remain fail-closed.
 
 Heartbeat errors no longer kill the heartbeat thread; it retries and records failure/recovery through the telemetry callback when storage permits.
 
 ## Retention and reconstruction
 
-Research-critical facts are durable PostgreSQL rows. There is no automatic telemetry deletion or compression policy in this migration. Retention is therefore the PostgreSQL service/operator policy. Railway platform logs and local rotating files remain useful diagnostics but are not required for reconstruction. Railway filesystem files, PIDs, locks, WebSocket objects and in-memory buffers are intentionally ephemeral.
+Research-critical facts are durable PostgreSQL rows and are never subject to automatic retention. Bounded retention applies only to raw high-frequency `trades`, `orderbook_snapshots` and `liquidations`; raw data at or after the oldest still-open trade is retained for excursion reconstruction. Deletes are batched. PostgreSQL capacity is monitored and new entries fail closed before the configured quota threshold. Railway platform logs and local rotating files remain useful diagnostics but are not required for reconstruction. Railway filesystem files, PIDs, locks, WebSocket objects and in-memory buffers are intentionally ephemeral.
+
+Delivered outbox envelopes are not the audit record: the normalized target
+rows are. Confirmed deliveries older than the configured retention window are
+deleted in bounded batches on a background maintenance thread. Pending,
+dead-letter and unconfirmed rows are never deleted. Metrics retain
+pending/delivered/dead-letter counts and oldest-pending age.
 
 ## Validation
 
@@ -184,6 +208,7 @@ BYBIT_TESTNET=true
 BYBIT_API_KEY=<Bybit Testnet key>
 BYBIT_API_SECRET=<Bybit Testnet secret>
 DATABASE_URL=${{Postgres.DATABASE_URL}}
+STORAGE_MAX_DATABASE_BYTES=<PostgreSQL volume quota in bytes>
 RAILWAY_DEPLOYMENT_DRAINING_SECONDS=30
 ```
 

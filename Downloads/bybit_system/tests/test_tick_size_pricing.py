@@ -196,6 +196,24 @@ class OrderParamsUseTickAwarePricesTest(unittest.TestCase):
         self.assertGreater(sl, 573.3)
         self.assertLess(tp, 573.3)
 
+    def test_entry_supports_last_and_mark_price_triggers(self):
+        from strategy.signal import Action
+        for source in ("LastPrice", "MarkPrice"):
+            execution = _execution()
+            execution.cfg.protective_trigger_by = source
+            execution.protective_trigger_by = source
+            execution.session = self.FakeSession()
+            execution._lot_size_cache["BNBUSDT"].update({
+                "qtyStep": 0.01, "minOrderQty": 0.01,
+            })
+            execution.open_position(
+                "BNBUSDT", Action.OPEN_SHORT, size_usdt=100, leverage=1,
+                last_price=573.3, stop_loss_pct=1.5, take_profit_pct=3.0,
+                source="test",
+            )
+            self.assertEqual(execution.session.last_params["slTriggerBy"], source)
+            self.assertEqual(execution.session.last_params["tpTriggerBy"], source)
+
 
 class TrailingStopTickTest(unittest.TestCase):
     class FakeSession:
@@ -255,6 +273,18 @@ class PositionProtectionTickTest(unittest.TestCase):
             execution.set_position_protection(
                 "BNBUSDT", "Buy", 573.3, 574.0, 578.0
             )
+
+    def test_amendment_supports_last_and_mark_price_triggers(self):
+        for source in ("LastPrice", "MarkPrice"):
+            execution = _execution()
+            execution.cfg.protective_trigger_by = source
+            execution.protective_trigger_by = source
+            execution.session = self.FakeSession()
+            execution.set_position_protection(
+                "BNBUSDT", "Buy", 573.3, 570.04, 578.06
+            )
+            self.assertEqual(execution.session.last["slTriggerBy"], source)
+            self.assertEqual(execution.session.last["tpTriggerBy"], source)
 
 
 if __name__ == "__main__":

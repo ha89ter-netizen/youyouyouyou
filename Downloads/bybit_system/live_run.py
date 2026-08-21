@@ -4,12 +4,14 @@ import argparse
 import hashlib
 import importlib
 import json
+import logging
 import os
 import secrets
 import signal
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -22,12 +24,49 @@ from runtime_control import DatabaseProcessLock, RUNTIME_DIR
 from storage.db import Database
 from storage.journal import TradeJournal
 from storage.migrations import run_safe_migrations
+from storage.durability import StorageGuard, apply_high_frequency_retention
 from storage.models import Candle, OrderbookSnapshot, PositionSnapshot, RunMetadata, TradeLog
 from storage.telemetry import TelemetryStore
 from timeutils import utcnow
 
 ROOT = Path(__file__).resolve().parent
 CURRENT_RUN = RUNTIME_DIR / "current_run.json"
+SUPERVISOR_INFO = RUNTIME_DIR / "supervisor.json"
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class CollectorRestartPolicy:
+    """Bounded process-level backoff, reset only after a stable collector."""
+
+    initial_seconds: float = 5.0
+    maximum_seconds: float = 60.0
+    stable_reset_seconds: float = 300.0
+    monotonic_fn: object = time.monotonic
+
+    def __post_init__(self):
+        self.initial_seconds = max(0.1, float(self.initial_seconds))
+        self.maximum_seconds = max(self.initial_seconds, float(self.maximum_seconds))
+        self.stable_reset_seconds = max(0.0, float(self.stable_reset_seconds))
+        self.failures = 0
+        self.started_at = None
+
+    def started(self) -> None:
+        self.started_at = self.monotonic_fn()
+
+    def failure_delay(self) -> float:
+        if (
+            self.started_at is not None
+            and self.monotonic_fn() - self.started_at >= self.stable_reset_seconds
+        ):
+            self.failures = 0
+        delay = min(
+            self.maximum_seconds,
+            self.initial_seconds * (2 ** self.failures),
+        )
+        self.failures += 1
+        self.started_at = None
+        return delay
 
 
 def _load_env_file() -> None:
@@ -82,9 +121,29 @@ def _service_info(service: str) -> dict:
     if not path.exists():
         return {}
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
     except (OSError, ValueError):
         return {}
+
+
+def _write_supervisor_info(run_id: str) -> None:
+    RUNTIME_DIR.mkdir(exist_ok=True)
+    SUPERVISOR_INFO.write_text(json.dumps({
+        "service": "supervisor",
+        "run_id": run_id,
+        "pid": os.getpid(),
+        "started_at": utcnow().isoformat(),
+    }, indent=2), encoding="utf-8")
+
+
+def _clear_own_supervisor_info() -> None:
+    info = _service_info("supervisor")
+    if info.get("pid") == os.getpid():
+        try:
+            SUPERVISOR_INFO.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _validate_runtime_config(cfg: BybitConfig) -> None:
@@ -108,6 +167,23 @@ def _validate_runtime_config(cfg: BybitConfig) -> None:
     if host in ("", "localhost", "127.0.0.1", "::1") or host.endswith(".localhost"):
         raise RuntimeError(
             "Railway mode requires external PostgreSQL; localhost DATABASE_URL is forbidden"
+        )
+    raw_capacity = os.getenv("STORAGE_MAX_DATABASE_BYTES", "").strip()
+    if not raw_capacity:
+        raise RuntimeError(
+            "STORAGE_MAX_DATABASE_BYTES is required in Railway mode so the bot can "
+            "block new entries before PostgreSQL fills again"
+        )
+    try:
+        capacity = int(raw_capacity)
+    except ValueError as exc:
+        raise RuntimeError(
+            "STORAGE_MAX_DATABASE_BYTES must be a positive integer in Railway mode"
+        ) from exc
+    if capacity <= 0:
+        raise RuntimeError(
+            "STORAGE_MAX_DATABASE_BYTES is required in Railway mode so the bot can "
+            "block new entries before PostgreSQL fills again"
         )
 
 
@@ -306,6 +382,18 @@ def _prepare(
     if not db.check_connection():
         raise RuntimeError("Database is unavailable")
     run_safe_migrations(db.engine)
+    deleted = apply_high_frequency_retention(db.engine, cfg)
+    logger.info("High-frequency retention applied before run: %s", deleted)
+    storage = StorageGuard(db, cfg).status()
+    if not storage["entry_allowed"]:
+        # Capacity pressure must fail closed for *new entries*, not prevent the
+        # process from supervising exchange-native protection and existing
+        # exposure. StrategyEngine applies the same guard before every entry.
+        logger.critical(
+            "PostgreSQL storage safety gate blocks new entries: %s; "
+            "startup continues for open-position management",
+            storage["reason"],
+        )
     if cfg.runtime_mode == "railway" and db.engine.dialect.name != "postgresql":
         raise RuntimeError("Railway durability check failed: database is not PostgreSQL")
 
@@ -411,6 +499,7 @@ def _wait_for_collector(
     run_id: str,
     timeout: int = 180,
     expected_pid: Optional[int] = None,
+    max_candle_age_minutes: int = 45,
 ) -> None:
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -430,9 +519,20 @@ def _wait_for_collector(
         finally:
             session.close()
         now_ms = int(time.time() * 1000)
+        expected_service_ready = (
+            expected_pid is None
+            or bool(
+                info
+                and info.get("run_id") == run_id
+                and info.get("pid") == expected_pid
+                and _process_alive(expected_pid)
+            )
+        )
         if (
             run and run.collector_heartbeat_at
-            and latest_candle and now_ms - int(latest_candle) < 20 * 60 * 1000
+            and expected_service_ready
+            and latest_candle
+            and now_ms - int(latest_candle) < max(1, max_candle_age_minutes) * 60 * 1000
             and latest_book and now_ms - int(latest_book) < 2 * 60 * 1000
         ):
             return
@@ -440,16 +540,61 @@ def _wait_for_collector(
     raise RuntimeError("Market data did not become fresh before timeout")
 
 
+def _spawn_detached_supervisor() -> subprocess.Popen:
+    """Start the same foreground supervisor used by Railway as a local daemon."""
+    env = os.environ.copy()
+    env.update({"BYBIT_TESTNET": "true", "TRADING_ENABLED": "true", "PYTHONUNBUFFERED": "1"})
+    log_dir = ROOT / "logs"
+    log_dir.mkdir(exist_ok=True)
+    stream = (log_dir / "supervisor.log").open("a", encoding="utf-8")
+    try:
+        return subprocess.Popen(
+            [sys.executable, "-u", str(ROOT / "live_run.py"), "run"],
+            cwd=ROOT, env=env, stdin=subprocess.DEVNULL,
+            stdout=stream, stderr=subprocess.STDOUT, start_new_session=True,
+        )
+    finally:
+        stream.close()
+
+
 def cmd_start(_args) -> int:
-    run_id, _cfg, db, _lock = _prepare()
-    sha = _commit_sha()
-    collector_pid = _spawn("main.py", run_id, sha)
-    print(f"collector_pid={collector_pid}", flush=True)
-    _wait_for_collector(db, run_id, expected_pid=collector_pid)
-    trader_pid = _spawn("trading_main.py", run_id, sha)
-    print(f"trader_pid={trader_pid}", flush=True)
-    print(f"run_id={run_id}", flush=True)
-    return 0
+    """Local detached mode, always backed by the restart-capable supervisor."""
+    _load_env_file()
+    _reload_config()
+    cfg = BybitConfig()
+    _validate_runtime_config(cfg)
+    if os.getenv("BYBIT_TESTNET", "").lower() != "true" or not cfg.testnet:
+        raise RuntimeError("Testnet safety gate failed")
+    for service in ("supervisor", "collector", "trader"):
+        info = _service_info(service)
+        if _process_alive(info.get("pid")):
+            raise RuntimeError(f"Duplicate {service} process is already alive")
+
+    supervisor = _spawn_detached_supervisor()
+    deadline = time.time() + 300
+    while time.time() < deadline:
+        code = supervisor.poll()
+        if code is not None:
+            raise RuntimeError(
+                f"Supervisor exited during startup with status {code}; "
+                "inspect logs/supervisor.log"
+            )
+        supervisor_info = _service_info("supervisor")
+        collector_info = _service_info("collector")
+        trader_info = _service_info("trader")
+        if (
+            supervisor_info.get("pid") == supervisor.pid
+            and _process_alive(collector_info.get("pid"))
+            and _process_alive(trader_info.get("pid"))
+        ):
+            print(f"supervisor_pid={supervisor.pid}", flush=True)
+            print(f"collector_pid={collector_info['pid']}", flush=True)
+            print(f"trader_pid={trader_info['pid']}", flush=True)
+            print(f"run_id={trader_info.get('run_id')}", flush=True)
+            return 0
+        time.sleep(1)
+    supervisor.terminate()
+    raise RuntimeError("Supervised local startup did not become ready within 300 seconds")
 
 
 def _terminate_children(children: list[subprocess.Popen]) -> None:
@@ -467,11 +612,63 @@ def _terminate_children(children: list[subprocess.Popen]) -> None:
             child.wait(timeout=5)
 
 
+def _record_supervisor_health(telemetry, event_type, severity, status, **details) -> None:
+    try:
+        telemetry.record_health(
+            "process_supervisor", event_type, severity, status, details=details,
+        )
+    except Exception:
+        logger.exception("Unable to persist supervisor health event %s", event_type)
+
+
+def _start_collector_with_recovery(db, cfg, run_id, sha, telemetry, policy):
+    """Recreate collector until it is alive and fresh; never stop the trader."""
+    while True:
+        collector = _spawn_process("main.py", run_id, sha)
+        policy.started()
+        try:
+            _wait_for_collector(
+                db, run_id, expected_pid=collector.pid,
+                max_candle_age_minutes=cfg.max_candle_age_minutes,
+            )
+            _record_supervisor_health(
+                telemetry, "collector_process_recovered", "info", "recovered",
+                collector_pid=collector.pid, restart_failures=policy.failures,
+            )
+            return collector
+        except Exception as exc:
+            if collector.poll() is None:
+                collector.terminate()
+                try:
+                    collector.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    collector.kill()
+                    collector.wait(timeout=5)
+            delay = policy.failure_delay()
+            _record_supervisor_health(
+                telemetry, "collector_process_restart_failed", "error", "retrying",
+                collector_pid=collector.pid, exit_code=collector.poll(),
+                retry_in_seconds=delay, error=repr(exc),
+            )
+            print(
+                f"collector restart failed; retrying in {delay:.1f}s: {exc}",
+                flush=True,
+            )
+            time.sleep(delay)
+
+
 def cmd_run(_args) -> int:
     """Railway foreground supervisor: keep children attached and observable."""
     run_id, _cfg, db, supervisor_lock = _prepare(acquire_supervisor_lock=True)
     sha = _commit_sha()
     children: list[subprocess.Popen] = []
+    telemetry = TelemetryStore(db, _cfg)
+    restart_policy = CollectorRestartPolicy(
+        initial_seconds=_cfg.collector_restart_initial_seconds,
+        maximum_seconds=_cfg.collector_restart_max_seconds,
+        stable_reset_seconds=_cfg.collector_restart_stable_reset_seconds,
+    )
+    _write_supervisor_info(run_id)
 
     def stop_signal(_signum, _frame):
         raise KeyboardInterrupt
@@ -479,10 +676,11 @@ def cmd_run(_args) -> int:
     signal.signal(signal.SIGTERM, stop_signal)
     signal.signal(signal.SIGINT, stop_signal)
     try:
-        collector = _spawn_process("main.py", run_id, sha)
+        collector = _start_collector_with_recovery(
+            db, _cfg, run_id, sha, telemetry, restart_policy,
+        )
         children.append(collector)
         print(f"collector_pid={collector.pid}", flush=True)
-        _wait_for_collector(db, run_id, expected_pid=collector.pid)
 
         trader = _spawn_process("trading_main.py", run_id, sha)
         children.append(trader)
@@ -490,12 +688,31 @@ def cmd_run(_args) -> int:
         print(f"run_id={run_id}", flush=True)
 
         while True:
-            for name, child in (("collector", collector), ("trader", trader)):
-                code = child.poll()
-                if code is not None:
-                    raise RuntimeError(
-                        f"{name} process exited unexpectedly with status {code}"
-                    )
+            trader_code = trader.poll()
+            if trader_code is not None:
+                raise RuntimeError(
+                    f"trader process exited unexpectedly with status {trader_code}"
+                )
+            collector_code = collector.poll()
+            if collector_code is not None:
+                delay = restart_policy.failure_delay()
+                _record_supervisor_health(
+                    telemetry, "collector_process_exit", "critical", "restarting",
+                    exit_code=collector_code, retry_in_seconds=delay,
+                    existing_position_management_continues=True,
+                    new_entries_fail_closed_on_stale_data=True,
+                )
+                print(
+                    f"collector exited with status {collector_code}; "
+                    f"restarting in {delay:.1f}s",
+                    flush=True,
+                )
+                time.sleep(delay)
+                collector = _start_collector_with_recovery(
+                    db, _cfg, run_id, sha, telemetry, restart_policy,
+                )
+                children.append(collector)
+                print(f"collector_restarted_pid={collector.pid}", flush=True)
             time.sleep(1)
     except KeyboardInterrupt:
         print("Railway supervisor stopping children", flush=True)
@@ -504,6 +721,7 @@ def cmd_run(_args) -> int:
         _terminate_children(children)
         if supervisor_lock is not None:
             supervisor_lock.stop()
+        _clear_own_supervisor_info()
 
 
 def cmd_status(_args) -> int:
@@ -538,6 +756,11 @@ def cmd_status(_args) -> int:
                 f"{service}_pid={info.get('pid')} "
                 f"alive={_process_alive(info.get('pid'))} heartbeat={heartbeat}"
             )
+        supervisor = _service_info("supervisor")
+        print(
+            f"supervisor_pid={supervisor.get('pid')} "
+            f"alive={_process_alive(supervisor.get('pid'))}"
+        )
     finally:
         session.close()
     return 0
@@ -547,6 +770,24 @@ def cmd_stop(_args) -> int:
     _load_env_file()
     _reload_config()
     cfg = BybitConfig()
+    supervisor = _service_info("supervisor")
+    supervisor_pid = supervisor.get("pid")
+    if _process_alive(supervisor_pid):
+        command = subprocess.check_output(
+            ["ps", "-p", str(supervisor_pid), "-o", "command="], text=True
+        )
+        if "live_run.py run" not in command:
+            raise RuntimeError(
+                f"PID {supervisor_pid} does not match live_run.py run; refusing to signal"
+            )
+        os.kill(int(supervisor_pid), signal.SIGTERM)
+        print(f"stopping_supervisor_pid={supervisor_pid}")
+        deadline = time.time() + 20
+        while _process_alive(supervisor_pid) and time.time() < deadline:
+            time.sleep(0.2)
+
+    # Backward-compatible cleanup for old unsupervised local launches and for
+    # a supervisor that did not terminate its children within the grace time.
     for service in ("trader", "collector"):
         info = _service_info(service)
         pid = info.get("pid")
