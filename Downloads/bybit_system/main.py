@@ -12,6 +12,7 @@ import logging
 import os
 import signal
 import socket
+import threading
 import time
 from typing import Optional
 
@@ -194,6 +195,28 @@ def main():
     deleted = apply_high_frequency_retention(db.engine, cfg)
     logger.info("High-frequency retention applied: %s", deleted)
     telemetry = TelemetryStore(db, cfg)
+    retention_stop = threading.Event()
+
+    def retention_worker():
+        interval = max(
+            300, int(getattr(cfg, "high_frequency_retention_interval_seconds", 1800))
+        )
+        while not retention_stop.wait(interval):
+            try:
+                removed = apply_high_frequency_retention(db.engine, cfg)
+                if any(removed.values()):
+                    logger.info("Periodic high-frequency retention applied: %s", removed)
+            except Exception as exc:
+                telemetry.record_health(
+                    "storage", "high_frequency_retention_failure",
+                    "error", "degraded", error=exc,
+                    details={"next_retry_seconds": interval},
+                )
+
+    retention_thread = threading.Thread(
+        target=retention_worker, name="market-retention", daemon=True
+    )
+    retention_thread.start()
     pybit_logger = logging.getLogger("pybit._websocket_stream")
     pybit_telemetry_handler = _PybitTelemetryHandler(telemetry)
     pybit_logger.addHandler(pybit_telemetry_handler)
@@ -353,6 +376,8 @@ def main():
     except KeyboardInterrupt:
         logger.info("Останавливаюсь, сбрасываю буферы в БД...")
     finally:
+        retention_stop.set()
+        retention_thread.join(timeout=5)
         stream.close()
         store.stop()
         runtime.stop()

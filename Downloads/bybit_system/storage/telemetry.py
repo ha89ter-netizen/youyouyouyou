@@ -77,9 +77,14 @@ CONFIG_ENV_NAMES = (
     "STORAGE_MAX_DATABASE_BYTES",
     "STORAGE_ENTRY_BLOCK_RATIO", "STORAGE_MONITOR_INTERVAL_SEC", "RAW_TRADES_RETENTION_HOURS",
     "ORDERBOOK_RETENTION_HOURS", "LIQUIDATIONS_RETENTION_HOURS",
+    "FUNDING_RAW_RETENTION_HOURS", "OPEN_INTEREST_RAW_RETENTION_HOURS",
+    "HIGH_FREQUENCY_RETENTION_INTERVAL_SECONDS",
     "RETENTION_DELETE_BATCH_SIZE", "RETENTION_MAX_ROWS_PER_RUN",
     "PROTECTIVE_TRIGGER_BY", "SLIPPAGE_ELEVATED_PCT", "SLIPPAGE_ANOMALOUS_PCT",
     "SLIPPAGE_ELEVATED_R", "SLIPPAGE_ANOMALOUS_R", "MAX_REALIZED_LOSS_R",
+    "PROTECTIVE_QUARANTINE_SECONDS", "PROTECTIVE_ANOMALY_STICKY_COUNT",
+    "OPERATOR_MONITOR_INTERVAL_SECONDS", "HEALTH_HTTP_ENABLED",
+    "TELEGRAM_ALERTS_ENABLED", "TELEGRAM_DAILY_SUMMARY_UTC_HOUR",
     "COLLECTOR_RESTART_INITIAL_SECONDS", "COLLECTOR_RESTART_MAX_SECONDS",
     "COLLECTOR_RESTART_STABLE_RESET_SECONDS",
     "WS_RECONNECT_INITIAL_SECONDS", "WS_RECONNECT_MAX_SECONDS",
@@ -1345,7 +1350,9 @@ class TelemetryStore:
             slippage_pct=slippage.get("slippage_pct"),
             slippage_r=slippage.get("slippage_r"),
             slippage_classification=slippage.get("classification"),
-            trigger_at=slippage.get("trigger_at"), fill_at=slippage.get("fill_at"),
+            trigger_at=slippage.get("trigger_at"),
+            trigger_evidence_quality=slippage.get("trigger_evidence_quality"),
+            fill_at=slippage.get("fill_at"),
             protective_execution_id=slippage.get("execution_id"),
             policy_epoch=int(payload.get("policy_epoch") or 0),
             raw_payload=safe_json({"records": records, "executions": executions_by_order,
@@ -1369,6 +1376,8 @@ class TelemetryStore:
         ).order_by(TradeExchangeOrder.last_observed_at.desc()).first()
         raw_order = (order.raw_payload or {}) if order else {}
         trigger = safe_float(order.trigger_price) if order else None
+        stop_type = (order.stop_order_type or "") if order else ""
+        is_trailing = "trailing" in stop_type.lower()
         trigger_source = (
             raw_order.get("triggerBy") or raw_order.get("slTriggerBy")
             or raw_order.get("tpTriggerBy")
@@ -1404,7 +1413,7 @@ class TelemetryStore:
         last = safe_float(nearest.last_price) if nearest else None
         near = mark if trigger_source == "MarkPrice" else last if trigger_source == "LastPrice" else None
         adverse = pct = slippage_r = None
-        if trigger is not None and fill is not None:
+        if trigger is not None and fill is not None and not is_trailing:
             is_long = trade.action == "open_long"
             # Positive means execution was worse than the intended protective
             # trigger; negative means price improvement.
@@ -1418,7 +1427,13 @@ class TelemetryStore:
         anomalous_r = float(getattr(self.cfg, "slippage_anomalous_r", 0.75))
         adverse_pct = max(0.0, pct or 0.0)
         adverse_r = max(0.0, slippage_r or 0.0)
-        if trigger is None or fill is None:
+        if is_trailing:
+            # Bybit order history exposes the trailing activation/configured
+            # price, not a certified dynamic trigger price at the instant the
+            # trailing order fired. Comparing that value with the fill created
+            # false multi-R "slippage" anomalies on profitable exits.
+            classification = "unavailable"
+        elif trigger is None or fill is None:
             classification = "unavailable"
         elif adverse_pct >= anomalous_pct or adverse_r >= anomalous_r:
             classification = "anomalous"
@@ -1433,10 +1448,16 @@ class TelemetryStore:
             "slippage_absolute": adverse, "slippage_pct": pct,
             "slippage_r": slippage_r, "classification": classification,
             # Bybit closed-PnL/order history has no certified trigger timestamp.
-            "trigger_at": None, "fill_at": fill_at,
+            "trigger_at": None,
+            "trigger_evidence_quality": (
+                "trailing_dynamic_trigger_unavailable" if is_trailing
+                else "static_trigger_price_confirmed_timestamp_unavailable"
+            ),
+            "fill_at": fill_at,
             "execution_id": executions[-1].get("execId") if executions else None,
             "exchange_order_id": order.exchange_order_id if order else None,
             "is_protective": bool(order and order.stop_order_type),
+            "is_trailing": is_trailing,
         }
 
     def _finalize_protection_lifecycle(
@@ -1493,6 +1514,12 @@ class TelemetryStore:
                 "realized_r": safe_float(row.realized_r),
                 "realized_pnl": safe_float(row.realized_pnl),
                 "actual_exit_reason": row.actual_exit_reason,
+                "exchange_exit_mechanism": row.exchange_exit_mechanism,
+                "intended_trigger_price": safe_float(row.intended_trigger_price),
+                "trigger_source": row.trigger_source,
+                "trigger_at": row.trigger_at,
+                "trigger_evidence_quality": row.trigger_evidence_quality,
+                "fill_at": row.fill_at,
                 "exchange_order_id": (
                     (row.closing_order_ids or [None])[0]
                     if row.closing_order_ids else None

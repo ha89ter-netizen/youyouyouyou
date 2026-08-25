@@ -19,6 +19,7 @@ import hashlib
 import math
 import time
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Optional
 
 import pandas as pd
@@ -31,7 +32,7 @@ from storage.risk_state import RiskStateStore
 from storage.telemetry import TelemetryStore
 from storage.durability import EntryIntentStore, StorageGuard
 from strategy.signal import Signal, Action
-from timeutils import from_epoch_ms, utc_today, utcnow
+from timeutils import ensure_aware_utc, from_epoch_ms, utc_today, utcnow
 from strategy.experts import ExpertSignalCollector
 from strategy.indicators import compute_all_indicators, trend_direction
 from market_context import MarketContextEngine
@@ -180,10 +181,62 @@ class StrategyEngine:
         # order_link_id -> сколько циклов подряд не можем найти закрытие
         self._orphan_attempts: dict[str, int] = {}
         self._reconcile_daily_pnl_with_journal()
+        self._reclassify_legacy_trailing_slippage_breakers()
         self.telemetry.record_health(
             "strategy_engine", "restart_recovery", "info", "completed",
             details={"risk_manager_restored": True},
         )
+
+    def _reclassify_legacy_trailing_slippage_breakers(self) -> int:
+        """Repair only the proven legacy trailing-trigger false positive.
+
+        Older code compared a trailing activation/configuration price with the
+        final fill and made every such anomaly sticky. Bybit does not expose
+        the dynamic trailing trigger price, so that comparison was invalid.
+        We retain every real loss-envelope/unknown cause and only convert a
+        legacy trailing cause when durable exit telemetry proves the trade did
+        not breach the configured realized-loss envelope.
+        """
+        changed = 0
+        max_loss_r = max(0.0, float(getattr(self.cfg, "max_realized_loss_r", 1.5)))
+        for cause, metadata in self.risk_manager.breaker_causes().items():
+            if not cause.startswith("protective_slippage:"):
+                continue
+            if metadata.get("category") is not None:
+                continue
+            order_link_id = cause.split(":", 1)[1]
+            evidence = self.telemetry.get_exit_slippage(order_link_id)
+            mechanism = str((evidence or {}).get("exchange_exit_mechanism") or "").lower()
+            realized_r = (evidence or {}).get("realized_r")
+            if "trailing" not in mechanism or realized_r is None:
+                continue
+            if max_loss_r > 0 and float(realized_r) <= -max_loss_r:
+                continue
+            fill_at = ensure_aware_utc((evidence or {}).get("fill_at"))
+            if fill_at is None:
+                continue
+            if not self.risk_manager.resolve_breaker_cause(cause):
+                continue
+            duration = max(
+                60, int(getattr(self.cfg, "protective_quarantine_seconds", 3600))
+            )
+            deadline = fill_at + timedelta(seconds=duration)
+            if deadline > utcnow():
+                self.risk_manager.trip_circuit_breaker(
+                    "legacy trailing slippage evidence reclassified as temporary quarantine",
+                    sticky=False, cause=cause, expires_at=deadline,
+                    category="protective_execution_anomaly",
+                )
+            self.telemetry.record_health(
+                "protective_execution", "legacy_trailing_breaker_reclassified",
+                "warning", "recovered", details={
+                    "order_link_id": order_link_id, "realized_r": realized_r,
+                    "exchange_exit_mechanism": evidence.get("exchange_exit_mechanism"),
+                    "quarantine_expires_at": deadline.isoformat(),
+                },
+            )
+            changed += 1
+        return changed
 
     def _reconcile_daily_pnl_with_journal(self):
         """
@@ -2303,7 +2356,33 @@ class StrategyEngine:
                 f"slippage_pct={evidence.get('slippage_pct')} "
                 f"slippage_r={evidence.get('slippage_r')}"
             )
-        self.risk_manager.trip_circuit_breaker(reason, sticky=True, cause=cause)
+        temporary = anomalous_slippage and not envelope_breached
+        sticky = True
+        expires_at = None
+        if temporary:
+            causes_reader = getattr(self.risk_manager, "breaker_causes", None)
+            existing = causes_reader() if callable(causes_reader) else {}
+            prior = sum(
+                1 for value in existing.values()
+                if value.get("category") == "protective_execution_anomaly"
+            )
+            threshold = max(
+                1, int(getattr(cfg, "protective_anomaly_sticky_count", 2))
+            )
+            sticky = prior + 1 >= threshold
+            if not sticky:
+                seconds = max(
+                    60, int(getattr(cfg, "protective_quarantine_seconds", 3600))
+                )
+                expires_at = utcnow() + timedelta(seconds=seconds)
+                reason += (
+                    f"; temporary entry quarantine for {seconds}s because exchange "
+                    "history has no certified trigger timestamp"
+                )
+        self.risk_manager.trip_circuit_breaker(
+            reason, sticky=sticky, cause=cause, expires_at=expires_at,
+            category="protective_execution_anomaly" if temporary else "risk_envelope",
+        )
         self.telemetry.record_health(
             "protective_execution", event_type,
             "critical", "entries_blocked", symbol=symbol,
@@ -2312,6 +2391,9 @@ class StrategyEngine:
                 "breaker_cause": cause,
                 "max_realized_loss_r": max_loss_r,
                 "existing_position_management_continues": True,
+                "temporary_quarantine": temporary and not sticky,
+                "quarantine_expires_at": expires_at.isoformat() if expires_at else None,
+                "escalated_sticky": sticky,
                 **evidence,
             },
         )

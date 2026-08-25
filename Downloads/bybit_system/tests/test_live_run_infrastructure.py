@@ -21,6 +21,17 @@ from timeutils import utc_day_str, utcnow
 
 
 class LiveRunInfrastructureTest(unittest.TestCase):
+    def test_enabled_telegram_alerts_require_both_environment_secrets(self):
+        cfg = BybitConfig(api_key="x", api_secret="y")
+        cfg.runtime_mode = "local"; cfg.telegram_alerts_enabled = True
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "TELEGRAM_BOT_TOKEN"):
+                live_run._validate_runtime_config(cfg)
+        with patch.dict(os.environ, {
+            "TELEGRAM_BOT_TOKEN": "token", "TELEGRAM_CHAT_ID": "123",
+        }, clear=True):
+            live_run._validate_runtime_config(cfg)
+
     def test_live_run_has_module_logger_for_preflight_diagnostics(self):
         self.assertIsInstance(live_run.logger, logging.Logger)
 

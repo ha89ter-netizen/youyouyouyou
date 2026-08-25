@@ -22,6 +22,61 @@ from timeutils import ensure_aware_utc, utcnow
 logger = logging.getLogger(__name__)
 
 
+_TICKER_ROLLUPS = {
+    "funding_rate": ("funding_ts", "funding_rate", "funding_rate_minute_rollups"),
+    "open_interest": ("ts", "open_interest", "open_interest_minute_rollups"),
+}
+
+
+def _archive_ticker_rows(engine, table: str, cutoff: int) -> None:
+    """Persist minute aggregates before raw ticker rows become eligible for deletion."""
+    timestamp_column, value_column, archive = _TICKER_ROLLUPS[table]
+    with engine.begin() as conn:
+        prior = conn.execute(text(
+            "SELECT archived_through_ms FROM high_frequency_retention_state "
+            "WHERE table_name = :table_name"
+        ), {"table_name": table}).scalar_one_or_none()
+    if prior is not None and int(prior) >= cutoff:
+        return
+    lower_clause = f" AND {timestamp_column} >= :prior" if prior is not None else ""
+    select_sql = (
+        f"SELECT symbol, CAST({timestamp_column} / 60000 AS BIGINT) * 60000, "
+        f"COUNT(*), MIN({value_column}), MAX({value_column}), AVG({value_column}) "
+        f"FROM {table} WHERE {timestamp_column} < :cutoff{lower_clause} "
+        f"GROUP BY symbol, CAST({timestamp_column} / 60000 AS BIGINT)"
+    )
+    if engine.dialect.name == "postgresql":
+        statement = text(
+            f"INSERT INTO {archive} "
+            "(symbol, bucket_start, sample_count, minimum_value, maximum_value, average_value) "
+            f"{select_sql} ON CONFLICT (symbol, bucket_start) DO NOTHING"
+        )
+    else:
+        statement = text(
+            f"INSERT OR IGNORE INTO {archive} "
+            "(symbol, bucket_start, sample_count, minimum_value, maximum_value, average_value) "
+            f"{select_sql}"
+        )
+    parameters = {"cutoff": cutoff, "prior": prior}
+    with engine.begin() as conn:
+        conn.execute(statement, parameters)
+        if engine.dialect.name == "postgresql":
+            conn.execute(text(
+                "INSERT INTO high_frequency_retention_state "
+                "(table_name, archived_through_ms, updated_at) "
+                "VALUES (:table_name, :cutoff, :updated_at) "
+                "ON CONFLICT (table_name) DO UPDATE SET "
+                "archived_through_ms = EXCLUDED.archived_through_ms, "
+                "updated_at = EXCLUDED.updated_at"
+            ), {"table_name": table, "cutoff": cutoff, "updated_at": utcnow()})
+        else:
+            conn.execute(text(
+                "INSERT OR REPLACE INTO high_frequency_retention_state "
+                "(table_name, archived_through_ms, updated_at) "
+                "VALUES (:table_name, :cutoff, :updated_at)"
+            ), {"table_name": table, "cutoff": cutoff, "updated_at": utcnow()})
+
+
 ENTRY_TRANSITIONS = {
     "prepared": {"submitted"},
     "submitted": {"accepted", "rejected"},
@@ -367,6 +422,12 @@ def apply_high_frequency_retention(engine, cfg) -> dict[str, int]:
         "trades": ("ts", int(getattr(cfg, "raw_trades_retention_hours", 168))),
         "orderbook_snapshots": ("ts", int(getattr(cfg, "orderbook_retention_hours", 168))),
         "liquidations": ("ts", int(getattr(cfg, "liquidations_retention_hours", 720))),
+        "funding_rate": (
+            "funding_ts", int(getattr(cfg, "funding_raw_retention_hours", 24))
+        ),
+        "open_interest": (
+            "ts", int(getattr(cfg, "open_interest_raw_retention_hours", 24))
+        ),
     }
     now_ms = int(utcnow().timestamp() * 1000)
     deleted: dict[str, int] = {}
@@ -395,6 +456,11 @@ def apply_high_frequency_retention(engine, cfg) -> dict[str, int]:
         # still-open trade, even if it outlives the normal retention window.
         if oldest_open_ms is not None:
             cutoff = min(cutoff, oldest_open_ms)
+        if table in _TICKER_ROLLUPS:
+            # Archive/delete only complete UTC-minute buckets so a later run
+            # cannot discover additional samples for an already sealed bucket.
+            cutoff = (cutoff // 60_000) * 60_000
+            _archive_ticker_rows(engine, table, cutoff)
         total = 0
         while total < max_rows:
             with engine.begin() as conn:

@@ -216,7 +216,12 @@ def cmd_status(cfg, args) -> int:
     if causes:
         print("\nПричины circuit breaker (снимаются по одной через resolve-cause):")
         for key, value in causes.items():
-            flag = "требует устранения причины" if value["sticky"] else "снимется со сменой UTC-дня"
+            if value["sticky"]:
+                flag = "требует устранения причины"
+            elif value.get("expires_at"):
+                flag = f"временная пауза до {value['expires_at']}"
+            else:
+                flag = "снимется со сменой UTC-дня"
             print(f"  [{key}] {value['reason']}  ({flag})")
 
     blocked = risk.blocked_symbols()

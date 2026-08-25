@@ -197,6 +197,31 @@ def _bare_engine(cfg, execution, journal, risk_manager) -> StrategyEngine:
 # ======================================================================
 
 class DailyLimitSurvivesRestartTest(unittest.TestCase):
+    def test_temporary_breaker_expiry_survives_restart_and_clears_on_deadline(self):
+        db = SessionBackedDb(); store = RiskStateStore(db); cfg = _cfg()
+        first = RiskManager(cfg, state_store=store)
+        deadline = utcnow() + timedelta(minutes=30)
+        first.trip_circuit_breaker(
+            "unverified exchange anomaly", cause="protective:x",
+            expires_at=deadline, category="protective_execution_anomaly",
+        )
+        restarted = RiskManager(cfg, state_store=store)
+        self.assertTrue(restarted.circuit_breaker_tripped)
+        self.assertEqual(restarted.expire_temporary_causes(deadline - timedelta(seconds=1)), [])
+        self.assertEqual(restarted.expire_temporary_causes(deadline), ["protective:x"])
+        self.assertFalse(restarted.circuit_breaker_tripped)
+
+    def test_utc_day_reset_does_not_shorten_temporary_execution_quarantine(self):
+        manager = RiskManager(_cfg())
+        deadline = utcnow() + timedelta(minutes=30)
+        manager.trip_circuit_breaker(
+            "execution quarantine", cause="protective:x", expires_at=deadline,
+            category="protective_execution_anomaly",
+        )
+        manager._daily_reset_date = utc_today() - timedelta(days=1)
+        manager.ensure_daily_reset(1000)
+        self.assertIn("protective:x", manager.breaker_causes())
+
     def test_daily_pnl_and_counters_survive_restart(self):
         db = SessionBackedDb()
         store = RiskStateStore(db)

@@ -174,7 +174,7 @@ Heartbeat errors no longer kill the heartbeat thread; it retries and records fai
 
 ## Retention and reconstruction
 
-Research-critical facts are durable PostgreSQL rows and are never subject to automatic retention. Bounded retention applies only to raw high-frequency `trades`, `orderbook_snapshots` and `liquidations`; raw data at or after the oldest still-open trade is retained for excursion reconstruction. Deletes are batched. PostgreSQL capacity is monitored and new entries fail closed before the configured quota threshold. Railway platform logs and local rotating files remain useful diagnostics but are not required for reconstruction. Railway filesystem files, PIDs, locks, WebSocket objects and in-memory buffers are intentionally ephemeral.
+Research-critical facts are durable PostgreSQL rows and are never subject to automatic retention. Bounded retention applies only to raw high-frequency `trades`, `orderbook_snapshots`, `liquidations`, `funding_rate` and `open_interest`; raw data at or after the oldest still-open trade is retained for excursion reconstruction. Before older funding/OI ticker samples are deleted, minute count/min/max/average aggregates are durably inserted into `funding_rate_minute_rollups` and `open_interest_minute_rollups`. Deletes are batched and run on a background cadence. PostgreSQL capacity is monitored and new entries fail closed before the configured quota threshold. Railway platform logs and local rotating files remain useful diagnostics but are not required for reconstruction. Railway filesystem files, PIDs, locks, WebSocket objects and in-memory buffers are intentionally ephemeral.
 
 Delivered outbox envelopes are not the audit record: the normalized target
 rows are. Confirmed deliveries older than the configured retention window are
@@ -211,6 +211,12 @@ DATABASE_URL=${{Postgres.DATABASE_URL}}
 STORAGE_MAX_DATABASE_BYTES=<PostgreSQL volume quota in bytes>
 RAILWAY_DEPLOYMENT_DRAINING_SECONDS=30
 ```
+
+Optional automatic operator notifications require
+`TELEGRAM_ALERTS_ENABLED=true`, `TELEGRAM_BOT_TOKEN`, and `TELEGRAM_CHAT_ID`.
+The credentials are secret environment-only values and are not captured in
+immutable metadata. The supervisor exposes non-secret `GET /healthz` and
+`GET /status` endpoints on Railway's `PORT`.
 
 Railway supplies `RAILWAY_GIT_COMMIT_SHA`; otherwise set `COMMIT_SHA`. `OPENAI_API_KEY` is required only when the frozen current runtime uses the OpenAI analyst. Optional telemetry-only cadence settings are `TELEMETRY_ACCOUNT_INTERVAL_SEC=60` and `TELEMETRY_POSITION_INTERVAL_SEC=30`.
 

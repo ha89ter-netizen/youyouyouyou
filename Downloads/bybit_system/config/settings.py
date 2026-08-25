@@ -372,6 +372,15 @@ class BybitConfig:
     liquidations_retention_hours: int = int(
         os.getenv("LIQUIDATIONS_RETENTION_HOURS", "720")
     )
+    funding_raw_retention_hours: int = int(
+        os.getenv("FUNDING_RAW_RETENTION_HOURS", "24")
+    )
+    open_interest_raw_retention_hours: int = int(
+        os.getenv("OPEN_INTEREST_RAW_RETENTION_HOURS", "24")
+    )
+    high_frequency_retention_interval_seconds: int = int(
+        os.getenv("HIGH_FREQUENCY_RETENTION_INTERVAL_SECONDS", "1800")
+    )
     retention_delete_batch_size: int = int(
         os.getenv("RETENTION_DELETE_BATCH_SIZE", "10000")
     )
@@ -403,6 +412,26 @@ class BybitConfig:
     # positions continue to be managed and retain their native protection.
     max_realized_loss_r: float = float(
         os.getenv("MAX_REALIZED_LOSS_R", "1.5")
+    )
+    protective_quarantine_seconds: int = int(
+        os.getenv("PROTECTIVE_QUARANTINE_SECONDS", "3600")
+    )
+    protective_anomaly_sticky_count: int = int(
+        os.getenv("PROTECTIVE_ANOMALY_STICKY_COUNT", "2")
+    )
+
+    # Operator observability. Telegram credentials are intentionally read
+    # directly from the environment by the notifier and are never captured
+    # in immutable run metadata.
+    operator_monitor_interval_seconds: int = int(
+        os.getenv("OPERATOR_MONITOR_INTERVAL_SECONDS", "30")
+    )
+    health_http_enabled: bool = os.getenv("HEALTH_HTTP_ENABLED", "true").lower() == "true"
+    telegram_alerts_enabled: bool = os.getenv(
+        "TELEGRAM_ALERTS_ENABLED", "false"
+    ).lower() == "true"
+    telegram_daily_summary_utc_hour: int = int(
+        os.getenv("TELEGRAM_DAILY_SUMMARY_UTC_HOUR", "12")
     )
 
     # Process-supervisor policy.  This is deliberately separate from the

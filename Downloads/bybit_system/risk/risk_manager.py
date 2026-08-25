@@ -16,11 +16,12 @@ RiskStateStore и переживает перезапуск процесса. Д
 
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Dict, List, Optional
 
 from config.settings import BybitConfig
 from strategy.signal import Signal, Action
-from timeutils import parse_utc_day, utc_day_str, utc_today, utcnow
+from timeutils import ensure_aware_utc, parse_utc_day, utc_day_str, utc_today, utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +49,8 @@ def _causes_from_state(state: dict) -> Dict[str, dict]:
             causes[str(key)] = {
                 "reason": str(value.get("reason", "")),
                 "sticky": bool(value.get("sticky")),
+                "expires_at": value.get("expires_at"),
+                "category": value.get("category"),
             }
         if causes:
             return causes
@@ -121,6 +124,7 @@ class RiskManager:
             (не блокируют), а не считаются автоматическим провалом.
         """
         self._maybe_reset_daily_counters(account_balance_usdt)
+        self.expire_temporary_causes()
 
         if self.circuit_breaker_tripped:
             return RiskCheckResult(
@@ -313,6 +317,7 @@ class RiskManager:
         закрытия вчерашней позиции рано утром).
         """
         self._maybe_reset_daily_counters(current_balance)
+        self.expire_temporary_causes()
 
     def record_closed_pnl(self, pnl_usdt: float):
         """Вызывать после КАЖДОГО закрытия позиции — чтобы дневной лимит убытка работал."""
@@ -378,7 +383,10 @@ class RiskManager:
     def blocked_symbols(self) -> Dict[str, str]:
         return dict(self._blocked_symbols)
 
-    def trip_circuit_breaker(self, reason: str, sticky: bool = False, cause: str = "unspecified"):
+    def trip_circuit_breaker(
+        self, reason: str, sticky: bool = False, cause: str = "unspecified",
+        *, expires_at: Optional[datetime] = None, category: Optional[str] = None,
+    ):
         """
         Взводит circuit breaker с ИМЕНОВАННОЙ причиной.
 
@@ -393,10 +401,15 @@ class RiskManager:
         результат): переживает и рестарт, и смену дня. Снимается только
         устранением причины (resolve_breaker_cause) или ручным сбросом.
         """
+        expiry = ensure_aware_utc(expires_at).isoformat() if expires_at is not None else None
+        replacement = {
+            "reason": reason, "sticky": bool(sticky),
+            "expires_at": expiry, "category": category,
+        }
         existing = self._breaker_causes.get(cause)
-        if existing is not None and existing["reason"] == reason and existing["sticky"] == sticky:
+        if existing == replacement:
             return
-        self._breaker_causes[cause] = {"reason": reason, "sticky": bool(sticky)}
+        self._breaker_causes[cause] = replacement
         logger.error(
             "CIRCUIT BREAKER АКТИВИРОВАН [%s]%s: %s. Активных причин: %d",
             cause,
@@ -405,6 +418,34 @@ class RiskManager:
             len(self._breaker_causes),
         )
         self._persist()
+
+    def expire_temporary_causes(self, now: Optional[datetime] = None) -> List[str]:
+        """Expire only explicitly timed, non-sticky entry quarantines.
+
+        Proven risk-envelope breaches and financial uncertainty stay sticky.
+        The deadline is durable, so a restart cannot shorten the quarantine.
+        """
+        current = ensure_aware_utc(now) or utcnow()
+        expired = []
+        for key, value in list(self._breaker_causes.items()):
+            if value.get("sticky") or not value.get("expires_at"):
+                continue
+            try:
+                deadline = ensure_aware_utc(
+                    datetime.fromisoformat(str(value["expires_at"]))
+                )
+            except (TypeError, ValueError):
+                continue
+            if deadline is not None and deadline <= current:
+                expired.append(key)
+                del self._breaker_causes[key]
+        if expired:
+            logger.warning(
+                "Временная защитная пауза истекла (%s); оставшихся причин breaker: %d",
+                ", ".join(expired), len(self._breaker_causes),
+            )
+            self._persist()
+        return expired
 
     def resolve_breaker_cause(self, cause: str) -> bool:
         """
@@ -522,7 +563,13 @@ class RiskManager:
             self._last_entry_ts_by_symbol.clear()
             self._daily_start_balance = current_balance
             self._daily_reset_date = today
-            expired = [k for k, v in self._breaker_causes.items() if not v["sticky"]]
+            # Daily limits reset at the UTC boundary. Explicitly timed
+            # execution quarantines keep their own deadline and must not be
+            # shortened merely because midnight passed.
+            expired = [
+                k for k, v in self._breaker_causes.items()
+                if not v["sticky"] and not v.get("expires_at")
+            ]
             for key in expired:
                 del self._breaker_causes[key]
             if self._breaker_causes:
@@ -563,9 +610,19 @@ class RiskManager:
         if saved_day is None or saved_day != today:
             # Состояние от прошлого дня. Дневные значения не переносим, но
             # sticky-breaker переносим: он не привязан к суткам.
-            sticky_causes = {
-                key: value for key, value in _causes_from_state(state).items() if value["sticky"]
-            }
+            sticky_causes = {}
+            now = utcnow()
+            for key, value in _causes_from_state(state).items():
+                if value["sticky"]:
+                    sticky_causes[key] = value
+                    continue
+                expiry = value.get("expires_at")
+                try:
+                    deadline = ensure_aware_utc(datetime.fromisoformat(str(expiry)))
+                except (TypeError, ValueError):
+                    deadline = None
+                if deadline is not None and deadline > now:
+                    sticky_causes[key] = value
             if sticky_causes:
                 self._breaker_causes = sticky_causes
                 logger.critical(

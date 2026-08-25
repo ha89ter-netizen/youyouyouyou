@@ -27,6 +27,7 @@ from storage.migrations import run_safe_migrations
 from storage.durability import StorageGuard, apply_high_frequency_retention
 from storage.models import Candle, OrderbookSnapshot, PositionSnapshot, RunMetadata, TradeLog
 from storage.telemetry import TelemetryStore
+from operator_monitor import OperatorMonitor
 from timeutils import utcnow
 
 ROOT = Path(__file__).resolve().parent
@@ -149,6 +150,14 @@ def _clear_own_supervisor_info() -> None:
 def _validate_runtime_config(cfg: BybitConfig) -> None:
     if cfg.runtime_mode not in ("local", "railway"):
         raise RuntimeError("RUNTIME_MODE must be either 'local' or 'railway'")
+    if getattr(cfg, "telegram_alerts_enabled", False):
+        if not os.getenv("TELEGRAM_BOT_TOKEN", "").strip() or not os.getenv(
+            "TELEGRAM_CHAT_ID", ""
+        ).strip():
+            raise RuntimeError(
+                "TELEGRAM_ALERTS_ENABLED=true requires TELEGRAM_BOT_TOKEN and "
+                "TELEGRAM_CHAT_ID"
+            )
     if cfg.runtime_mode != "railway":
         return
 
@@ -669,6 +678,8 @@ def cmd_run(_args) -> int:
         stable_reset_seconds=_cfg.collector_restart_stable_reset_seconds,
     )
     _write_supervisor_info(run_id)
+    operator_monitor = OperatorMonitor(db, _cfg, run_id)
+    operator_monitor.start()
 
     def stop_signal(_signum, _frame):
         raise KeyboardInterrupt
@@ -719,6 +730,7 @@ def cmd_run(_args) -> int:
         return 0
     finally:
         _terminate_children(children)
+        operator_monitor.stop()
         if supervisor_lock is not None:
             supervisor_lock.stop()
         _clear_own_supervisor_info()

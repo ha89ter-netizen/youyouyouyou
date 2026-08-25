@@ -5,13 +5,15 @@ from sqlalchemy import inspect, text
 
 from storage.models import (
     Base, EntryIntent, NormalizedExecution, ReconciliationAnomaly, RiskState,
-    RunMetadata, TelemetryOutbox, TradeClosure, TradeExchangeOrder, TradeExpertVote,
+    FundingRateMinuteRollup, HighFrequencyRetentionState,
+    OpenInterestMinuteRollup, OperatorMonitorState, RunMetadata, TelemetryOutbox,
+    TradeClosure, TradeExchangeOrder, TradeExpertVote,
 )
 
 logger = logging.getLogger(__name__)
 
-DATABASE_SCHEMA_VERSION = "telemetry-v5-protective-execution"
-MIGRATION_VERSION = "2026-08-19-reconnect-slippage-breakeven-v1"
+DATABASE_SCHEMA_VERSION = "telemetry-v6-operator-reliability"
+MIGRATION_VERSION = "2026-08-25-storage-monitor-quarantine-v1"
 
 
 TELEMETRY_ATTRIBUTION_COLUMNS: Dict[str, Dict[str, str]] = {
@@ -36,6 +38,7 @@ TRADE_EXIT_SLIPPAGE_COLUMNS: Dict[str, str] = {
     "slippage_r": "NUMERIC",
     "slippage_classification": "VARCHAR(20)",
     "trigger_at": "TIMESTAMP WITH TIME ZONE",
+    "trigger_evidence_quality": "VARCHAR(40)",
     "fill_at": "TIMESTAMP WITH TIME ZONE",
     "protective_execution_id": "VARCHAR(100)",
 }
@@ -172,6 +175,10 @@ def ensure_trade_exchange_evidence_tables(engine) -> None:
 
 def ensure_durability_tables(engine) -> None:
     TelemetryOutbox.__table__.create(bind=engine, checkfirst=True)
+    OperatorMonitorState.__table__.create(bind=engine, checkfirst=True)
+    FundingRateMinuteRollup.__table__.create(bind=engine, checkfirst=True)
+    OpenInterestMinuteRollup.__table__.create(bind=engine, checkfirst=True)
+    HighFrequencyRetentionState.__table__.create(bind=engine, checkfirst=True)
     EntryIntent.__table__.create(bind=engine, checkfirst=True)
     inspector = inspect(engine)
     if inspector.has_table("entry_intents"):

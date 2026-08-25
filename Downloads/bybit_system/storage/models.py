@@ -467,6 +467,7 @@ class TradeExitEvent(Base):
     slippage_r = Column(Numeric, nullable=True)
     slippage_classification = Column(String(20), nullable=True, index=True)
     trigger_at = Column(DateTime(timezone=True), nullable=True)
+    trigger_evidence_quality = Column(String(40), nullable=True)
     fill_at = Column(DateTime(timezone=True), nullable=True)
     protective_execution_id = Column(String(100), nullable=True)
     policy_epoch = Column(Integer, nullable=False)
@@ -562,6 +563,15 @@ class TelemetryOutbox(Base):
     last_error = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
     delivered_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class OperatorMonitorState(Base):
+    """Durable cursor/state for operator alerts; never contains credentials."""
+    __tablename__ = "operator_monitor_state"
+
+    state_key = Column(String(100), primary_key=True)
+    state_value = Column(JSONB_COMPAT, nullable=False)
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
 
 
 class EntryIntent(Base):
@@ -703,6 +713,43 @@ class OpenInterest(Base):
     __table_args__ = (
         PrimaryKeyConstraint("symbol", "ts"),
     )
+
+
+class FundingRateMinuteRollup(Base):
+    """Loss-bounded archive of ticker-level funding samples."""
+    __tablename__ = "funding_rate_minute_rollups"
+
+    symbol = Column(String(20), nullable=False)
+    bucket_start = Column(BigInteger, nullable=False)
+    sample_count = Column(Integer, nullable=False)
+    minimum_value = Column(Numeric, nullable=False)
+    maximum_value = Column(Numeric, nullable=False)
+    average_value = Column(Numeric, nullable=False)
+
+    __table_args__ = (PrimaryKeyConstraint("symbol", "bucket_start"),)
+
+
+class OpenInterestMinuteRollup(Base):
+    """Loss-bounded archive of ticker-level open-interest samples."""
+    __tablename__ = "open_interest_minute_rollups"
+
+    symbol = Column(String(20), nullable=False)
+    bucket_start = Column(BigInteger, nullable=False)
+    sample_count = Column(Integer, nullable=False)
+    minimum_value = Column(Numeric, nullable=False)
+    maximum_value = Column(Numeric, nullable=False)
+    average_value = Column(Numeric, nullable=False)
+
+    __table_args__ = (PrimaryKeyConstraint("symbol", "bucket_start"),)
+
+
+class HighFrequencyRetentionState(Base):
+    """Durable archive watermark; prevents rescanning all historical ticks."""
+    __tablename__ = "high_frequency_retention_state"
+
+    table_name = Column(String(50), primary_key=True)
+    archived_through_ms = Column(BigInteger, nullable=False)
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
 
 
 class Liquidation(Base):

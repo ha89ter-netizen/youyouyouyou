@@ -19,8 +19,10 @@ from storage.durability import (
 )
 from storage.journal import TradeJournal
 from storage.models import (
-    Base, EntryIntent, NormalizedExecution, OperationalHealthEvent,
-    ReconciliationAnomaly, TelemetryOutbox, Trade, TradeExitEvent, TradeLog,
+    Base, EntryIntent, FundingRate, FundingRateMinuteRollup,
+    NormalizedExecution, OpenInterest, OpenInterestMinuteRollup,
+    OperationalHealthEvent, ReconciliationAnomaly, TelemetryOutbox, Trade,
+    TradeExitEvent, TradeLog,
     TradeExchangeOrder, TradeProtectionEvent,
 )
 from storage.telemetry import TelemetryStore
@@ -49,6 +51,8 @@ def config(run_id="durability-run"):
     value.raw_trades_retention_hours = 168
     value.orderbook_retention_hours = 168
     value.liquidations_retention_hours = 720
+    value.funding_raw_retention_hours = 24
+    value.open_interest_raw_retention_hours = 24
     return value
 
 
@@ -413,7 +417,9 @@ def test_storage_guard_fails_closed_when_session_creation_fails():
     assert "unavailable" in status["reason"]
 
 
-@pytest.mark.parametrize("table", ["trades", "orderbook_snapshots", "liquidations"])
+@pytest.mark.parametrize("table", [
+    "trades", "orderbook_snapshots", "liquidations", "funding_rate", "open_interest",
+])
 def test_retention_policy_scope_excludes_audit_tables(table):
     # Policy declaration itself is intentionally allowlisted; this catches a
     # future broad "delete all old rows" implementation.
@@ -454,6 +460,31 @@ def test_retention_preserves_raw_ticks_needed_by_old_open_trade():
     apply_high_frequency_retention(db.engine, cfg)
     session = db.get_session()
     assert session.query(Trade).filter_by(trade_id="during-open").count() == 1
+    session.close()
+
+
+def test_retention_bounds_ticker_tables_without_deleting_recent_research_data():
+    db = Db(); cfg = config(); now_ms = to_epoch_ms(utcnow())
+    session = db.get_session()
+    session.add_all([
+        FundingRate(symbol="SOLUSDT", funding_ts=now_ms - 25 * 3600_000,
+                    funding_rate=.0001),
+        FundingRate(symbol="SOLUSDT", funding_ts=now_ms, funding_rate=.0002),
+        OpenInterest(symbol="SOLUSDT", ts=now_ms - 25 * 3600_000,
+                     open_interest=100),
+        OpenInterest(symbol="SOLUSDT", ts=now_ms, open_interest=101),
+    ])
+    session.commit(); session.close()
+    deleted = apply_high_frequency_retention(db.engine, cfg)
+    assert deleted["funding_rate"] == 1
+    assert deleted["open_interest"] == 1
+    session = db.get_session()
+    assert session.query(FundingRate).count() == 1
+    assert session.query(OpenInterest).count() == 1
+    funding_archive = session.query(FundingRateMinuteRollup).one()
+    oi_archive = session.query(OpenInterestMinuteRollup).one()
+    assert funding_archive.sample_count == 1
+    assert oi_archive.sample_count == 1
     session.close()
 
 

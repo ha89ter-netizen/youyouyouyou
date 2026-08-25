@@ -135,6 +135,9 @@ POSITION_CLOSE_VISIBILITY_GRACE_SECONDS=120
 RAW_TRADES_RETENTION_HOURS=168
 ORDERBOOK_RETENTION_HOURS=168
 LIQUIDATIONS_RETENTION_HOURS=720
+FUNDING_RAW_RETENTION_HOURS=24
+OPEN_INTEREST_RAW_RETENTION_HOURS=24
+HIGH_FREQUENCY_RETENTION_INTERVAL_SECONDS=1800
 WS_RECONNECT_INITIAL_SECONDS=5
 WS_RECONNECT_MAX_SECONDS=60
 WS_RECONNECT_JITTER_RATIO=0.20
@@ -149,14 +152,37 @@ SLIPPAGE_ANOMALOUS_PCT=1.0
 SLIPPAGE_ELEVATED_R=0.25
 SLIPPAGE_ANOMALOUS_R=0.75
 MAX_REALIZED_LOSS_R=1.5
+PROTECTIVE_QUARANTINE_SECONDS=3600
+PROTECTIVE_ANOMALY_STICKY_COUNT=2
+HEALTH_HTTP_ENABLED=true
+OPERATOR_MONITOR_INTERVAL_SECONDS=30
 ```
+
+Optional automatic Telegram operator alerts:
+
+```bash
+TELEGRAM_ALERTS_ENABLED=true
+TELEGRAM_BOT_TOKEN=<secret token from BotFather>
+TELEGRAM_CHAT_ID=<destination chat id>
+TELEGRAM_DAILY_SUMMARY_UTC_HOUR=12
+```
+
+The token and chat ID are read directly from the process environment and are
+never persisted in run metadata, telemetry, or logs. Alerts are automatic for
+startup, trade open/close, breaker changes, runtime/storage failures and a
+daily summary. Failed deliveries remain in a bounded durable retry queue.
+`GET /healthz` and `GET /status` expose the same non-secret status snapshot.
 
 `PROTECTIVE_TRIGGER_BY` supports only `LastPrice` and `MarkPrice`. The default
 remains `LastPrice` to preserve the frozen run behaviour; changing it affects
 real exchange triggering and therefore requires a separately approved smoke
-test. An anomalous protective trigger-to-fill result creates a durable sticky
-circuit-breaker cause: new entries stop, while existing positions and their
-exchange-native protection continue to be managed.
+test. A first anomalous protective trigger-to-fill result without a certified
+exchange trigger timestamp creates a durable timed entry quarantine; a second
+active anomaly escalates it to sticky. A proven realized loss outside
+`MAX_REALIZED_LOSS_R` remains immediately sticky. Existing positions and their
+exchange-native protection continue to be managed in every case. A trailing
+activation/configuration price is not treated as the unknown dynamic trailing
+trigger price.
 
 `MAX_REALIZED_LOSS_R` is an execution safety envelope, not an SL distance. An
 exchange-confirmed result at or below the configured negative R limit creates

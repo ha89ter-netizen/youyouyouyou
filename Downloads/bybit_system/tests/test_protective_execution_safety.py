@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from datetime import timedelta
 
 import pytest
 from sqlalchemy import create_engine
@@ -31,6 +32,8 @@ def config():
     cfg.slippage_elevated_pct = .25; cfg.slippage_anomalous_pct = 1.0
     cfg.slippage_elevated_r = .25; cfg.slippage_anomalous_r = .75
     cfg.protective_trigger_by = "LastPrice"
+    cfg.protective_quarantine_seconds = 3600
+    cfg.protective_anomaly_sticky_count = 2
     return cfg
 
 
@@ -72,6 +75,7 @@ def test_trigger_to_fill_slippage_classification(fill, expected):
     assert float(event.intended_trigger_price) == 98
     assert float(event.actual_fill_price) == fill
     assert event.trigger_source == "LastPrice"
+    assert event.trigger_evidence_quality == "static_trigger_price_confirmed_timestamp_unavailable"
     assert event.protective_execution_id == "close-exec"
     session.close()
 
@@ -117,7 +121,8 @@ def test_slippage_breaker_only_blocks_new_entries_for_anomalous_fill(classificat
     assert engine._apply_protective_slippage_breaker("link", "TESTUSDT") is tripped
     assert bool(breaker) is tripped
     if tripped:
-        assert breaker[0][1]["sticky"] is True
+        assert breaker[0][1]["sticky"] is False
+        assert breaker[0][1]["expires_at"] is not None
         assert breaker[0][1]["cause"] == "protective_slippage:link"
         assert health[0][1]["details"]["existing_position_management_continues"] is True
 
@@ -152,6 +157,83 @@ def test_realized_loss_envelope_is_independent_of_exit_type(
         assert breaker[0][1]["sticky"] is True
         assert health[0][0][1] == "realized_loss_risk_envelope_breach"
         assert health[0][1]["details"]["existing_position_management_continues"] is True
+
+
+def test_second_active_execution_anomaly_escalates_to_sticky_breaker():
+    engine = object.__new__(StrategyEngine); breaker = []
+    engine.cfg = SimpleNamespace(
+        max_realized_loss_r=1.5, protective_quarantine_seconds=3600,
+        protective_anomaly_sticky_count=2,
+    )
+    engine.telemetry = SimpleNamespace(
+        get_exit_slippage=lambda _link: {
+            "classification": "anomalous", "slippage_pct": 2,
+            "slippage_r": 1, "realized_r": .2,
+        },
+        record_health=lambda *args, **kwargs: True,
+    )
+    engine.risk_manager = SimpleNamespace(
+        breaker_causes=lambda: {"first": {
+            "category": "protective_execution_anomaly", "sticky": False,
+        }},
+        trip_circuit_breaker=lambda *args, **kwargs: breaker.append(kwargs),
+    )
+    assert engine._apply_protective_slippage_breaker("second", "TESTUSDT")
+    assert breaker[0]["sticky"] is True
+    assert breaker[0]["expires_at"] is None
+
+
+def test_trailing_activation_price_is_not_misclassified_as_fill_slippage():
+    db, store = finalized_exit(105, trigger=98, stop_type="TrailingStop")
+    session = db.get_session(); event = session.query(TradeExitEvent).one()
+    assert event.slippage_classification == "unavailable"
+    assert event.slippage_absolute is None
+    assert event.slippage_r is None
+    assert event.trigger_evidence_quality == "trailing_dynamic_trigger_unavailable"
+    session.close()
+    evidence = store.get_exit_slippage("entry-link")
+    assert evidence["classification"] == "unavailable"
+    assert evidence["exchange_exit_mechanism"] == "TrailingStop"
+
+
+def test_legacy_profitable_trailing_false_positive_is_safely_reclassified():
+    engine = object.__new__(StrategyEngine); resolved = []; health = []; tripped = []
+    engine.cfg = SimpleNamespace(max_realized_loss_r=1.5, protective_quarantine_seconds=3600)
+    engine.risk_manager = SimpleNamespace(
+        breaker_causes=lambda: {"protective_slippage:legacy": {
+            "reason": "old classifier", "sticky": True, "category": None,
+        }},
+        resolve_breaker_cause=lambda cause: resolved.append(cause) or True,
+        trip_circuit_breaker=lambda *args, **kwargs: tripped.append(kwargs),
+    )
+    engine.telemetry = SimpleNamespace(
+        get_exit_slippage=lambda _link: {
+            "exchange_exit_mechanism": "TrailingStop", "realized_r": 1.03,
+            "fill_at": utcnow() - timedelta(hours=2),
+        },
+        record_health=lambda *args, **kwargs: health.append((args, kwargs)),
+    )
+    assert engine._reclassify_legacy_trailing_slippage_breakers() == 1
+    assert resolved == ["protective_slippage:legacy"]
+    assert tripped == []  # historical quarantine already elapsed
+    assert health[0][0][1] == "legacy_trailing_breaker_reclassified"
+
+
+def test_legacy_trailing_breaker_is_not_cleared_if_realized_loss_breached_envelope():
+    engine = object.__new__(StrategyEngine); resolved = []
+    engine.cfg = SimpleNamespace(max_realized_loss_r=1.5, protective_quarantine_seconds=3600)
+    engine.risk_manager = SimpleNamespace(
+        breaker_causes=lambda: {"protective_slippage:legacy": {
+            "reason": "old classifier", "sticky": True, "category": None,
+        }},
+        resolve_breaker_cause=lambda cause: resolved.append(cause) or True,
+    )
+    engine.telemetry = SimpleNamespace(get_exit_slippage=lambda _link: {
+        "exchange_exit_mechanism": "TrailingStop", "realized_r": -2.0,
+        "fill_at": utcnow() - timedelta(hours=2),
+    })
+    assert engine._reclassify_legacy_trailing_slippage_breakers() == 0
+    assert resolved == []
 
 
 def test_exit_evidence_exposes_realized_r_for_risk_envelope():
