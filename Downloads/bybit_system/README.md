@@ -172,6 +172,10 @@ never persisted in run metadata, telemetry, or logs. Alerts are automatic for
 startup, trade open/close, breaker changes, runtime/storage failures and a
 daily summary. Failed deliveries remain in a bounded durable retry queue.
 `GET /healthz` and `GET /status` expose the same non-secret status snapshot.
+The authorized Telegram chat also supports read-only commands: `/start` and
+`/status` return runtime health, `/positions` lists current exposure, and
+`/pnl` returns the current UTC-day result. Commands cannot place, amend, or
+cancel exchange orders; messages from any other chat ID are ignored.
 
 `PROTECTIVE_TRIGGER_BY` supports only `LastPrice` and `MarkPrice`. The default
 remains `LastPrice` to preserve the frozen run behaviour; changing it affects

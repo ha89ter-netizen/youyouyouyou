@@ -19,12 +19,12 @@ from datetime import timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Optional
 
-from sqlalchemy import func
+from sqlalchemy import func, or_
 
 from storage.durability import StorageGuard
 from storage.models import (
-    OperationalHealthEvent, OperatorMonitorState, RunMetadata, RiskState,
-    TelemetryOutbox, TradeLog,
+    AccountSnapshot, OperationalHealthEvent, OperatorMonitorState,
+    PositionSnapshot, RunMetadata, RiskState, TelemetryOutbox, TradeLog,
 )
 from timeutils import ensure_aware_utc, utcnow
 
@@ -45,6 +45,7 @@ class TelegramClient:
         self._token = token
         self._chat_id = chat_id
         self._timeout = timeout
+        self._poll_error_active = False
 
     def send(self, message: str) -> bool:
         payload = urllib.parse.urlencode({
@@ -64,11 +65,37 @@ class TelegramClient:
             logger.error("Telegram notification failed (%s)", type(exc).__name__)
             return False
 
+    def get_updates(self, offset: int) -> list[dict]:
+        payload = urllib.parse.urlencode({
+            "offset": str(max(0, int(offset))),
+            "timeout": "0",
+            "allowed_updates": json.dumps(["message"]),
+        }).encode("utf-8")
+        request = urllib.request.Request(
+            f"https://api.telegram.org/bot{self._token}/getUpdates",
+            data=payload, method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self._timeout) as response:
+                document = json.loads(response.read().decode("utf-8"))
+            if self._poll_error_active:
+                logger.info("Telegram command polling recovered")
+            self._poll_error_active = False
+            result = document.get("result", []) if document.get("ok") else []
+            return result if isinstance(result, list) else []
+        except Exception as exc:
+            if not self._poll_error_active:
+                logger.error("Telegram command polling failed (%s)", type(exc).__name__)
+            self._poll_error_active = True
+            return []
+
 
 class OperatorMonitor:
     def __init__(
         self, db, cfg, run_id: str,
         sender: Optional[Callable[[str], bool]] = None,
+        updates_fetcher: Optional[Callable[[int], list[dict]]] = None,
+        authorized_chat_id: Optional[str] = None,
     ):
         self.db = db
         self.cfg = cfg
@@ -83,11 +110,18 @@ class OperatorMonitor:
             "run_id": run_id, "status": "starting", "testnet": bool(cfg.testnet)
         }
         self._sender = sender
+        self._updates_fetcher = updates_fetcher
+        self._authorized_chat_id = (
+            str(authorized_chat_id) if authorized_chat_id is not None else None
+        )
         if self._sender is None and getattr(cfg, "telegram_alerts_enabled", False):
             token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
             chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
             if token and chat_id:
-                self._sender = TelegramClient(token, chat_id).send
+                client = TelegramClient(token, chat_id)
+                self._sender = client.send
+                self._updates_fetcher = client.get_updates
+                self._authorized_chat_id = str(chat_id)
             else:
                 logger.error(
                     "TELEGRAM_ALERTS_ENABLED=true, but TELEGRAM_BOT_TOKEN or "
@@ -158,7 +192,10 @@ class OperatorMonitor:
             return
         session = self.db.get_session()
         try:
-            trades = session.query(TradeLog).filter_by(run_id=self.run_id).all()
+            trades = session.query(TradeLog).filter(or_(
+                TradeLog.run_id == self.run_id,
+                TradeLog.status == "open",
+            )).all()
             latest_health = session.query(func.max(OperationalHealthEvent.id)).filter_by(
                 run_id=self.run_id
             ).scalar() or 0
@@ -170,6 +207,7 @@ class OperatorMonitor:
                 "storage_level": None,
                 "last_daily_summary": None,
                 "startup_sent": False,
+                "telegram_update_offset": 0,
                 "pending_messages": [],
             }
             self._save_state(state)
@@ -188,7 +226,17 @@ class OperatorMonitor:
         try:
             run = session.query(RunMetadata).filter_by(run_id=self.run_id).first()
             risk = session.query(RiskState).filter_by(id=1).first()
-            trades = session.query(TradeLog).filter_by(run_id=self.run_id).order_by(
+            tracked_ids = [
+                int(value) for value in (state.get("trade_states") or {})
+                if str(value).isdigit()
+            ]
+            ownership_filter = or_(
+                TradeLog.run_id == self.run_id,
+                TradeLog.status == "open",
+            )
+            if tracked_ids:
+                ownership_filter = or_(ownership_filter, TradeLog.id.in_(tracked_ids))
+            trades = session.query(TradeLog).filter(ownership_filter).order_by(
                 TradeLog.id.asc()
             ).all()
             open_trades = [row for row in trades if row.status == "open"]
@@ -330,10 +378,114 @@ class OperatorMonitor:
         # Bound an unavailable Telegram destination without losing the latest
         # operational events forever or growing PostgreSQL without limit.
         state["pending_messages"] = (remaining + pending[100:])[-100:]
+        self._poll_telegram_commands(state, snapshot)
         self._save_state(state)
         with self._snapshot_lock:
             self._snapshot = snapshot
         return snapshot
+
+    def _poll_telegram_commands(self, state: dict, snapshot: dict) -> None:
+        if self._updates_fetcher is None or self._authorized_chat_id is None:
+            return
+        offset = int(state.get("telegram_update_offset") or 0)
+        updates = self._updates_fetcher(offset)
+        for update in sorted(updates, key=lambda item: int(item.get("update_id", 0))):
+            update_id = int(update.get("update_id", 0))
+            message = update.get("message") or {}
+            chat_id = str((message.get("chat") or {}).get("id", ""))
+            text = str(message.get("text") or "").strip()
+            if chat_id != self._authorized_chat_id:
+                offset = max(offset, update_id + 1)
+                continue
+            command = text.split(maxsplit=1)[0].split("@", 1)[0].lower() if text else ""
+            if command not in ("/start", "/status", "/positions", "/pnl", "/help"):
+                offset = max(offset, update_id + 1)
+                continue
+            response = self._build_command_response(command, snapshot)
+            if not self._notify(response):
+                break
+            offset = max(offset, update_id + 1)
+        state["telegram_update_offset"] = offset
+
+    def _build_command_response(self, command: str, snapshot: dict) -> str:
+        session = self.db.get_session()
+        try:
+            now = utcnow()
+            risk = session.query(RiskState).filter_by(id=1).first()
+            open_trades = session.query(TradeLog).filter_by(status="open").order_by(
+                TradeLog.id.asc()
+            ).all()
+            today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            closed_today = session.query(TradeLog).filter(
+                TradeLog.status == "closed",
+                TradeLog.closed_at >= today_start,
+            ).all()
+            latest_account = session.query(AccountSnapshot).order_by(
+                AccountSnapshot.observed_at.desc()
+            ).first()
+
+            if command == "/positions":
+                if not open_trades:
+                    return "📭 Открытых позиций нет."
+                lines = [f"📌 Открытые позиции: {len(open_trades)}"]
+                for trade in open_trades[:20]:
+                    position = session.query(PositionSnapshot).filter_by(
+                        trade_log_id=trade.id
+                    ).order_by(PositionSnapshot.observed_at.desc()).first()
+                    direction = "LONG" if trade.action == "open_long" else "SHORT"
+                    unrealized = (
+                        f"{float(position.unrealized_pnl):+.3f} USDT"
+                        if position and position.unrealized_pnl is not None else "n/a"
+                    )
+                    lines.append(
+                        f"#{trade.id} {trade.symbol} {direction} | entry="
+                        f"{float(trade.entry_price):.8g} | SL={float(trade.stop_loss_price):.8g} "
+                        f"TP={float(trade.take_profit_price):.8g} | uPnL={unrealized}"
+                    )
+                return "\n".join(lines)
+
+            gross_profit = sum(max(0.0, float(row.pnl_usdt or 0)) for row in closed_today)
+            gross_loss = sum(min(0.0, float(row.pnl_usdt or 0)) for row in closed_today)
+            net = gross_profit + gross_loss
+            fees = sum(float(row.total_fee_usdt or 0) for row in closed_today)
+            wins = sum(1 for row in closed_today if float(row.pnl_usdt or 0) > 0)
+            win_rate = wins / len(closed_today) * 100 if closed_today else 0.0
+            if command == "/pnl":
+                wallet = (
+                    f"{float(latest_account.wallet_balance):.2f} USDT"
+                    if latest_account and latest_account.wallet_balance is not None else "n/a"
+                )
+                return (
+                    f"💰 P&L за сегодня (UTC)\nclosed={len(closed_today)} | "
+                    f"win rate={win_rate:.1f}%\nnet={net:+.4f} USDT | "
+                    f"gross profit={gross_profit:+.4f} | gross loss={gross_loss:.4f}\n"
+                    f"fees={fees:.4f} USDT | wallet={wallet}"
+                )
+
+            if command == "/help":
+                return "Команды: /status — состояние, /positions — позиции, /pnl — P&L."
+
+            database = snapshot.get("database") or {}
+            usage = database.get("usage_ratio")
+            db_text = "OK" if database.get("available") else "ERROR"
+            if usage is not None:
+                db_text += f" ({float(usage):.1%})"
+            causes = dict((risk.circuit_breaker_causes or {}) if risk else {})
+            daily_pnl = float(risk.daily_pnl_usdt or 0) if risk else net
+            report = (
+                f"🤖 Bybit Testnet bot\nrun={self.run_id}\n"
+                f"runtime={snapshot.get('status', 'unknown')} | DB={db_text}\n"
+                f"collector={'OK' if snapshot.get('collector_heartbeat') else 'unknown'} | "
+                f"trader={'OK' if snapshot.get('trader_heartbeat') else 'unknown'}\n"
+                f"open={len(open_trades)} | daily P&L={daily_pnl:+.4f} USDT\n"
+                f"circuit breaker={'ON' if causes else 'off'} | "
+                f"outbox pending={(snapshot.get('outbox') or {}).get('pending', 0)}"
+            )
+            if command == "/start":
+                report += "\n\nКоманды: /status, /positions, /pnl"
+            return report
+        finally:
+            session.close()
 
     def _start_http(self) -> None:
         monitor = self

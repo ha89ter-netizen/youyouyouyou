@@ -115,3 +115,70 @@ def test_telegram_credentials_are_never_captured_in_run_configuration(monkeypatc
     assert "CHAT_MUST_NOT_PERSIST" not in rendered
     assert "TELEGRAM_BOT_TOKEN" not in document["environment"]
     assert "TELEGRAM_CHAT_ID" not in document["environment"]
+
+
+def test_read_only_telegram_commands_report_status_positions_and_pnl():
+    db = Db(); seed(db); sent = []
+    session = db.get_session()
+    session.add(TradeLog(
+        symbol="ETHUSDT", action="open_long", source="test", reason="test",
+        order_link_id="open-link", run_id="old-run", entry_price=100,
+        size_usdt=100, leverage=1, stop_loss_price=98,
+        take_profit_price=104, status="open",
+    ))
+    session.add(TradeLog(
+        symbol="BTCUSDT", action="open_short", source="test", reason="test",
+        order_link_id="closed-link", run_id="run", entry_price=100,
+        size_usdt=100, leverage=1, status="closed", pnl_usdt=2.5,
+        total_fee_usdt=.2, closed_at=utcnow(),
+    ))
+    session.commit(); session.close()
+    updates = [{
+        "update_id": number,
+        "message": {"chat": {"id": 42}, "text": command},
+    } for number, command in enumerate(
+        ("/start", "/status", "/positions", "/pnl"), start=10
+    )]
+    monitor = OperatorMonitor(
+        db, cfg(), "run", sender=lambda text: sent.append(text) or True,
+        updates_fetcher=lambda offset: [
+            update for update in updates if update["update_id"] >= offset
+        ],
+        authorized_chat_id="42",
+    )
+    monitor._initialize_durable_cursors(); monitor.poll_once()
+    assert any("Команды: /status, /positions, /pnl" in text for text in sent)
+    assert any("runtime=healthy" in text for text in sent)
+    assert any("ETHUSDT LONG" in text and "SL=98" in text for text in sent)
+    assert any("net=+2.5000 USDT" in text for text in sent)
+    session = db.get_session(); state = session.query(OperatorMonitorState).one()
+    assert state.state_value["telegram_update_offset"] == 14
+    session.close()
+
+    before = list(sent)
+    restarted = OperatorMonitor(
+        db, cfg(), "run", sender=lambda text: sent.append(text) or True,
+        updates_fetcher=lambda offset: [
+            update for update in updates if update["update_id"] >= offset
+        ],
+        authorized_chat_id="42",
+    )
+    restarted.poll_once()
+    assert sent == before
+
+
+def test_telegram_commands_ignore_unauthorized_chat():
+    db = Db(); seed(db); sent = []
+    updates = [{
+        "update_id": 7,
+        "message": {"chat": {"id": 999}, "text": "/positions"},
+    }]
+    monitor = OperatorMonitor(
+        db, cfg(), "run", sender=lambda text: sent.append(text) or True,
+        updates_fetcher=lambda _offset: updates, authorized_chat_id="42",
+    )
+    monitor._initialize_durable_cursors(); monitor.poll_once()
+    assert not any("Открытые позиции" in text for text in sent)
+    session = db.get_session(); state = session.query(OperatorMonitorState).one()
+    assert state.state_value["telegram_update_offset"] == 8
+    session.close()
