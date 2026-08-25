@@ -10,6 +10,7 @@ from storage.journal import TradeJournal
 from storage.models import (
     Base, TradeExchangeOrder, TradeExitEvent, TradeLog, TradeProtectionEvent,
 )
+from storage.migrations import TRADE_EXIT_SLIPPAGE_COLUMNS
 from storage.telemetry import TelemetryStore
 from strategy.engine import StrategyEngine
 from timeutils import to_epoch_ms, utcnow
@@ -35,6 +36,12 @@ def config():
     cfg.protective_quarantine_seconds = 3600
     cfg.protective_anomaly_sticky_count = 2
     return cfg
+
+
+def test_trigger_evidence_quality_schema_accepts_full_structured_label():
+    label = "static_trigger_price_confirmed_timestamp_unavailable"
+    assert TradeExitEvent.__table__.c.trigger_evidence_quality.type.length >= len(label)
+    assert TRADE_EXIT_SLIPPAGE_COLUMNS["trigger_evidence_quality"] == "VARCHAR(100)"
 
 
 def finalized_exit(fill, trigger=98, stop_type="StopLoss"):

@@ -12,8 +12,8 @@ from storage.models import (
 
 logger = logging.getLogger(__name__)
 
-DATABASE_SCHEMA_VERSION = "telemetry-v6-operator-reliability"
-MIGRATION_VERSION = "2026-08-25-storage-monitor-quarantine-v1"
+DATABASE_SCHEMA_VERSION = "telemetry-v7-exit-evidence-width"
+MIGRATION_VERSION = "2026-08-25-exit-evidence-width-v1"
 
 
 TELEMETRY_ATTRIBUTION_COLUMNS: Dict[str, Dict[str, str]] = {
@@ -38,7 +38,7 @@ TRADE_EXIT_SLIPPAGE_COLUMNS: Dict[str, str] = {
     "slippage_r": "NUMERIC",
     "slippage_classification": "VARCHAR(20)",
     "trigger_at": "TIMESTAMP WITH TIME ZONE",
-    "trigger_evidence_quality": "VARCHAR(40)",
+    "trigger_evidence_quality": "VARCHAR(100)",
     "fill_at": "TIMESTAMP WITH TIME ZONE",
     "protective_execution_id": "VARCHAR(100)",
 }
@@ -202,6 +202,18 @@ def widen_exit_reason(engine) -> None:
         ))
 
 
+def widen_trigger_evidence_quality(engine) -> None:
+    """Allow the complete structured evidence label used by protective exits."""
+    inspector = inspect(engine)
+    if engine.dialect.name != "postgresql" or not inspector.has_table("trade_exit_events"):
+        return
+    with engine.begin() as conn:
+        conn.execute(text(
+            "ALTER TABLE trade_exit_events "
+            "ALTER COLUMN trigger_evidence_quality TYPE VARCHAR(100)"
+        ))
+
+
 RISK_STATE_COLUMNS: Dict[str, str] = {
     "pending_entries": "JSONB",
     "blocked_symbols": "JSONB",
@@ -294,5 +306,6 @@ def run_safe_migrations(engine) -> None:
     ensure_durability_tables(engine)
     widen_exit_reason(engine)
     ensure_trade_exit_slippage_columns(engine)
+    widen_trigger_evidence_quality(engine)
     ensure_telemetry_attribution_columns(engine)
     ensure_analytics_indexes(engine)

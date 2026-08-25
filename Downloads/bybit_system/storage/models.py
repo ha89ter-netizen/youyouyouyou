@@ -467,7 +467,7 @@ class TradeExitEvent(Base):
     slippage_r = Column(Numeric, nullable=True)
     slippage_classification = Column(String(20), nullable=True, index=True)
     trigger_at = Column(DateTime(timezone=True), nullable=True)
-    trigger_evidence_quality = Column(String(40), nullable=True)
+    trigger_evidence_quality = Column(String(100), nullable=True)
     fill_at = Column(DateTime(timezone=True), nullable=True)
     protective_execution_id = Column(String(100), nullable=True)
     policy_epoch = Column(Integer, nullable=False)
