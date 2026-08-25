@@ -491,6 +491,54 @@ class LiveRunInfrastructureTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "deterministic owners"):
                 live_run._assert_clean_exchange(self.cfg, self.db)
 
+    def test_restart_accepts_strongly_owned_protection_replacement(self):
+        trade = TradeLog(
+            symbol="UNIUSDT", action="open_long",
+            order_link_id="intent-owner", entry_filled_qty=2,
+        )
+        position = {
+            "symbol": "UNIUSDT", "side": "Buy", "size": "2",
+            "stopLoss": "4.28", "takeProfit": "4.48",
+        }
+        orders = [
+            {"orderId": "new-sl", "stopOrderType": "StopLoss",
+             "parentOrderLinkId": "intent-owner", "triggerBy": "MarkPrice",
+             "side": "Sell", "qty": "2", "triggerPrice": "4.28",
+             "reduceOnly": True},
+            {"orderId": "new-tp", "stopOrderType": "TakeProfit",
+             "parentOrderLinkId": "intent-owner", "triggerBy": "MarkPrice",
+             "side": "Sell", "qty": "2", "triggerPrice": "4.48",
+             "reduceOnly": True},
+        ]
+        self.cfg.protective_trigger_by = "MarkPrice"
+        self.assertTrue(live_run._replacement_protection_owned_by_trade(
+            self.cfg, trade, position, orders
+        ))
+
+    def test_restart_rejects_protection_replacement_with_wrong_parent(self):
+        trade = TradeLog(
+            symbol="UNIUSDT", action="open_long",
+            order_link_id="intent-owner", entry_filled_qty=2,
+        )
+        position = {
+            "symbol": "UNIUSDT", "side": "Buy", "size": "2",
+            "stopLoss": "4.28", "takeProfit": "4.48",
+        }
+        orders = [
+            {"orderId": "new-sl", "stopOrderType": "StopLoss",
+             "parentOrderLinkId": "different-owner", "triggerBy": "MarkPrice",
+             "side": "Sell", "qty": "2", "triggerPrice": "4.28",
+             "reduceOnly": True},
+            {"orderId": "new-tp", "stopOrderType": "TakeProfit",
+             "parentOrderLinkId": "intent-owner", "triggerBy": "MarkPrice",
+             "side": "Sell", "qty": "2", "triggerPrice": "4.48",
+             "reduceOnly": True},
+        ]
+        self.cfg.protective_trigger_by = "MarkPrice"
+        self.assertFalse(live_run._replacement_protection_owned_by_trade(
+            self.cfg, trade, position, orders
+        ))
+
 
 if __name__ == "__main__":
     unittest.main()

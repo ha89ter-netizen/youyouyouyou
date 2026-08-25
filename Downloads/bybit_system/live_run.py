@@ -285,7 +285,17 @@ def _assert_clean_exchange(cfg: BybitConfig, db: Database) -> dict:
         finally:
             session.close()
         if expected_ids and current_ids != expected_ids:
-            raise RuntimeError(f"Inherited {symbol} protective order IDs changed unexpectedly")
+            if not _replacement_protection_owned_by_trade(
+                cfg, trade, position, protective
+            ):
+                raise RuntimeError(
+                    f"Inherited {symbol} protective order IDs changed unexpectedly"
+                )
+            logger.warning(
+                "Inherited %s protective IDs changed through a strongly-owned "
+                "exchange replacement; accepting current read-back",
+                symbol,
+            )
         owned_order_ids.update(current_ids)
         inherited.append({
             "classification": "inherited_live_protected",
@@ -330,6 +340,46 @@ def _assert_clean_exchange(cfg: BybitConfig, db: Database) -> dict:
     account = dict(account)
     account["inherited_positions"] = inherited
     return account
+
+
+def _replacement_protection_owned_by_trade(
+    cfg: BybitConfig, trade: TradeLog, position: dict, protective: list[dict]
+) -> bool:
+    """Validate replacement child IDs by stable parent ownership and live terms."""
+    required = {"StopLoss", "TakeProfit"}
+    by_kind = {
+        order.get("stopOrderType"): order
+        for order in protective
+        if order.get("stopOrderType") in required
+    }
+    if set(by_kind) != required or not trade.order_link_id:
+        return False
+    expected_source = getattr(cfg, "protective_trigger_by", "LastPrice")
+    expected_side = "Sell" if trade.action == "open_long" else "Buy"
+    expected_qty = float(position.get("size") or 0)
+    expected_prices = {
+        "StopLoss": float(position.get("stopLoss") or 0),
+        "TakeProfit": float(position.get("takeProfit") or 0),
+    }
+    if expected_qty <= 0 or not all(expected_prices.values()):
+        return False
+    for kind, order in by_kind.items():
+        if order.get("parentOrderLinkId") != trade.order_link_id:
+            return False
+        if order.get("triggerBy") != expected_source:
+            return False
+        if order.get("side") != expected_side or not order.get("reduceOnly"):
+            return False
+        order_qty = float(order.get("qty") or order.get("leavesQty") or 0)
+        qty_tolerance = max(1e-8, abs(expected_qty) * 1e-6)
+        if abs(order_qty - expected_qty) > qty_tolerance:
+            return False
+        trigger_price = float(order.get("triggerPrice") or 0)
+        expected_price = expected_prices[kind]
+        price_tolerance = max(1e-8, abs(expected_price) * 1e-6)
+        if abs(trigger_price - expected_price) > price_tolerance:
+            return False
+    return True
 
 
 def _environment_summary(cfg: BybitConfig) -> dict:
