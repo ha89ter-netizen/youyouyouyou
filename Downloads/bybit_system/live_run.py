@@ -10,8 +10,10 @@ import secrets
 import signal
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Optional
 
@@ -20,7 +22,7 @@ from sqlalchemy.engine import make_url
 
 from config.settings import BybitConfig
 from execution.execution_engine import ExecutionEngine
-from runtime_control import DatabaseProcessLock, RUNTIME_DIR
+from runtime_control import DatabaseProcessLock, DuplicateProcessError, RUNTIME_DIR
 from storage.db import Database
 from storage.journal import TradeJournal
 from storage.migrations import run_safe_migrations
@@ -34,6 +36,99 @@ ROOT = Path(__file__).resolve().parent
 CURRENT_RUN = RUNTIME_DIR / "current_run.json"
 SUPERVISOR_INFO = RUNTIME_DIR / "supervisor.json"
 logger = logging.getLogger(__name__)
+
+
+class _RailwayDeploymentHandoverServer:
+    """Deployment-only health endpoint while the previous singleton drains.
+
+    Railway keeps the old deployment active until the new deployment returns
+    HTTP 200.  The PostgreSQL advisory lock intentionally prevents both
+    supervisors from trading at once, so the new container must be able to
+    report a safe standby state before it can acquire that lock.
+    """
+
+    def __init__(self, port: int):
+        self.port = int(port)
+        self._http: Optional[ThreadingHTTPServer] = None
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        if self._http is not None:
+            return
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path not in ("/healthz", "/status"):
+                    self.send_error(404)
+                    return
+                body = json.dumps({
+                    "status": "standby",
+                    "handover": True,
+                    "testnet": True,
+                }).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format, *_args):
+                return
+
+        self._http = ThreadingHTTPServer(("0.0.0.0", self.port), Handler)
+        self._thread = threading.Thread(
+            target=self._http.serve_forever,
+            name="railway-deployment-handover",
+            daemon=True,
+        )
+        self._thread.start()
+        logger.warning(
+            "Previous Railway supervisor still owns the singleton lock; "
+            "serving standby health on port %d until deployment handover",
+            self.port,
+        )
+
+    def stop(self) -> None:
+        if self._http is None:
+            return
+        self._http.shutdown()
+        self._http.server_close()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+        self._http = None
+        self._thread = None
+
+
+def _acquire_supervisor_lock(lock: DatabaseProcessLock, cfg: BybitConfig) -> None:
+    """Acquire immediately locally, or safely wait through a Railway cutover."""
+    if cfg.runtime_mode != "railway":
+        lock.start()
+        return
+
+    wait_seconds = max(
+        30.0, float(os.getenv("RAILWAY_HANDOVER_WAIT_SECONDS", "360"))
+    )
+    retry_seconds = max(
+        0.1, float(os.getenv("RAILWAY_HANDOVER_RETRY_SECONDS", "2"))
+    )
+    deadline = time.monotonic() + wait_seconds
+    handover = _RailwayDeploymentHandoverServer(int(os.getenv("PORT", "8080")))
+    try:
+        while True:
+            try:
+                lock.start()
+                return
+            except DuplicateProcessError:
+                handover.start()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError(
+                        "Timed out waiting for the previous Railway supervisor "
+                        "to release its singleton lock"
+                    )
+                time.sleep(min(retry_seconds, remaining))
+    finally:
+        handover.stop()
 
 
 @dataclass
@@ -459,7 +554,7 @@ def _prepare(
     supervisor_lock = None
     if acquire_supervisor_lock:
         supervisor_lock = DatabaseProcessLock(db, "supervisor")
-        supervisor_lock.start()
+        _acquire_supervisor_lock(supervisor_lock, cfg)
 
     journal = TradeJournal(db)
     remaining = journal.get_orphaned_trades()

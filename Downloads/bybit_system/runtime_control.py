@@ -24,6 +24,10 @@ _DATABASE_LOCK_IDS = {
 }
 
 
+class DuplicateProcessError(RuntimeError):
+    """Raised when another container already owns a singleton service lock."""
+
+
 class DatabaseProcessLock:
     """PostgreSQL advisory lock that prevents duplicates across containers."""
 
@@ -44,7 +48,7 @@ class DatabaseProcessLock:
                 {"lock_id": _DATABASE_LOCK_IDS[self.service]},
             ).scalar()
             if not acquired:
-                raise RuntimeError(
+                raise DuplicateProcessError(
                     f"Duplicate {self.service} process is already running"
                 )
             self._connection = connection

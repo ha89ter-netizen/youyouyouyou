@@ -125,7 +125,7 @@ changing trading behaviour:
 TELEMETRY_ACCOUNT_INTERVAL_SEC=60
 TELEMETRY_POSITION_INTERVAL_SEC=30
 STRATEGY_VERSION=frozen-current
-STORAGE_ENTRY_BLOCK_RATIO=0.85
+STORAGE_ENTRY_BLOCK_RATIO=0.70
 TELEMETRY_OUTBOX_DELIVERED_RETENTION_HOURS=24
 TELEMETRY_OUTBOX_CLEANUP_BATCH_SIZE=1000
 TELEMETRY_OUTBOX_CLEANUP_MAX_BATCHES=10
@@ -135,8 +135,8 @@ POSITION_CLOSE_VISIBILITY_GRACE_SECONDS=120
 RAW_TRADES_RETENTION_HOURS=168
 ORDERBOOK_RETENTION_HOURS=168
 LIQUIDATIONS_RETENTION_HOURS=720
-FUNDING_RAW_RETENTION_HOURS=24
-OPEN_INTEREST_RAW_RETENTION_HOURS=24
+FUNDING_RAW_RETENTION_HOURS=6
+OPEN_INTEREST_RAW_RETENTION_HOURS=6
 HIGH_FREQUENCY_RETENTION_INTERVAL_SECONDS=1800
 WS_RECONNECT_INITIAL_SECONDS=5
 WS_RECONNECT_MAX_SECONDS=60
@@ -157,6 +157,11 @@ PROTECTIVE_ANOMALY_STICKY_COUNT=2
 HEALTH_HTTP_ENABLED=true
 OPERATOR_MONITOR_INTERVAL_SECONDS=30
 ```
+
+Raw funding/open-interest ticks are retained for six hours; before deletion,
+complete UTC-minute buckets are preserved as count/min/max/average rollups.
+This bounds the two highest-churn tables without changing current strategy
+inputs or discarding their longer-term research history.
 
 Optional automatic Telegram operator alerts:
 
@@ -207,7 +212,7 @@ new policy epoch.
 `DATABASE_URL` обязан указывать на внешний PostgreSQL: Railway-режим отвергает
 отсутствующее значение, SQLite и localhost. `STORAGE_MAX_DATABASE_BYTES`
 обязан соответствовать реальной квоте Railway volume; при недоступной БД или
-достижении 85% этой квоты новые входы блокируются, но открытые позиции продолжают
+достижении 70% этой квоты новые входы блокируются, но открытые позиции продолжают
 управляться. `RAILWAY_GIT_COMMIT_SHA`
 предоставляется Railway автоматически; при другом способе сборки задайте
 `COMMIT_SHA` явно. `OPENAI_API_KEY` нужен только если текущая конфигурация

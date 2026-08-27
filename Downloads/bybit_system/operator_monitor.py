@@ -40,6 +40,15 @@ def _json_default(value):
         return str(value)
 
 
+def _format_number(value: Any) -> str:
+    if value is None:
+        return "n/a"
+    try:
+        return f"{float(value):.8g}"
+    except (TypeError, ValueError):
+        return "n/a"
+
+
 class TelegramClient:
     def __init__(self, token: str, chat_id: str, timeout: float = 10.0):
         self._token = token
@@ -243,6 +252,16 @@ class OperatorMonitor:
             closed = [row for row in trades if row.status == "closed"]
             total_pnl = sum(float(row.pnl_usdt or 0) for row in closed)
             wins = sum(1 for row in closed if float(row.pnl_usdt or 0) > 0)
+            today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            closed_today = [
+                row for row in closed
+                if ensure_aware_utc(row.closed_at)
+                and ensure_aware_utc(row.closed_at) >= today_start
+            ]
+            daily_pnl = sum(float(row.pnl_usdt or 0) for row in closed_today)
+            daily_wins = sum(
+                1 for row in closed_today if float(row.pnl_usdt or 0) > 0
+            )
             outbox = dict(session.query(
                 TelemetryOutbox.status, func.count(TelemetryOutbox.id)
             ).group_by(TelemetryOutbox.status).all())
@@ -318,10 +337,14 @@ class OperatorMonitor:
             state["last_health_id"] = int(latest_health)
 
             ratio = storage.get("usage_ratio")
-            level = "critical" if ratio is not None and ratio >= .85 else (
-                "warning" if ratio is not None and ratio >= .70 else "normal"
+            critical_ratio = min(1.0, max(0.01, float(getattr(
+                self.cfg, "storage_entry_block_ratio", .85
+            ))))
+            warning_ratio = max(0.0, critical_ratio - .15)
+            level = "critical" if ratio is not None and ratio >= critical_ratio else (
+                "warning" if ratio is not None and ratio >= warning_ratio else "normal"
             )
-            if state.get("storage_level") not in (None, level) and level != "normal":
+            if state.get("storage_level") != level and level != "normal":
                 messages.append(f"🚨 PostgreSQL usage is {ratio:.1%} ({level})")
             state["storage_level"] = level
 
@@ -330,11 +353,15 @@ class OperatorMonitor:
             ))))
             today = now.date().isoformat()
             if now.hour >= daily_hour and state.get("last_daily_summary") != today:
-                win_rate = wins / len(closed) * 100 if closed else 0.0
+                win_rate = (
+                    daily_wins / len(closed_today) * 100 if closed_today else 0.0
+                )
                 summary = (
                     f"🧾 Daily status {today} UTC\nrun={self.run_id}\n"
-                    f"closed={len(closed)} open={len(open_trades)} win_rate={win_rate:.1f}%\n"
-                    f"PnL={total_pnl:+.4f} USDT breaker={'ON' if causes else 'off'}\n"
+                    f"closed={len(closed_today)} open={len(open_trades)} "
+                    f"win_rate={win_rate:.1f}%\n"
+                    f"PnL={daily_pnl:+.4f} USDT "
+                    f"breaker={'ON' if causes else 'off'}\n"
                 )
                 summary += f"DB={ratio:.1%}" if ratio is not None else "DB size unavailable"
                 messages.append(summary)
@@ -347,6 +374,8 @@ class OperatorMonitor:
                 ),
                 "collector_heartbeat": run.collector_heartbeat_at if run else None,
                 "trader_heartbeat": run.trader_heartbeat_at if run else None,
+                "collector_healthy": collector_ok,
+                "trader_healthy": trader_ok,
                 "closed_trades": len(closed), "open_trades": len(open_trades),
                 "wins": wins, "realized_pnl_usdt": total_pnl,
                 "circuit_breaker": bool(causes), "breaker_causes": causes,
@@ -439,8 +468,10 @@ class OperatorMonitor:
                     )
                     lines.append(
                         f"#{trade.id} {trade.symbol} {direction} | entry="
-                        f"{float(trade.entry_price):.8g} | SL={float(trade.stop_loss_price):.8g} "
-                        f"TP={float(trade.take_profit_price):.8g} | uPnL={unrealized}"
+                        f"{_format_number(trade.entry_price)} | "
+                        f"SL={_format_number(trade.stop_loss_price)} "
+                        f"TP={_format_number(trade.take_profit_price)} | "
+                        f"uPnL={unrealized}"
                     )
                 return "\n".join(lines)
 
@@ -475,8 +506,8 @@ class OperatorMonitor:
             report = (
                 f"🤖 Bybit Testnet bot\nrun={self.run_id}\n"
                 f"runtime={snapshot.get('status', 'unknown')} | DB={db_text}\n"
-                f"collector={'OK' if snapshot.get('collector_heartbeat') else 'unknown'} | "
-                f"trader={'OK' if snapshot.get('trader_heartbeat') else 'unknown'}\n"
+                f"collector={'OK' if snapshot.get('collector_healthy') else 'STALE'} | "
+                f"trader={'OK' if snapshot.get('trader_healthy') else 'STALE'}\n"
                 f"open={len(open_trades)} | daily P&L={daily_pnl:+.4f} USDT\n"
                 f"circuit breaker={'ON' if causes else 'off'} | "
                 f"outbox pending={(snapshot.get('outbox') or {}).get('pending', 0)}"

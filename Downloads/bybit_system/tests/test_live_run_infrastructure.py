@@ -9,7 +9,7 @@ from unittest.mock import Mock, patch
 from config.settings import BybitConfig
 import live_run
 from risk.risk_manager import RiskManager
-from runtime_control import DatabaseProcessLock, RuntimeService
+from runtime_control import DatabaseProcessLock, DuplicateProcessError, RuntimeService
 import runtime_control
 from storage.db import Database
 from storage.journal import TradeJournal
@@ -365,6 +365,38 @@ class LiveRunInfrastructureTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "Duplicate trader"):
             lock.start()
         connection.close.assert_called_once()
+
+    def test_railway_handover_serves_health_then_acquires_singleton_lock(self):
+        cfg = BybitConfig(runtime_mode="railway")
+        lock = Mock()
+        lock.start.side_effect = [
+            DuplicateProcessError("Duplicate supervisor process is already running"),
+            None,
+        ]
+        handover = Mock()
+        with patch.object(
+            live_run, "_RailwayDeploymentHandoverServer", return_value=handover
+        ) as server_class, patch.object(live_run.time, "sleep") as sleep, patch.dict(
+            os.environ,
+            {"PORT": "9123", "RAILWAY_HANDOVER_WAIT_SECONDS": "60"},
+            clear=False,
+        ):
+            live_run._acquire_supervisor_lock(lock, cfg)
+
+        self.assertEqual(lock.start.call_count, 2)
+        server_class.assert_called_once_with(9123)
+        handover.start.assert_called_once_with()
+        handover.stop.assert_called_once_with()
+        sleep.assert_called_once_with(2.0)
+
+    def test_local_duplicate_supervisor_lock_fails_without_handover(self):
+        cfg = BybitConfig(runtime_mode="local")
+        lock = Mock()
+        lock.start.side_effect = DuplicateProcessError("Duplicate supervisor")
+        with patch.object(live_run, "_RailwayDeploymentHandoverServer") as server_class:
+            with self.assertRaisesRegex(DuplicateProcessError, "Duplicate supervisor"):
+                live_run._acquire_supervisor_lock(lock, cfg)
+        server_class.assert_not_called()
 
     def test_railway_rejects_missing_or_localhost_database_url(self):
         missing = BybitConfig(runtime_mode="railway", db_url="")

@@ -25,15 +25,11 @@ def _symbols_from_env() -> List[str]:
         "ADAUSDT",
         "TRXUSDT",
         "LINKUSDT",
-        "AVAXUSDT",
         "SUIUSDT",
-        "TONUSDT",
         "HBARUSDT",
         "DOTUSDT",
-        "LTCUSDT",
         "BCHUSDT",
         "UNIUSDT",
-        "ATOMUSDT",
         "APTUSDT",
         "1000PEPEUSDT",
         "HYPEUSDT",
@@ -358,7 +354,7 @@ class BybitConfig:
         os.getenv("STORAGE_MAX_DATABASE_BYTES", "0")
     )
     storage_entry_block_ratio: float = float(
-        os.getenv("STORAGE_ENTRY_BLOCK_RATIO", "0.85")
+        os.getenv("STORAGE_ENTRY_BLOCK_RATIO", "0.70")
     )
     storage_monitor_interval_sec: int = int(
         os.getenv("STORAGE_MONITOR_INTERVAL_SEC", "300")
@@ -373,10 +369,10 @@ class BybitConfig:
         os.getenv("LIQUIDATIONS_RETENTION_HOURS", "720")
     )
     funding_raw_retention_hours: int = int(
-        os.getenv("FUNDING_RAW_RETENTION_HOURS", "24")
+        os.getenv("FUNDING_RAW_RETENTION_HOURS", "6")
     )
     open_interest_raw_retention_hours: int = int(
-        os.getenv("OPEN_INTEREST_RAW_RETENTION_HOURS", "24")
+        os.getenv("OPEN_INTEREST_RAW_RETENTION_HOURS", "6")
     )
     high_frequency_retention_interval_seconds: int = int(
         os.getenv("HIGH_FREQUENCY_RETENTION_INTERVAL_SECONDS", "1800")

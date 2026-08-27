@@ -129,6 +129,10 @@ Each symbol evaluation receives a unique evaluation ID. Structured events preser
 
 Insufficient or stale data is itself a rejected evaluation. Later stages (risk approval, ranking, anti-burst, re-check and exchange submission) append separate phase events instead of overwriting the committee decision.
 
+Decision fields are stored once in normalized columns and rejection rows. The
+JSON extension column retains only schema metadata and unknown future fields;
+it does not duplicate the normalized payload on every evaluation.
+
 ## Protection and exits
 
 Initial protection, missing protection, rejected/successful tightening, trailing activation and final exchange trigger are appended to `trade_protection_events`. Events contain old/new structured values, exchange IDs when available, source module, reason, outcome, safe raw status and policy epoch.
@@ -175,6 +179,10 @@ Heartbeat errors no longer kill the heartbeat thread; it retries and records fai
 ## Retention and reconstruction
 
 Research-critical facts are durable PostgreSQL rows and are never subject to automatic retention. Bounded retention applies only to raw high-frequency `trades`, `orderbook_snapshots`, `liquidations`, `funding_rate` and `open_interest`; raw data at or after the oldest still-open trade is retained for excursion reconstruction. Before older funding/OI ticker samples are deleted, minute count/min/max/average aggregates are durably inserted into `funding_rate_minute_rollups` and `open_interest_minute_rollups`. Deletes are batched and run on a background cadence. PostgreSQL capacity is monitored and new entries fail closed before the configured quota threshold. Railway platform logs and local rotating files remain useful diagnostics but are not required for reconstruction. Railway filesystem files, PIDs, locks, WebSocket objects and in-memory buffers are intentionally ephemeral.
+
+The default raw funding/OI window is six hours; their minute rollups remain
+durable. Raw trades and order-book snapshots keep the longer seven-day window,
+and every raw table is preserved back to the oldest still-open trade.
 
 Delivered outbox envelopes are not the audit record: the normalized target
 rows are. Confirmed deliveries older than the configured retention window are

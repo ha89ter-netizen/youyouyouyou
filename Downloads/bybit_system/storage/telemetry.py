@@ -118,9 +118,35 @@ FILTER_KEYS = {
     "max_open_interest_age_minutes", "max_trade_flow_age_seconds",
 }
 
+# DecisionEvent already persists every current payload field in typed columns,
+# while RejectionEvent persists the nested rejection list.  Keeping the whole
+# payload again in JSONB roughly doubles this high-volume audit table.  Unknown
+# future fields remain durable in ``extra`` so schema evolution does not lose
+# information.
+_NORMALIZED_DECISION_PAYLOAD_KEYS = {
+    "accepted", "confirmation_families", "decision_reason", "decision_score",
+    "estimated_risk", "evaluation_id", "filter_results", "final_decision",
+    "funding", "market_data_age_seconds", "market_data_timestamp",
+    "market_regime", "phase", "proposed_entry", "proposed_quantity",
+    "proposed_stop_loss", "proposed_take_profit", "rejections", "risk_score",
+    "side", "signal_outputs", "spread", "symbol", "trend_state",
+    "volatility_regime",
+}
+
 
 def _sha(value: Any) -> str:
     return hashlib.sha256(stable_json_dumps(value).encode("utf-8")).hexdigest()
+
+
+def _compact_decision_payload(payload: dict) -> dict:
+    extra = {
+        key: value for key, value in payload.items()
+        if key not in _NORMALIZED_DECISION_PAYLOAD_KEYS
+    }
+    compact = {"schema": "normalized-v1"}
+    if extra:
+        compact["extra"] = safe_json(extra)
+    return compact
 
 
 def _safe_database_url(raw: str) -> str:
@@ -1073,7 +1099,7 @@ class TelemetryStore:
             accepted=bool(payload.get("accepted")), policy_epoch=epoch,
             commit_sha=command.get("commit_sha") or "unknown",
             config_hash=command.get("config_hash") or "unknown",
-            structured_payload=safe_json(payload),
+            structured_payload=_compact_decision_payload(payload),
         )
         session.add(row)
         for index, rejection in enumerate(payload.get("rejections") or []):

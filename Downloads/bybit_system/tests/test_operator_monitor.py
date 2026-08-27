@@ -1,3 +1,4 @@
+from datetime import timedelta
 from types import SimpleNamespace
 
 from sqlalchemy import create_engine
@@ -102,6 +103,8 @@ def test_health_snapshot_reports_breaker_without_calling_exchange():
     monitor = OperatorMonitor(db, cfg(), "run", sender=lambda _text: True)
     monitor._initialize_durable_cursors(); snapshot = monitor.poll_once()
     assert snapshot["status"] == "healthy"
+    assert snapshot["collector_healthy"] is True
+    assert snapshot["trader_healthy"] is True
     assert snapshot["circuit_breaker"] is True
     assert snapshot["open_trades"] == 0
 
@@ -182,3 +185,71 @@ def test_telegram_commands_ignore_unauthorized_chat():
     session = db.get_session(); state = session.query(OperatorMonitorState).one()
     assert state.state_value["telegram_update_offset"] == 8
     session.close()
+
+
+def test_daily_summary_counts_only_current_utc_day():
+    db = Db(); seed(db); sent = []; now = utcnow()
+    session = db.get_session()
+    session.add_all([
+        TradeLog(
+            symbol="OLDUSDT", action="open_long", source="test", reason="old",
+            order_link_id="old", run_id="run", entry_price=100, size_usdt=100,
+            leverage=1, status="closed", pnl_usdt=99,
+            closed_at=now - timedelta(days=1),
+        ),
+        TradeLog(
+            symbol="TODAYUSDT", action="open_long", source="test", reason="today",
+            order_link_id="today", run_id="run", entry_price=100, size_usdt=100,
+            leverage=1, status="closed", pnl_usdt=2, closed_at=now,
+        ),
+    ])
+    session.commit(); session.close()
+    config = cfg(); config.telegram_daily_summary_utc_hour = 0
+    monitor = OperatorMonitor(
+        db, config, "run", sender=lambda text: sent.append(text) or True
+    )
+    monitor._initialize_durable_cursors(); monitor.poll_once()
+    summary = next(text for text in sent if "Daily status" in text)
+    assert "closed=1" in summary
+    assert "PnL=+2.0000 USDT" in summary
+    assert "+101.0000" not in summary
+
+
+def test_positions_command_handles_missing_protection_prices():
+    db = Db(); seed(db); sent = []
+    session = db.get_session()
+    session.add(TradeLog(
+        symbol="ETHUSDT", action="open_long", source="test", reason="test",
+        order_link_id="missing-protection", run_id="run", entry_price=100,
+        size_usdt=100, leverage=1, stop_loss_price=None,
+        take_profit_price=None, status="open",
+    ))
+    session.commit(); session.close()
+    monitor = OperatorMonitor(
+        db, cfg(), "run", sender=lambda text: sent.append(text) or True,
+        updates_fetcher=lambda _offset: [{
+            "update_id": 1,
+            "message": {"chat": {"id": 42}, "text": "/positions"},
+        }],
+        authorized_chat_id="42",
+    )
+    monitor._initialize_durable_cursors(); monitor.poll_once()
+    assert any("ETHUSDT LONG" in text and "SL=n/a TP=n/a" in text for text in sent)
+
+
+def test_initial_storage_warning_uses_configured_safety_threshold(monkeypatch):
+    db = Db(); seed(db); sent = []; config = cfg()
+    config.storage_entry_block_ratio = .70
+    monkeypatch.setattr(
+        "operator_monitor.StorageGuard.status",
+        lambda _self: {
+            "available": True, "database_bytes": 3_000_000_000,
+            "maximum_bytes": 5_000_000_000, "usage_ratio": .60,
+            "entry_allowed": True, "reason": None,
+        },
+    )
+    monitor = OperatorMonitor(
+        db, config, "run", sender=lambda text: sent.append(text) or True
+    )
+    monitor._initialize_durable_cursors(); monitor.poll_once()
+    assert any("PostgreSQL usage is 60.0% (warning)" in text for text in sent)

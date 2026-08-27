@@ -10,8 +10,9 @@ from sqlalchemy.orm import sessionmaker
 from config.settings import BybitConfig
 from storage.migrations import run_safe_migrations
 from storage.models import (
-    AccountSnapshot, Base, OperationalHealthEvent, PositionSnapshot, RunPolicyEpoch,
-    Trade, TradeExcursion, TradeExitEvent, TradeLog, TradeProtectionEvent, TradingRun,
+    AccountSnapshot, Base, DecisionEvent, OperationalHealthEvent, PositionSnapshot,
+    RejectionEvent, RunPolicyEpoch, Trade, TradeExcursion, TradeExitEvent, TradeLog,
+    TradeProtectionEvent, TradingRun,
 )
 from storage.telemetry import TelemetryStore, config_hash, effective_config_document
 from strategy.engine import StrategyEngine
@@ -132,6 +133,35 @@ class ResearchTelemetryTest(unittest.TestCase):
         self.assertNotIn("API_KEY_MUST_NOT_PERSIST", persisted)
         self.assertNotIn("API_SECRET_MUST_NOT_PERSIST", persisted)
         self.assertNotIn("OPENAI_SECRET_MUST_NOT_PERSIST", persisted)
+
+    def test_decision_payload_avoids_normalized_json_duplication(self):
+        self.store.record_decision({
+            "evaluation_id": "evaluation-1",
+            "phase": "candidate",
+            "symbol": "SOLUSDT",
+            "side": "open_long",
+            "signal_outputs": [{"source": "ema", "action": "open_long"}],
+            "confirmation_families": ["trend"],
+            "filter_results": {"fresh": True},
+            "final_decision": "hold",
+            "decision_reason": "risk gate",
+            "accepted": False,
+            "rejections": [{
+                "stage": "risk", "code": "blocked", "reason": "risk gate",
+                "context": {"breaker": True},
+            }],
+            "future_extension": {"kept": True},
+        })
+        session = self.db.get_session()
+        decision = session.query(DecisionEvent).one()
+        rejection = session.query(RejectionEvent).one()
+        self.assertEqual(decision.signal_outputs[0]["source"], "ema")
+        self.assertEqual(decision.structured_payload, {
+            "schema": "normalized-v1",
+            "extra": {"future_extension": {"kept": True}},
+        })
+        self.assertEqual(rejection.structured_context, {"breaker": True})
+        session.close()
 
     def test_source_change_refuses_same_immutable_run(self):
         (self.root / "app.py").write_text("VERSION = 2\n", encoding="utf-8")
