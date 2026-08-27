@@ -380,8 +380,12 @@ class BybitConfig:
     retention_delete_batch_size: int = int(
         os.getenv("RETENTION_DELETE_BATCH_SIZE", "10000")
     )
+    # Measured on the Railway database: the two ticker tables ingest roughly
+    # 190k rows/hour combined, so a 100k per-table budget could not drain a
+    # backlog while also keeping up with new writes. Deletion stays batched and
+    # only ever touches rows already past their policy window.
     retention_max_rows_per_run: int = int(
-        os.getenv("RETENTION_MAX_ROWS_PER_RUN", "100000")
+        os.getenv("RETENTION_MAX_ROWS_PER_RUN", "400000")
     )
 
     # Protective orders keep LastPrice by default for backward-compatible
@@ -426,8 +430,23 @@ class BybitConfig:
     telegram_alerts_enabled: bool = os.getenv(
         "TELEGRAM_ALERTS_ENABLED", "false"
     ).lower() == "true"
-    telegram_daily_summary_utc_hour: int = int(
-        os.getenv("TELEGRAM_DAILY_SUMMARY_UTC_HOUR", "12")
+    # Consolidated owner report cadence. This replaces the former once-a-day
+    # summary: an hourly report answers "how is it going?" without the owner
+    # having to wait until a fixed hour.
+    telegram_report_interval_minutes: int = int(
+        os.getenv("TELEGRAM_REPORT_INTERVAL_MINUTES", "60")
+    )
+    # Reporting period for that report: "24h", "utc_day" or "run". Printed
+    # verbatim in the message so a number is never period-ambiguous.
+    telegram_report_period: str = os.getenv("TELEGRAM_REPORT_PERIOD", "24h")
+    # A problem must persist this long before the owner is told, so a
+    # WebSocket blip that reconnects on its own never reaches Telegram.
+    telegram_alert_escalation_seconds: int = int(
+        os.getenv("TELEGRAM_ALERT_ESCALATION_SECONDS", "180")
+    )
+    # An unchanged, still-active problem is repeated at most this often.
+    telegram_alert_reminder_seconds: int = int(
+        os.getenv("TELEGRAM_ALERT_REMINDER_SECONDS", "3600")
     )
 
     # Process-supervisor policy.  This is deliberately separate from the

@@ -786,6 +786,32 @@ class OrderbookSnapshot(Base):
     )
 
 
+
+class OperatorControlCommand(Base):
+    """Durable owner request that the trading process applies, never Telegram itself.
+
+    The operator monitor lives in the supervisor process while the Risk Manager
+    lives in the trader process and owns ``risk_state`` in memory. A Telegram
+    callback that mutated ``risk_state`` directly would be silently overwritten
+    by the trader's next persist, and it would bypass every safety check. The
+    monitor therefore only *requests*; the trader consumes the request inside
+    its own cycle, validates deterministic preconditions and records the
+    outcome here.
+    """
+    __tablename__ = "operator_control_commands"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    command = Column(String(30), nullable=False)
+    requested_by = Column(String(64), nullable=False)
+    requested_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+    run_id = Column(String(100), nullable=True)
+    # pending -> applied | rejected. Never re-applied: the trader marks a row
+    # terminal in the same transaction that acts on it.
+    state = Column(String(20), nullable=False, default="pending")
+    processed_at = Column(DateTime(timezone=True), nullable=True)
+    outcome = Column(String(2000), nullable=True)
+    details = Column(JSONB_COMPAT, nullable=True)
+
 # Таблицы, которые нужно превратить в TimescaleDB hypertable (по колонке времени)
 HYPERTABLE_CONFIG = {
     "candles": "start_time",

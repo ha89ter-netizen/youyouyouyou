@@ -31,6 +31,8 @@ from storage.journal import TradeJournal
 from storage.risk_state import RiskStateStore
 from storage.telemetry import TelemetryStore
 from storage.durability import EntryIntentStore, StorageGuard
+from operational_status import OperationalStatusEvaluator
+from operator_control import OperatorControlApplier, OperatorControlStore
 from strategy.signal import Signal, Action
 from timeutils import ensure_aware_utc, from_epoch_ms, utc_today, utcnow
 from strategy.experts import ExpertSignalCollector
@@ -174,6 +176,15 @@ class StrategyEngine:
         self.telemetry = TelemetryStore(db, cfg)
         self.entry_intents = EntryIntentStore(db, cfg)
         self.storage_guard = StorageGuard(db, cfg)
+        # Owner requests from Telegram arrive as durable rows and are applied
+        # here, in the process that owns risk state, after this process
+        # re-validates them against live health. Telegram itself can never
+        # change trading state.
+        self._status_evaluator = OperationalStatusEvaluator(db, cfg, cfg.run_id)
+        self.operator_control = OperatorControlApplier(
+            OperatorControlStore(db), self.risk_manager,
+            self._status_evaluator.evaluate,
+        )
         self._trailing_activated: set = set()  # order_link_id, для которых уже включили trailing
         self._last_entry_ts: Optional[float] = None
         self._protection_entry_halt: Optional[str] = None
@@ -316,6 +327,7 @@ class StrategyEngine:
             # separate fail-closed durability gate.
             logger.exception("Durable telemetry outbox replay unavailable")
         self._monitor_storage_capacity()
+        self._apply_operator_commands()
         # Position state is fetched and managed independently from account
         # balance. A wallet endpoint failure must never suppress protection,
         # reconciliation, or Exit Manager work for existing exposure.
@@ -436,6 +448,24 @@ class StrategyEngine:
 
         if balance is not None:
             self._execute_ranked_candidates(candidates, balance, positions)
+
+    def _apply_operator_commands(self) -> None:
+        """Apply owner pause/resume requests; never let one stop the cycle."""
+        try:
+            for outcome in self.operator_control.apply_pending():
+                self.telemetry.record_health(
+                    "operator_control", f"command_{outcome.state}",
+                    "warning" if outcome.state == "rejected" else "info",
+                    outcome.state,
+                    details={"command": outcome.command, "outcome": outcome.outcome},
+                )
+        except Exception as exc:
+            self.telemetry.record_health(
+                "operator_control", "command_processing_failure",
+                "error", "deferred", error=exc,
+                details={"trading_cycle_continued": True},
+            )
+            logger.exception("Operator control commands deferred")
 
     def _monitor_storage_capacity(self) -> None:
         guard = getattr(self, "storage_guard", None)

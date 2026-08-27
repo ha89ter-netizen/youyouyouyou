@@ -156,6 +156,7 @@ PROTECTIVE_QUARANTINE_SECONDS=3600
 PROTECTIVE_ANOMALY_STICKY_COUNT=2
 HEALTH_HTTP_ENABLED=true
 OPERATOR_MONITOR_INTERVAL_SECONDS=30
+RETENTION_MAX_ROWS_PER_RUN=400000
 ```
 
 Raw funding/open-interest ticks are retained for six hours; before deletion,
@@ -163,24 +164,157 @@ complete UTC-minute buckets are preserved as count/min/max/average rollups.
 This bounds the two highest-churn tables without changing current strategy
 inputs or discarding their longer-term research history.
 
-Optional automatic Telegram operator alerts:
+### PostgreSQL growth and maintenance
+
+Run the read-only audit before changing any retention setting:
+
+```bash
+python -m tools.storage_audit          # add --json for machine-readable output
+```
+
+It classifies every table as A (critical trading evidence), B (audit/research
+history), C (reconstructible raw market data under bounded retention) or D
+(ephemeral bookkeeping), and separates heap from index size. Only C and D are
+ever bounded automatically; A and B are never auto-deleted.
+
+The audit exists because of a specific trap. Autovacuum reclaims heap space for
+reuse but never rebuilds a bloated btree, so the delete-heavy retention loop
+can leave an index several times larger than its own table. When that is what
+dominates, deleting more rows returns no space and only adds more bloat. The
+audit reports it explicitly and estimates what `REINDEX` would return.
+
+`REINDEX` rewrites an index and is an owner-approved maintenance action, never
+something the trading process does to itself. `CONCURRENTLY` avoids blocking
+writes, and each statement is independent, so it is safe to stop between them:
+
+```bash
+psql "$DATABASE_URL" -c "REINDEX INDEX CONCURRENTLY funding_rate_pkey;"
+psql "$DATABASE_URL" -c "REINDEX INDEX CONCURRENTLY open_interest_pkey;"
+python -m tools.storage_audit          # confirm the space came back
+```
+
+A failed `REINDEX CONCURRENTLY` leaves an invalid index behind; find it with
+`SELECT indexrelid::regclass FROM pg_index WHERE NOT indisvalid;` and drop only
+that invalid copy. Do not `VACUUM FULL` a table the bot is using: it takes an
+exclusive lock and blocks the trading cycle.
+
+## Telegram operator surface
 
 ```bash
 TELEGRAM_ALERTS_ENABLED=true
 TELEGRAM_BOT_TOKEN=<secret token from BotFather>
 TELEGRAM_CHAT_ID=<destination chat id>
-TELEGRAM_DAILY_SUMMARY_UTC_HOUR=12
+TELEGRAM_USER_ID=<your own numeric Telegram user id>
+TELEGRAM_REPORT_INTERVAL_MINUTES=60
+TELEGRAM_REPORT_PERIOD=24h            # 24h | utc_day | run
+TELEGRAM_ALERT_ESCALATION_SECONDS=180
+TELEGRAM_ALERT_REMINDER_SECONDS=3600
 ```
 
-The token and chat ID are read directly from the process environment and are
-never persisted in run metadata, telemetry, or logs. Alerts are automatic for
-startup, trade open/close, breaker changes, runtime/storage failures and a
-daily summary. Failed deliveries remain in a bounded durable retry queue.
-`GET /healthz` and `GET /status` expose the same non-secret status snapshot.
-The authorized Telegram chat also supports read-only commands: `/start` and
-`/status` return runtime health, `/positions` lists current exposure, and
-`/pnl` returns the current UTC-day result. Commands cannot place, amend, or
-cancel exchange orders; messages from any other chat ID are ignored.
+Get `TELEGRAM_CHAT_ID` and `TELEGRAM_USER_ID` by messaging the bot once and
+reading `https://api.telegram.org/bot<TOKEN>/getUpdates`: `message.chat.id` is
+the chat, `message.from.id` is you. In a private chat they are equal; in a
+group they are not, and both are checked. All three values are read directly
+from the process environment and are never persisted in run metadata,
+telemetry or logs.
+
+**Authorization fails closed.** Every message, command and inline button must
+come from `TELEGRAM_CHAT_ID` *and* `TELEGRAM_USER_ID`. If `TELEGRAM_USER_ID`
+is not configured, commands and buttons are disabled entirely — alerts are
+still delivered, but nobody can control the bot. Callback queries are
+authorized exactly like commands, so a forwarded message cannot become a
+remote control. There is no command that runs shell, SQL, or arbitrary
+exchange orders.
+
+### Commands
+
+| Command | Effect |
+| --- | --- |
+| `/status` | Is the bot working right now, and are entries allowed |
+| `/report` | Full trading report for the configured period |
+| `/positions` | Open positions with side and unrealized P&L |
+| `/health` | Per-component detail: heartbeats, data age, outbox, breaker |
+| `/pause` | Request a pause: new entries stop, positions stay managed |
+| `/resume` | Request a resume: deterministic safety checks must pass first |
+
+### Health states
+
+| State | Meaning |
+| --- | --- |
+| `HEALTHY` | Everything fresh, new entries permitted |
+| `DEGRADED` | Running, but an input the strategy depends on is unhealthy |
+| `PAUSED` | Running and managing positions; new entries blocked by a gate |
+| `STOPPED` | The runtime is not observable, or PostgreSQL is unusable |
+
+The state is derived from data the trading process already writes —
+`run_metadata` heartbeats, `risk_state` breaker causes, the storage guard, the
+telemetry outbox and raw market-data timestamps. There is no second source of
+truth for Telegram. `GET /healthz` and `GET /status` expose the same snapshot.
+
+### Alerts, not telemetry
+
+Raw engineering events such as `market_collector/websocket_disconnect` are no
+longer forwarded to Telegram; they remain in `operational_health_events` and
+the rotating log files. The owner gets lifecycle communication instead: a
+problem has to make the canonical state non-`HEALTHY` **and** stay that way for
+`TELEGRAM_ALERT_ESCALATION_SECONDS` before one `BOT WARNING` is sent. An
+unchanged problem repeats at most every `TELEGRAM_ALERT_REMINDER_SECONDS`; a
+worsening state alerts immediately; recovery sends exactly one `BOT RECOVERED`.
+A WebSocket blip that reconnects on its own therefore produces no message at
+all. Failed deliveries stay in a bounded durable retry queue.
+
+### Recovery and resume are separate
+
+Bounded automatic recovery (WebSocket reconnect, subscription restore, REST
+candle repair, reconciliation) needs no approval and continues on its own.
+Resuming *new entries* after a safety pause does. `/resume` only appends a row
+to `operator_control_commands`; the trading process consumes it inside its own
+cycle and re-validates, against live state, that PostgreSQL is available, the
+runtime is running normally, both heartbeats are fresh, market data is younger
+than five minutes, position state is readable, no telemetry has dead-lettered,
+and no circuit-breaker cause other than the owner's own pause remains. If any
+check fails the request is rejected with the reason, and trading stays paused.
+`/resume` can only clear the `operator_pause` cause: it can never clear an
+orphan, daily-loss or protective-execution cause.
+
+This indirection is required for correctness as well as safety — the monitor
+runs in the supervisor process while the Risk Manager owns `risk_state` in the
+trader process, so a direct write from Telegram would be overwritten.
+
+### Hourly report
+
+One consolidated report per `TELEGRAM_REPORT_INTERVAL_MINUTES` (this replaces
+the former once-a-day summary). The period is printed in the message itself and
+never mixed. Metric definitions, all sourced from `trade_log` rows the journal
+writes only after Bybit confirms closure, plus `position_snapshots` for live
+values:
+
+| Metric | Definition |
+| --- | --- |
+| Qualifying closed trade | `status='closed'`, non-null `pnl_usdt`, `closed_at` in period |
+| Realized PnL | Sum of `pnl_usdt` over qualifying closed trades (net of fees) |
+| Gross Profit | Sum of positive `pnl_usdt` |
+| Gross Loss | Sum of negative `pnl_usdt` |
+| Win Rate | Positive-PnL trades / qualifying closed trades; exactly zero is not a win |
+| Unrealized PnL | Sum of newest `PositionSnapshot.unrealized_pnl` per open trade |
+| Best / Worst symbol | Highest / lowest aggregate realized PnL over the same set |
+
+Trades in `orphaned` status have an unknown result: they are excluded from
+performance and reported separately, never averaged in as flat. A value that
+cannot be read is rendered as `UNAVAILABLE`, never as `0` — "no positions" and
+"position state could not be read" are different statements.
+
+Telegram is a visibility and control surface only. If it is unavailable the
+trading engine keeps running, keeps managing protection and keeps its own
+fail-closed behaviour; nothing in the trading path waits on it.
+
+### A future AI assistant
+
+`operator_control.py` is the seam. An assistant may read status and reports and
+explain them, and may translate natural language into one of the same explicit
+commands — which still pass authorization and every deterministic check above.
+An LLM is never the authority on whether trading is safe. No AI provider is
+wired into this path today.
 
 `PROTECTIVE_TRIGGER_BY` supports only `LastPrice` and `MarkPrice`. The default
 remains `LastPrice` to preserve the frozen run behaviour; changing it affects
