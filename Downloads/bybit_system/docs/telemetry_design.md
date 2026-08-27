@@ -150,6 +150,15 @@ normal/elevated/anomalous classification. Bybit history does not provide a
 certified trigger timestamp, so the near-trigger market observation is a
 fill-time proxy and is labeled as such in raw evidence.
 
+The intended trigger is the newest exchange-confirmed one, not the post-entry
+order snapshot. Bybit amends a tightened SL/TP on the same child order, so
+`trade_exchange_orders.trigger_price` keeps the value first read back after
+entry. When a later successful `protection_tightened` / `exchange_acknowledged`
+event carries a trigger for the same protective type, that price is used and
+`trigger_evidence_quality` names the event it came from. Without this, a
+tightened and profitable protective exit was classified as multi-R anomalous
+slippage and tripped a sticky circuit breaker.
+
 ## Failure isolation and health telemetry
 
 The prior top-of-cycle control flow fetched wallet balance before positions. A wallet failure raised out of `run_once` and skipped all position management. The flow now:

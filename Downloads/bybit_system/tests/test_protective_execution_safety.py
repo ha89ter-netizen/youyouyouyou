@@ -44,20 +44,32 @@ def test_trigger_evidence_quality_schema_accepts_full_structured_label():
     assert TRADE_EXIT_SLIPPAGE_COLUMNS["trigger_evidence_quality"] == "VARCHAR(100)"
 
 
-def finalized_exit(fill, trigger=98, stop_type="StopLoss"):
+def finalized_exit(fill, trigger=98, stop_type="StopLoss", tightened=None):
     db = Db(); cfg = config(); journal = TradeJournal(db); store = TelemetryStore(db, cfg)
     journal.log_entry(
         "TESTUSDT", "open_long", "test", "entry", 100, 100, 1, 2, 4,
         "entry-link", run_id=cfg.run_id, entry_filled_qty=1,
         stop_loss_price=98, take_profit_price=104,
     )
+    snapshot_at = utcnow() - timedelta(hours=3)
     session = db.get_session(); trade = session.query(TradeLog).one()
     session.add(TradeExchangeOrder(
         trade_log_id=trade.id, internal_order_link_id="entry-link",
         exchange_order_id="close-order", role="protective",
         order_status="Untriggered", stop_order_type=stop_type,
         trigger_price=trigger, raw_payload={"triggerBy": "LastPrice"},
-    )); session.commit(); session.close()
+        first_observed_at=snapshot_at, last_observed_at=snapshot_at,
+    ))
+    if tightened is not None:
+        session.add(TradeProtectionEvent(
+            event_key="tightened-key", run_id=cfg.run_id, trade_log_id=trade.id,
+            order_link_id="entry-link", observed_at=snapshot_at + timedelta(hours=1),
+            symbol="TESTUSDT", event_type="protection_tightened",
+            old_value={"stop_loss": 98, "take_profit": 104}, new_value=tightened,
+            reason="time-range tightening stage 1", source_module="strategy.engine",
+            success=True, policy_epoch=0,
+        ))
+    session.commit(); session.close()
     timestamp = str(to_epoch_ms(utcnow()))
     assert store.finalize_trade(
         "entry-link", actual_exit_reason="SL",
@@ -297,3 +309,36 @@ def test_post_entry_readback_verifies_configured_trigger_source():
         engine._protection_entry_halt = None
         assert engine._record_initial_protection_readback("TESTUSDT", "link", 98, 104)
         assert events[-1][0][1] == "verified_active"
+
+
+def test_amended_take_profit_is_compared_against_the_tightened_trigger():
+    """A tightened, exchange-confirmed TP must not read as anomalous slippage.
+
+    Reproduces the Testnet false positives of 2026-08-25: the Exit Manager
+    tightened TP, Bybit amended the same child order in place, and the stale
+    ``TradeExchangeOrder.trigger_price`` snapshot turned three profitable exits
+    into sticky ``protective_slippage`` circuit-breaker causes.
+    """
+    db, store = finalized_exit(
+        100.9, trigger=104, stop_type="TakeProfit",
+        tightened={"stop_loss": 99, "take_profit": 101},
+    )
+    session = db.get_session(); event = session.query(TradeExitEvent).one()
+    assert float(event.intended_trigger_price) == 101
+    assert event.slippage_classification == "normal"
+    assert event.trigger_evidence_quality == (
+        "amended_trigger_price_from_protection_tightened_timestamp_unavailable"
+    )
+    session.close()
+    assert store.get_exit_slippage("entry-link")["classification"] == "normal"
+
+
+def test_stale_order_snapshot_is_used_when_no_amendment_was_confirmed():
+    db, _ = finalized_exit(100.9, trigger=104, stop_type="TakeProfit")
+    session = db.get_session(); event = session.query(TradeExitEvent).one()
+    assert float(event.intended_trigger_price) == 104
+    assert event.slippage_classification == "anomalous"
+    assert event.trigger_evidence_quality == (
+        "static_trigger_price_confirmed_timestamp_unavailable"
+    )
+    session.close()

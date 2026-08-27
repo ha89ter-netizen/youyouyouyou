@@ -1392,6 +1392,43 @@ class TelemetryStore:
         )
         return True
 
+    def _amended_protective_trigger(self, session, trade, order, fill_at):
+        """Prefer the newest exchange-confirmed trigger over a stale snapshot.
+
+        ``TradeExchangeOrder`` rows are written once at post-entry read-back.
+        When the Exit Manager later tightens SL/TP, Bybit amends the same child
+        order in place, so the stored ``trigger_price`` keeps its original
+        value. Comparing that stale price with the fill turned tightened,
+        profitable exits into multi-R "anomalous" slippage.
+        """
+        stop_type = (order.stop_order_type or "").replace("_", "").lower() if order else ""
+        if "takeprofit" in stop_type:
+            key = "take_profit"
+        elif "stoploss" in stop_type:
+            key = "stop_loss"
+        else:
+            return None, None
+        snapshot_at = ensure_aware_utc(order.last_observed_at)
+        rows = session.query(TradeProtectionEvent).filter(
+            TradeProtectionEvent.trade_log_id == trade.id,
+            TradeProtectionEvent.event_type.in_(
+                ("protection_tightened", "exchange_acknowledged")
+            ),
+            TradeProtectionEvent.success.is_(True),
+        ).order_by(TradeProtectionEvent.observed_at.desc()).all()
+        for row in rows:
+            observed_at = ensure_aware_utc(row.observed_at)
+            if observed_at is None:
+                continue
+            if fill_at is not None and observed_at > fill_at:
+                continue
+            if snapshot_at is not None and observed_at <= snapshot_at:
+                break
+            value = safe_float((row.new_value or {}).get(key))
+            if value is not None:
+                return value, row.event_type
+        return None, None
+
     def _protective_slippage_evidence(
         self, session, trade, closing_ids, executions_by_order, initial_risk, observed
     ) -> dict:
@@ -1425,6 +1462,16 @@ class TelemetryStore:
             if from_epoch_ms(item.get("execTime")) is not None
         ]
         fill_at = max(fill_times) if fill_times else observed
+        amended_trigger, amended_source = self._amended_protective_trigger(
+            session, trade, order, fill_at
+        )
+        amended_quality = None
+        if amended_trigger is not None:
+            trigger = amended_trigger
+            amended_quality = (
+                f"amended_trigger_price_from_{amended_source}"
+                "_timestamp_unavailable"
+            )
         snapshots = session.query(PositionSnapshot).filter(
             PositionSnapshot.trade_log_id == trade.id,
             PositionSnapshot.observed_at >= fill_at - timedelta(minutes=2),
@@ -1477,7 +1524,8 @@ class TelemetryStore:
             "trigger_at": None,
             "trigger_evidence_quality": (
                 "trailing_dynamic_trigger_unavailable" if is_trailing
-                else "static_trigger_price_confirmed_timestamp_unavailable"
+                else amended_quality or
+                "static_trigger_price_confirmed_timestamp_unavailable"
             ),
             "fill_at": fill_at,
             "execution_id": executions[-1].get("execId") if executions else None,
